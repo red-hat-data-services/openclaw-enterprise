@@ -1,3 +1,4 @@
+import { renderInstallationConfigurations } from "./driver-configurations.mjs";
 import { element, button, statusBlock, trackVisualViewport } from "./dom.mjs";
 import {
   clearResolvedSecretNames,
@@ -1717,10 +1718,18 @@ async function loadPage({
             element("dt", {}, "Email"),
             element("dd", {}, session.user.email),
           ),
-          element("p", {}, "No configurable settings in this release."),
+
           button("Back", () => navigate(navigation.previousCollection)),
         ),
       );
+      if (installationAdmin) {
+        shell.view.append(
+          renderInstallationConfigurations({
+            request,
+            isCurrent: () => lifetime.isCurrent(viewState.active),
+          }),
+        );
+      }
       markMountedRoute(current);
       return;
     }

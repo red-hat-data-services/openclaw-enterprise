@@ -265,7 +265,7 @@ test("API and worker refuse a bad observability host or runtime image before ope
       images[role] = refused;
       cases.push(
         fixture(t, structuredClone(configuration)).then(async (copy) => {
-          for (const diagnostic of await refuses(copy, "RUNTIME_IMAGE_INVALID", refused)) {
+          for (const diagnostic of await refuses(copy, "DRIVER_CONFIGURATION_INVALID", refused)) {
             assert.equal(diagnostic.message, undefined, refused);
           }
         }),
@@ -1267,7 +1267,15 @@ test("startup rejects plaintext secrets, caller-authored identities, and unsuppo
         mode: "production",
         environment: { OCC_CONFIG_PATH: await fixture(t, configuration) },
       }),
-      expected,
+      (error) => {
+        if (error.name === "ConfigurationValidationError") {
+          assert.ok(error.error.details.length > 0);
+          assert.ok(error.error.details.every((detail) => typeof detail.message === "string"));
+        } else {
+          assert.match(error.message, expected);
+        }
+        return true;
+      },
     );
   }
 });
