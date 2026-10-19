@@ -172,5 +172,6 @@ export const ConfigurationAlternateDriver = story("policyConfigurationAlternate"
 export const ConfigurationDiscoveryLoading = story("policyConfigurationLoading");
 export const ConfigurationDiscoveryDenied = story("policyConfigurationDenied");
 export const ConfigurationStalePreview = story("policyConfigurationStale");
+export const ConfigurationJsonFallback = story("policyConfigurationJson");
 
 export const ConfigurationOwnerDenied = story("policyConfigurationHidden");
