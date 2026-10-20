@@ -11,7 +11,7 @@ import { clearRuntimeDenials } from "./agents/logs.mjs";
 import { createApiClient } from "./api-client.mjs";
 import { createViewLifetime } from "./view-lifetime.mjs";
 import { createNavigation, pages } from "./navigation.mjs";
-import { createShell, panel, sorted } from "./shell.mjs";
+import { createShell, initials, panel, sorted } from "./shell.mjs";
 import { createDraftStore } from "./drafts.mjs";
 import { renderRuntimeImages } from "./runtime-images.mjs";
 import { renderNamespaces } from "./namespaces.mjs";
@@ -858,24 +858,24 @@ function showLogin(message = "", destination = null) {
     required: "",
   });
   const feedback = statusBlock("danger", null, describe(true));
+  // The page's one line under the title also describes the email field (UX spec 3.12).
   const usernameHint = element(
-    "span",
-    { id: "username-hint", className: "hint" },
-    "Use your account email",
+    "p",
+    { id: "username-hint", className: "muted auth-intro" },
+    "Use your account email.",
   );
   // Recovery-only password sign-in hides the form until the recovery path is chosen.
   let recoveryOnly = false;
   const submit = element(
     "button",
     { type: "submit", className: "button button--primary" },
-    "Login",
+    "Sign in",
   );
   const form = element(
     "form",
     {},
-    element("label", { for: "username" }, "Username"),
+    element("label", { for: "username" }, "Email"),
     username,
-    usernameHint,
     element("label", { for: "password" }, "Password"),
     password,
     feedback,
@@ -940,6 +940,7 @@ function showLogin(message = "", destination = null) {
       feedback.textContent = "";
       form.insertBefore(feedback, submit);
       form.hidden = false;
+      usernameHint.hidden = false;
       username.focus();
     },
     { tone: "link", className: "auth-recovery", hidden: true },
@@ -1006,12 +1007,13 @@ function showLogin(message = "", destination = null) {
         element("img", { src: "/console/oce-mascot.png", alt: "", width: "40", height: "40" }),
         "OpenClaw Enterprise",
       ),
-      element("h1", {}, "Welcome back"),
-      element("p", { className: "muted" }, "Sign in to your Installation."),
+      element("h1", {}, "Sign in"),
+      usernameHint,
       form,
       providers,
       recovery,
     ),
+    ...signInFooter(),
   );
   void request("/api/auth/providers")
     .then((available) => {
@@ -1037,10 +1039,11 @@ function showLogin(message = "", destination = null) {
           if (feedback.textContent === describe(true)) {
             feedback.textContent = describe(false);
           }
-          usernameHint.textContent = "Use the recovery account's email";
+          usernameHint.textContent = "Use the recovery account's email.";
           // Never pull the form away from someone already using it.
           if (!pending && username.value === "" && password.value === "") {
             form.hidden = true;
+            usernameHint.hidden = true;
             providers.after(feedback);
             recovery.hidden = false;
           }
@@ -1050,6 +1053,21 @@ function showLogin(message = "", destination = null) {
     .catch(() => {
       // Password sign-in remains available when provider discovery fails.
     });
+}
+
+// The sign-in page footer names the build it serves, from the meta tag the image bakes in; a
+// development build has none, so the footer is left out.
+function signInFooter() {
+  const revision = document.querySelector('meta[name="occ-build-revision"]')?.content ?? "";
+  return /^[a-f0-9]{40}$/.test(revision)
+    ? [
+        element(
+          "footer",
+          { className: "auth-footer" },
+          `OpenClaw Enterprise · build ${revision.slice(0, 8)}`,
+        ),
+      ]
+    : [];
 }
 
 function showCheckingSession(checking = () => true) {
@@ -1108,7 +1126,7 @@ async function loadPage({
   // page the reader tried to reach stays in history for a later Back. This follows the tab
   // handler, which keeps same-Agent tab changes.
   if (fromHistory && mountedRouteKey !== null && leaveGuard?.({ pendingOnly: true })) {
-    history.pushState({ previousCollection: navigation.previousCollection }, "", mountedRouteKey);
+    history.pushState(null, "", mountedRouteKey);
     return;
   }
   const knownPrivateState = session !== null && Object.hasOwn(pages, current.feature);
@@ -1472,12 +1490,7 @@ async function loadPage({
         namespaces[0]
       )?.id ??
       null;
-    navigation.restoreHistory();
-    history.replaceState(
-      { previousCollection: navigation.previousCollection },
-      "",
-      pageUrl(current.target),
-    );
+    history.replaceState(null, "", pageUrl(current.target));
     const agentsNamespaceUnavailable =
       current.feature === "agents" && !namespaces.some((item) => item.id === namespaceId);
     if (current.namespace !== null && (!held || shownFeature === current.feature)) {
@@ -1740,23 +1753,7 @@ async function loadPage({
       attachDiagnostics(shell.diagnostics);
     }
     if (current.feature === "settings") {
-      shell.view.append(
-        element(
-          "section",
-          { className: "state-panel" },
-          element("h2", {}, "Signed-in account"),
-          element(
-            "dl",
-            { className: "settings" },
-            element("dt", {}, "Name"),
-            element("dd", {}, session.user.name),
-            element("dt", {}, "Email"),
-            element("dd", {}, session.user.email),
-          ),
-
-          button("Back", () => navigate(navigation.previousCollection)),
-        ),
-      );
+      shell.view.append(settingsView());
       if (installationAdmin) {
         shell.view.append(
           renderInstallationConfigurations({
@@ -1765,6 +1762,7 @@ async function loadPage({
           }),
         );
       }
+
       markMountedRoute(current);
       return;
     }
@@ -2431,6 +2429,52 @@ function resumePage() {
   });
 }
 
+// Settings (UX spec 3.10): the signed-in account, and this session with Sign out. The session
+// read carries no sign-in method, sign-in time or expiry, so the cards show only what it has.
+function settingsView() {
+  const { user } = session;
+  return element(
+    "div",
+    { className: "settings-page" },
+    element(
+      "section",
+      { className: "card" },
+      element("h2", {}, "Signed-in account"),
+      element(
+        "div",
+        { className: "settings-account" },
+        element(
+          "span",
+          { className: "account-avatar account-avatar--lg", "aria-hidden": "true" },
+          initials(user),
+        ),
+        element(
+          "dl",
+          { className: "settings" },
+          element("dt", {}, "Name"),
+          element("dd", {}, user.name),
+          element("dt", {}, "Email"),
+          element("dd", {}, user.email),
+        ),
+      ),
+    ),
+    element(
+      "section",
+      { className: "card" },
+      element("h2", {}, "Session"),
+      button("Sign out", () => void logout(), {
+        className: "settings-sign-out",
+        "aria-describedby": "settings-sign-out-help",
+      }),
+      element(
+        "p",
+        { className: "hint", id: "settings-sign-out-help" },
+        "Signing out ends this session on this device only.",
+      ),
+    ),
+  );
+}
+
 async function logout() {
   loggingOut = true;
   pendingIntent = null;
@@ -2458,7 +2502,6 @@ async function logout() {
   }
   if (confirmed) {
     loggingOut = false;
-    navigation.resetHistory();
     showLogin();
   } else {
     publicPanel(

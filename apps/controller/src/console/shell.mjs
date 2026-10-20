@@ -1,3 +1,4 @@
+import { displayDate } from "./agents/list.mjs";
 import { element, button } from "./dom.mjs";
 
 export function panel(target, title, description, actionLabel, action, requestId) {
@@ -70,6 +71,14 @@ const namespaceStatuses = {
   failed: { label: "Failed", tone: "danger" },
 };
 const backendTypes = { chatgpt: "ChatGPT", github: "GitHub", openshell: "OpenShell" };
+
+// Initials for the account avatar: the first letters of the first and last words of the
+// name, or of the email when the account has no name.
+export function initials(user) {
+  const words = (user?.name ?? "").trim().split(/\s+/).filter(Boolean);
+  const letters = (words.length > 1 ? [words[0], words.at(-1)] : words).map((word) => [...word][0]);
+  return (letters.join("") || [...(user?.email ?? "")][0] || "?").toUpperCase();
+}
 
 export function createShell({ app, pages, route, pageUrl, navigate, loadPage, logout }) {
   let session = null;
@@ -145,16 +154,6 @@ export function createShell({ app, pages, route, pageUrl, navigate, loadPage, lo
         action ? button(actionLabel, action) : null,
       ),
     );
-  }
-
-  // Initials for the account avatar: the first letters of the first and last words of the
-  // name, or of the email when the account has no name.
-  function initials(user) {
-    const words = (user?.name ?? "").trim().split(/\s+/).filter(Boolean);
-    const letters = (words.length > 1 ? [words[0], words.at(-1)] : words).map(
-      (word) => [...word][0],
-    );
-    return (letters.join("") || [...(user?.email ?? "")][0] || "?").toUpperCase();
   }
 
   function accountControl({ id, rootClass, toggle, menuFirst }) {
@@ -738,38 +737,88 @@ export function createShell({ app, pages, route, pageUrl, navigate, loadPage, lo
       );
       return;
     }
+    if (feature === "namespaces") {
+      renderNamespaceRows(view, items);
+      return;
+    }
     const list = element("ul", { className: "collection", "aria-label": pages[feature] });
     for (const item of sorted(items)) {
-      const name = item.name ?? item.id;
-      // A Namespace row opens that Namespace's Agents (finding 1897).
-      const label =
-        feature === "namespaces" ? namespaceLink(name, item.id) : element("span", {}, name);
-      const status = feature === "namespaces" ? namespaceStatuses[item.status] : undefined;
       list.append(
         element(
           "li",
-          {
-            className: feature === "namespaces" ? "card resource resource-linked" : "card resource",
-          },
+          { className: "card resource" },
           element(
             "div",
             {},
-            element("p", { className: "resource-name" }, label),
+            element("p", { className: "resource-name" }, element("span", {}, item.name ?? item.id)),
             feature === "backends" ? null : element("span", { className: "resource-id" }, item.id),
           ),
           feature === "agents"
             ? null
-            : element(
-                "span",
-                { className: "badge", ...(status ? { "data-tone": status.tone } : {}) },
-                feature === "backends"
-                  ? (backendTypes[item.type] ?? item.type)
-                  : (status?.label ?? item.status),
-              ),
+            : element("span", { className: "badge" }, backendTypes[item.type] ?? item.type),
         ),
       );
     }
     view.replaceChildren(list);
+  }
+
+  // Namespaces read as a table (UX spec 3.12): Namespace with its ID beneath, Status, Created.
+  // The rows stay a list, so each row is one item to a screen reader, and the column names
+  // above them are visual only: each cell carries its own name. A row opens that Namespace's
+  // Agents (finding 1897).
+  function renderNamespaceRows(view, items) {
+    const list = element("ul", {
+      className: "collection namespace-rows",
+      "aria-label": pages.namespaces,
+    });
+    for (const item of sorted(items)) {
+      const status = namespaceStatuses[item.status];
+      list.append(
+        element(
+          "li",
+          { className: "resource-linked namespace-row" },
+          element(
+            "div",
+            { className: "namespace-cell-name" },
+            element(
+              "p",
+              { className: "resource-name" },
+              namespaceLink(item.name ?? item.id, item.id),
+            ),
+            element("span", { className: "resource-id" }, item.id),
+          ),
+          element(
+            "span",
+            { className: "namespace-cell-status" },
+            element(
+              "span",
+              { className: "badge", ...(status ? { "data-tone": status.tone } : {}) },
+              status?.label ?? item.status,
+            ),
+          ),
+          element(
+            "span",
+            { className: "namespace-cell-created" },
+            element("span", { className: "namespace-cell-label" }, "Created "),
+            item.createdAt ? displayDate(item.createdAt) : "Unknown",
+          ),
+        ),
+      );
+    }
+    view.replaceChildren(
+      element(
+        "div",
+        { className: "namespace-table" },
+        element(
+          "div",
+          { className: "namespace-table-head", "aria-hidden": "true" },
+          element("span", {}, "Namespace"),
+          element("span", {}, "Status"),
+          element("span", {}, "Created"),
+        ),
+        list,
+      ),
+    );
   }
 
   function namespaceLink(name, id) {

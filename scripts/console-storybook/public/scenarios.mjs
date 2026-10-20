@@ -466,8 +466,9 @@ export const scenarios = {
     name: "Signed out",
     path: "/console/login",
     signedOut: true,
+    buildRevision: "1234567890abcdef1234567890abcdef12345678",
     description:
-      "The email and password form. Any nonempty demo email/password signs into this fixture.",
+      "The email and password form, and a footer naming the build. Any nonempty demo email/password signs into this fixture.",
   },
   githubLogin: {
     group: "Pages/Sign in",
@@ -524,7 +525,7 @@ export const scenarios = {
       click("Recovery sign-in"),
       { selector: "#username", value: "member@example.com" },
       { selector: "#password", value: "demo-only" },
-      click("Login"),
+      click("Sign in"),
     ],
     description:
       "Recovery sign-in reveals the password form. A refused password explains that only the recovery account can use one.",
@@ -647,7 +648,7 @@ export const scenarios = {
     actions: [
       { selector: "#username", value: "operator@example.com" },
       { selector: "#password", value: "demo-only" },
-      click("Login"),
+      click("Sign in"),
     ],
     description: "A rejected sign-in leaves the form available for retry.",
   },
@@ -901,6 +902,19 @@ export const scenarios = {
     description:
       "A first run's Namespace is still provisioning: the page names its status and what waits for it, and Create Agent stays available for drafts.",
   },
+  agentsNamespaceBecomesReady: {
+    group: "Pages/Agents",
+    name: "Namespace becomes ready",
+    namespaceStatus: "provisioning",
+    namespaceRechecks: ["provisioning", "ready"],
+    actions: [{ selector: 'input[type="search"]', value: "Research", focus: true }],
+    description:
+      "The Agents list rechecks a provisioning Namespace every 10 s while the reader stays on it, without a Refresh. When it reads ready, a success note replaces the warning in place, Create Agent loses its not-ready description, and the search text and focus stay.",
+    steps: [
+      'Keep the caret in Search Agents. After the first recheck (about 10 s) the note still begins "Namespace status: Provisioning."; within about 20 s it becomes "Namespace status: Ready. Agents created here can be deployed now."',
+      "Confirm Search Agents keeps its text and focus, Research assistant is still listed, and Create Agent is enabled with no description pointing at the note. No further Namespace reads happen.",
+    ],
+  },
   agentsDenied: {
     group: "Pages/Agents",
     name: "Access denied",
@@ -1009,6 +1023,31 @@ export const scenarios = {
     emptyNamespaces: true,
     description:
       "No accessible Namespaces. Create Namespace remains available; the API decides whether creation is permitted.",
+  },
+  namespacesEmptyMember: {
+    group: "Pages/Namespaces",
+    name: "Empty for a member",
+    path: "/console/namespaces",
+    emptyNamespaces: true,
+    observabilityDenied: true,
+    description:
+      "A person who does not administer the Installation gets Create Namespace as a secondary action and is told to ask an administrator. A Namespace create grant still works from it.",
+  },
+  namespaceCreateRefused: {
+    group: "Pages/Namespaces",
+    name: "Create refused, then closed",
+    path: "/console/namespaces",
+    emptyNamespaces: true,
+    observabilityDenied: true,
+    rules: [{ path: "/namespaces", method: "POST", status: 403, code: "FORBIDDEN" }],
+    actions: [
+      { click: "Create Namespace" },
+      { selector: "#namespace-name", value: "Support" },
+      { selector: 'dialog button[type="submit"]', click: true },
+      { click: "Cancel" },
+    ],
+    description:
+      "After the API refuses creation, the page disables Create Namespace, says why, and focuses that reason. A browser reload asks the API again.",
   },
   namespaceCreate: {
     group: "Pages/Namespaces",
@@ -1143,7 +1182,27 @@ export const scenarios = {
     group: "Pages/Settings",
     name: "Account",
     path: "/console/settings",
-    description: "Signed-in account and read-only Installation Driver schemas for administrators.",
+    description:
+      "An account card with initials, name and email, and a Session card with Sign out. Administrators can inspect read-only Installation Driver schemas. There are no editable settings in this release.",
+    steps: [
+      "Check that the page has no Namespace selector and that the account card shows initials, name and email.",
+      "Inspect Installation Driver schemas below the cards; no startup values or mutation controls are shown.",
+      "Choose Sign out in the Session card: “Signing out…” appears, then the sign-in page.",
+      "At a phone width, Sign out spans the Session card.",
+    ],
+  },
+  settingsSignOutFailure: {
+    group: "Pages/Settings",
+    name: "Sign-out unconfirmed",
+    path: "/console/settings",
+    rules: [{ path: "/api/auth/sign-out", method: "POST", status: 503 }],
+    // The account menu's hidden Sign out comes first in the page, so name the card's button.
+    actions: [{ selector: ".settings-sign-out", click: true }],
+    description:
+      "Sign out from the Session card fails with the session still active: private content stays hidden until revocation can be confirmed.",
+    steps: [
+      "Choose Retry: it repeats the sign-out and keeps private content hidden until it succeeds.",
+    ],
   },
   notFound: {
     group: "Pages/Navigation",
@@ -2671,7 +2730,11 @@ export const scenarios = {
     path: create,
     actions: [{ selector: "#agent-preset", value: "pre_00000000-0000-4000-8000-000000000001" }],
     description:
-      "A reusable template with required and defaulted variables. Use Preset copies values into an editable draft.",
+      "A reusable template with required and defaulted variables. Use Preset copies values into an editable draft. With a Preset chosen, Use Preset is the filled button and Start with default Preset is secondary.",
+    steps: [
+      'Under Start with default Preset, the hint reads "The default Preset is default-codex."',
+      "Use Preset is filled and Start with default Preset is secondary. Choose Choose a Preset in Preset template: the filled style returns to Start with default Preset.",
+    ],
     gap: "Preset CRUD has no console page; the fixture supplies a pre-existing Preset.",
   },
   createPresetExistingSecret: {
@@ -3284,6 +3347,21 @@ export const scenarios = {
       "Inspect the admitted version and its deployment activity.",
     ],
     gap: "The fixture simulates admission and worker completion; it does not verify a live Agent.",
+  },
+  editCurrentConfiguration: {
+    group: "Pages/Agent detail",
+    name: "Edit current Configuration",
+    path: `${revision}&tab=configuration`,
+    deployed: true,
+    actions: [click("Edit current Configuration")],
+    // The page brings the editor into view itself.
+    scrollToTabs: false,
+    description:
+      "Edit current Configuration on a version's Configuration tab opens the draft with its Configuration editor already open, brought into view and focused. It used to open the draft at the top of the page and still need an Edit Configuration click far below.",
+    steps: [
+      "The page shows the draft. Configuration JSON is in view with the caret in it; no Edit Configuration button is left to press.",
+      "Choose Cancel: the editor closes and Edit Configuration takes focus.",
+    ],
   },
   agentHeaderActions: {
     group: "Pages/Agent detail",
@@ -3907,6 +3985,9 @@ export const scenarios = {
     candidateDeploymentStatus: "queued",
     description:
       "v7 is admitted and queued without a live worker claim. v6 remains selected; serving is unverified. Deployment details keep Last recorded result, Reason and Since rows (not recorded yet), so the first result fills them in place.",
+    steps: [
+      'Selected version reads v6. v7\'s Configuration tab notice begins "Deploying version", not "Historical version".',
+    ],
   },
   deploymentRunning: {
     group: "Pages/Agent detail",
@@ -3916,6 +3997,23 @@ export const scenarios = {
     candidateDeploymentStatus: "running",
     description:
       "A worker holds the v7 deployment claim while v6 remains selected. The API does not expose finer runtime stages.",
+    steps: [
+      'Selected version reads v6. v7\'s Configuration tab notice reads "Deploying version · read-only admitted snapshot. It becomes the current version only if its deployment completes."',
+    ],
+  },
+  deploymentRunningActivates: {
+    group: "Pages/Agent detail",
+    name: "New version in progress, then current",
+    path: `${candidateVersion}&tab=configuration`,
+    deployed: true,
+    candidateDeploymentStatus: "running",
+    candidateActivates: true,
+    description:
+      "v7 is deploying while v6 stays selected, then the next status poll records success and selects v7. Its notice goes from Deploying version to Current version without showing Historical version in between. The deployment and activation are simulated.",
+    steps: [
+      'On arrival the notice begins "Deploying version" and Selected version reads v6.',
+      'Within about 5 s the notice begins "Current version" and Selected version reads v7.',
+    ],
   },
   deploymentDeferred: {
     group: "Pages/Agent detail",
@@ -4145,6 +4243,8 @@ export const scenarios = {
     description:
       "While viewing current v6, deployment activity reports failed v7 with bounded startup failure evidence. Open v7 Logs selects that failed version and brings its output into view.",
     steps: [
+      "Above the facts, the failure is one danger status block: a red stripe on a light red wash, the label DEPLOYMENT FAILED · V7, the title This Agent may be offline, and CONVERGENCE_DEADLINE_EXCEEDED in code at the end of the first sentence. Open v7 Logs is the page's one filled button; at 390 wide it spans the block.",
+      "In Deployment details, the three step tiles are white cards with a light edge; only the failed Deployment work tile has a red wash, and each marker carries its step's colour.",
       "Select Open v7 Logs in Deployment activity. The version selector changes from v6 to v7 and the Logs tab receives focus and its panel scrolls into view.",
       "Check the simulated Pod status and operational output, then use Back to return to v6. Browsing leaves v6 selected for service.",
     ],
@@ -4242,6 +4342,9 @@ export const scenarios = {
     ],
     description:
       "Watch v7 change from running to failed. Recovery appears below Deployment activity instead of pushing the overview down. The status and details update in place. The deployment and failure are simulated.",
+    steps: [
+      'On arrival v7\'s Configuration tab notice begins "Deploying version". Once v7 reads Failed, it begins "Historical version" and Selected version still reads v6.',
+    ],
   },
   deploymentModelProbeRetried: {
     group: "Pages/Agent detail",
@@ -4269,6 +4372,7 @@ export const scenarios = {
       "The same failed model check for a viewer whose permission answer denies Agent update and deploy. Recovery offers Open v7 Logs only.",
     steps: [
       "Check that the recovery has one link, Open v7 Logs, and the header says Open version draft.",
+      "Open v7 Logs is the block's filled primary button; at 390 wide it spans the block.",
     ],
     gap: "The permission answer is simulated; the API still authorizes every page a link opens.",
   },
@@ -4298,6 +4402,7 @@ export const scenarios = {
       "v7 failed because a controller dependency stayed unavailable. The recovery leads with the failure's own next step and offers Deploy again first, because that message says to deploy again.",
     steps: [
       "At 1440 and 390 wide, read the message and see Deploy again without scrolling.",
+      "Deploy again is the one filled button and Open v7 Logs an edged secondary button. At 390 wide they stack, each the block's full width. The message's first sentence ends with DEPENDENCY_UNAVAILABLE in code.",
       "Select Deploy again: the draft opens with its Deploy new version in view and focused, without deploying.",
     ],
     gap: "The failure is simulated; this story does not verify a live deployment.",
@@ -5143,6 +5248,20 @@ export const scenarios = {
     steps: [
       "Change the channel IDs, then click inside the panel and drag from its heading onto the gray backdrop. The editor stays open.",
       "Click the gray backdrop. Reopen Edit Slack and confirm the unsaved channel changes were discarded, just as with Cancel.",
+    ],
+  },
+  slackDrawerNoAuthentication: {
+    group: "Components/Channels",
+    name: "Slack editor, no model authentication",
+    path: `${draft}&tab=channels`,
+    slack: true,
+    auth: null,
+    actions: [click("Edit Slack")],
+    description:
+      "An Agent with no model authentication source: the drawer's notice adds that model credentials are configured in the Credentials tab before deploying. With a source bound (Slack editor), the notice stops after the first sentence.",
+    steps: [
+      'The notice at the top of the drawer reads "New version. Changes affect future deployments using this Configuration. Configure model credentials in the Credentials tab before deploying."',
+      'Open the Slack editor story: its notice reads only "New version. Changes affect future deployments using this Configuration."',
     ],
   },
   slackDirectoryChannels: {

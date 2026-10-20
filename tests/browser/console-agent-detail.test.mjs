@@ -1012,8 +1012,9 @@ test("Agent detail preserves admitted revision history while draft edits change 
   await expectNoText(page, /"marker": "draft-edited"|"marker": "stale-server"/);
   await page.getByRole("button", { name: "Edit current Configuration" }).click();
   await page.waitForURL((url) => url.searchParams.get("revision") === "draft");
-  await revealNativeConfiguration(page, "View native Configuration");
-  await page.getByText('"marker": "draft-edited"').waitFor();
+  // Edit current Configuration opens the draft's editor on the saved document (finding 2061).
+  await waitForLiveControls(page, ["configuration-json"]);
+  assert.deepEqual(JSON.parse(await editor.inputValue()), editedValues);
 
   await page.getByRole("tab", { name: "Credentials", exact: true }).click();
   await page.getByLabel("Authentication source").selectOption("");
@@ -1046,7 +1047,7 @@ test("Agent detail preserves admitted revision history while draft edits change 
     .waitFor();
   // Cancel discards the retained baseline too: reopening uses the freshly read saved document.
   await page.getByRole("button", { name: "Edit current Configuration" }).click();
-  await page.getByRole("button", { name: "Edit Configuration" }).click();
+  await waitForLiveControls(page, ["configuration-json"]);
   await editor.fill(JSON.stringify(nativeValues("discard-this-edit")));
   await page.getByRole("link", { name: "Namespaces", exact: true }).click();
   await page.getByRole("heading", { name: "Namespaces", exact: true }).waitFor();
@@ -3078,7 +3079,9 @@ test("a version editor without Agent update can recover a failed deployment from
     .getByRole("button", { name: "Open version draft" })
     .waitFor();
   const recovery = page.getByRole("region", { name: "Deployment needs attention" });
-  await recovery.getByText("v2 failed its startup model check.", { exact: false }).waitFor();
+  await recovery
+    .getByText("v2 failed its startup model check (RUNTIME_MODEL_PROBE_FAILED).", { exact: false })
+    .waitFor();
   await recovery.getByRole("link", { name: "Open version draft" }).click();
   await recovery.getByRole("link", { name: "Open version draft" }).waitFor();
   await page.getByRole("button", { name: "Edit Configuration" }).click();

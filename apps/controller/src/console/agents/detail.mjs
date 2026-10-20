@@ -443,6 +443,14 @@ export const DEPLOYMENT_POLL_MS = 5000;
 // pushed the shown overview down (finding 1489).
 export const FIRST_ACTIVITY_WAIT_MS = 2000;
 const PENDING_DEPLOYMENT_STATUSES = new Set(["queued", "running"]);
+// The badge tone of a recorded deployment outcome in the Agent summary; superseded and stopped
+// records stay neutral.
+const DEPLOYMENT_OUTCOME_TONES = {
+  queued: "info",
+  running: "info",
+  succeeded: "success",
+  failed: "danger",
+};
 
 // A recovery link opens a version tab far below the banner it sits in. Only the URL changed and
 // the page stayed at the top, so the link looked dead (finding 1586). The page the link opens,
@@ -1266,8 +1274,8 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
     return true;
   };
   context.setLeaveGuard?.(refuseLeave);
-  const currentVersionValue = element("strong");
-  const currentVersionNote = element("p", { className: "muted" });
+  const currentVersionValue = element("strong", { className: "stat-value" });
+  const currentVersionNote = element("p", { className: "stat-help" });
   // The summary's loading text follows the 250 ms rule: a read that settles sooner never shows
   // it, and the version number shows at once (finding 1438).
   function setDelayedText(node, prefix, loading) {
@@ -1275,46 +1283,86 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
       node.replaceChildren(prefix, element("span", { className: "delayed-status" }, loading));
     }
   }
-  const latestDeploymentValue = element("strong");
-  const latestDeploymentNote = element("p", { className: "muted" });
+  const latestDeploymentValue = element("strong", { className: "stat-value" });
+  const latestDeploymentNote = element("p", { className: "stat-help" });
   setDelayedText(latestDeploymentValue, "", "Loading…");
   setDelayedText(latestDeploymentNote, "", "Reading deployment history.");
-  const liveServingValue = element("strong", {}, "Not verified");
-  const liveServingNote = element("p", { className: "muted" });
+  // A recorded outcome is the version and a status badge (spec 3.5). The separator stays in the
+  // text for screen readers and text matching ("v7 · Failed"); the badge's gap shows it.
+  function setDeploymentOutcome(node, version, label, tone) {
+    const text = `${version} · ${label}`;
+    const badge = node.querySelector(":scope > .badge");
+    if (node.textContent === text && badge && (badge.dataset.tone ?? "") === (tone ?? "")) {
+      return;
+    }
+    node.replaceChildren(
+      version,
+      element("span", { className: "visually-hidden" }, " · "),
+      element("span", { className: "badge", ...(tone ? { "data-tone": tone } : {}) }, label),
+    );
+  }
+  const liveServingValue = element(
+    "strong",
+    { className: "stat-value" },
+    element("span", { className: "badge" }, "Not verified"),
+  );
+  function setLiveServing(mayBeOffline) {
+    const badge = liveServingValue.firstElementChild;
+    setText(badge, mayBeOffline ? "May be offline" : "Not verified");
+    if (mayBeOffline) {
+      if (badge.dataset.tone !== "warning") {
+        badge.dataset.tone = "warning";
+      }
+    } else if (badge.dataset.tone) {
+      delete badge.dataset.tone;
+    }
+  }
   // A requested stop belongs in the summary, not only in the Stop card at the bottom (finding
   // 1899). It is attached only once the Agent has a version: an Agent is created stopped.
-  const runtimeNote = element("p", { className: "muted" });
-  const runtimeFact = element(
-    "div",
-    {},
-    element("span", { className: "overview-fact-label" }, "Runtime"),
-    element("strong", {}, "Stop requested"),
+  const runtimeNote = element("p", { className: "stat-help" });
+  const stat = (label, ...children) =>
+    element(
+      "div",
+      { className: "stat" },
+      element("span", { className: "overview-fact-label stat-label" }, label),
+      ...children,
+    );
+  const runtimeFact = stat(
+    "Runtime",
+    element("strong", { className: "stat-value" }, "Stop requested"),
     runtimeNote,
   );
+  // The facts are a stat row (spec 3.5); what they cannot tell the reader is said once, in the
+  // disclosure under them, rather than under each fact (spec 3.6, plan D5).
   const currentSummary = element(
     "section",
-    { className: "agent-current-summary", "aria-label": "Agent state at a glance" },
+    { className: "agent-current-summary stats", "aria-label": "Agent state at a glance" },
+    stat("Selected version", currentVersionValue, currentVersionNote),
+    stat("Latest visible deployment", latestDeploymentValue, latestDeploymentNote),
+    stat("Live serving", liveServingValue),
+  );
+  const pageDisclosure = element(
+    "details",
+    { className: "disclosure" },
+    element("summary", {}, "What this page can tell you"),
     element(
-      "div",
+      "ul",
       {},
-      element("span", { className: "overview-fact-label" }, "Selected version"),
-      currentVersionValue,
-      currentVersionNote,
+      element("li", {}, "Selection does not confirm that this version is serving."),
+      element("li", {}, "Deployment records don’t verify live serving or model access."),
+      // Shown only while the sharing panel is (console.css): it speaks for that panel's list.
+      element(
+        "li",
+        { className: "disclosure-access" },
+        "Listed bindings describe present configuration; they do not confirm a previous request’s outcome.",
+      ),
     ),
-    element(
-      "div",
-      {},
-      element("span", { className: "overview-fact-label" }, "Latest visible deployment"),
-      latestDeploymentValue,
-      latestDeploymentNote,
-    ),
-    element(
-      "div",
-      {},
-      element("span", { className: "overview-fact-label" }, "Live serving"),
-      liveServingValue,
-      liveServingNote,
-    ),
+  );
+  const statCard = element(
+    "div",
+    { className: "card agent-stat-card" },
+    currentSummary,
+    pageDisclosure,
   );
   const statusLine = statusBlock("warning", null, null, [], {
     className: "agent-status-line",
@@ -1622,12 +1670,32 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
   detailPane.append(detailHeading, versionEvidence, tabs, content);
   const nativeAdmin = renderNativeAdminAccess(context, path);
   const recoveryTitle = element("h2");
-  const recoveryMessage = element("p");
-  const recoveryActions = element("div", { className: "deployment-recovery-actions" });
+  // A danger status block (spec 3.4): the failed version in the label, the code at the end of
+  // the message's first sentence, and one primary action. Each part is its own node, so a poll
+  // that reads back the same failure writes nothing.
+  const recoveryLabel = element("p", { className: "status-label" });
+  const recoveryLead = document.createTextNode("");
+  const recoveryCode = element("code", { hidden: true });
+  const recoveryRest = document.createTextNode("");
+  const recoveryMessage = element(
+    "p",
+    { className: "status-body" },
+    recoveryLead,
+    recoveryCode,
+    recoveryRest,
+  );
+  const recoveryActions = element("div", {
+    className: "status-actions deployment-recovery-actions",
+  });
   const recovery = element(
     "section",
-    { className: "deployment-recovery", hidden: true, "aria-label": "Deployment needs attention" },
-    element("span", { className: "recovery-label" }, "Deployment needs attention"),
+    {
+      className: "status deployment-recovery",
+      "data-tone": "danger",
+      hidden: true,
+      "aria-label": "Deployment needs attention",
+    },
+    recoveryLabel,
     recoveryTitle,
     recoveryMessage,
     recoveryActions,
@@ -1636,7 +1704,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
   const overviewStatus = element(
     "div",
     { className: "agent-overview-status" },
-    currentSummary,
+    statCard,
     statusLine,
     deploymentStatus,
   );
@@ -1669,7 +1737,47 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
     const smooth = animate && !globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     node.scrollIntoView({ block: "start", behavior: smooth ? "smooth" : "instant" });
   }
-  function openVersionDetail({ deploy = false, ...options } = {}) {
+  function openVersionDetail({ deploy = false, edit = false, ...options } = {}) {
+    // Edit current Configuration opens the draft with its Configuration editor open, in view and
+    // focused. It switched to the draft at the top of the page, and the editor still needed an
+    // Edit Configuration click far below (finding 2061).
+    // A draft restored with unsaved edits is already in the editor; otherwise its Edit
+    // Configuration button opens it.
+    const editorTarget = () =>
+      detailPane.querySelector("#configuration-json") ??
+      detailPane.querySelector('button[data-opens="configuration-editor"]');
+    const editStart = edit ? editorTarget() : null;
+    if (edit && !editStart && !detailLoadFinished) {
+      const tab = selectedTab;
+      void Promise.resolve(details).then(
+        () => {
+          const focused = document.activeElement;
+          if (
+            context.isCurrent() &&
+            !deleting &&
+            selectedTab === tab &&
+            (!focused || focused === document.body || focused === tabControls.get(tab)) &&
+            editorTarget()
+          ) {
+            openVersionDetail({ ...options, edit });
+          }
+        },
+        () => {},
+      );
+    }
+    if (editStart && !editStart.disabled) {
+      // Entering the editor focuses it without scrolling; the editor is then brought into view.
+      if (editStart.id === "configuration-json") {
+        editStart.focus({ preventScroll: true });
+      } else {
+        editStart.click();
+      }
+      const field = detailPane.querySelector("#configuration-json")?.closest(".form-field");
+      if (field) {
+        scrollToVersionDetail(options, field);
+        return;
+      }
+    }
     // Deploy again opens the draft at its deploy step, whose card can end below a phone's
     // fold when the version detail is at the top: the card is brought to the top, with its
     // Deploy new version focused when the reader can press it (finding 1898).
@@ -1709,7 +1817,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
     scrollOnReveal = () => {
       scrollOnReveal = null;
       if (context.isCurrent() && !deleting) {
-        openVersionDetail({ deploy: linkedOnLoad.deploy });
+        openVersionDetail({ deploy: linkedOnLoad.deploy, edit: linkedOnLoad.edit });
       }
     };
   }
@@ -1717,7 +1825,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
   context.onResume?.(() => {
     const linked = takeLinkedVersionView(linkedKey());
     if (linked && !deleting) {
-      openVersionDetail({ deploy: linked.deploy });
+      openVersionDetail({ deploy: linked.deploy, edit: linked.edit });
     }
   });
   function showDetail() {
@@ -1819,8 +1927,30 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
         ? "Plugin changes to this Agent appear in the next deployment. Existing versions stay unchanged."
         : "New version. Changes affect future deployments using this Configuration. Admitted versions stay unchanged."
       : selected === currentRevisionId
-        ? "Current version · read-only admitted snapshot. Selection does not confirm that this version is serving."
-        : "Historical version · read-only admitted snapshot. Browsing it does not change the current version.";
+        ? "Current version · read-only admitted snapshot."
+        : deployingRevision()?.id === selected
+          ? "Deploying version · read-only admitted snapshot. It becomes the current version only if its deployment completes."
+          : "Historical version · read-only admitted snapshot. Browsing it does not change the current version.";
+  }
+
+  // The newest version while its deployment is queued or running and it is not yet current. Right
+  // after Deploy new version it was called "Historical" beside "Selected version v1" (finding 2065).
+  function deployingRevision() {
+    const latest = visibleRevisions[0];
+    return latest &&
+      latest.id !== currentRevisionId &&
+      activityRevisionId === latest.id &&
+      PENDING_DEPLOYMENT_STATUSES.has(latestDeploymentStatus)
+      ? latest
+      : null;
+  }
+
+  function renderVersionNotice() {
+    const notice = content.querySelector(".version-selection-notice");
+    if (notice) {
+      // Deployment polls call this too; an unchanged notice is left untouched.
+      setText(notice, versionNotice());
+    }
   }
 
   function renderDetailHeading() {
@@ -2063,10 +2193,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
       renderCurrentVersion();
     }
     renderDetailHeading();
-    const notice = content.querySelector(".version-selection-notice");
-    if (notice) {
-      notice.textContent = versionNotice();
-    }
+    renderVersionNotice();
   }
 
   function renderLatestDeployment() {
@@ -2093,8 +2220,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
           ? `You cannot read version ${shortId(hidden)}, so its progress and outcome are not shown here. ${readAccessHint}`
           : "",
       );
-      setText(liveServingValue, "Not verified");
-      setText(liveServingNote, "Serving version and model access are unknown.");
+      setLiveServing(false);
       return;
     }
     const label = {
@@ -2151,9 +2277,11 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
       setDelayedText(latestDeploymentValue, `v${latest.revision} · `, "Loading…");
       setDelayedText(latestDeploymentNote, "", "Reading recorded deployment status.");
     } else {
-      setText(
+      setDeploymentOutcome(
         latestDeploymentValue,
-        `v${latest.revision} · ${label ?? (latestDeploymentError ? "Unavailable" : "Loading…")}`,
+        `v${latest.revision}`,
+        label ?? (latestDeploymentError ? "Unavailable" : "Loading…"),
+        DEPLOYMENT_OUTCOME_TONES[latestDeploymentStatus],
       );
       setText(
         latestDeploymentNote,
@@ -2167,11 +2295,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
       );
     }
     const mayBeOffline = replacementFailed || selectedFailed;
-    setText(liveServingValue, mayBeOffline ? "May be offline" : "Not verified");
-    setText(
-      liveServingNote,
-      mayBeOffline ? "" : "Deployment records don’t verify live serving or model access.",
-    );
+    setLiveServing(mayBeOffline);
     const outcome = newerHidden ? "" : (latestDeploymentStatus ?? "");
     if (latestDeploymentValue.dataset.outcome !== outcome) {
       latestDeploymentValue.dataset.outcome = outcome;
@@ -2232,13 +2356,14 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
       const modelCheck = ["RUNTIME_MODEL_PROBE_FAILED", "RUNTIME_MODEL_PROBE_TIMEOUT"].includes(
         code,
       );
+      setText(recoveryLabel, `Deployment failed · ${version}`);
       setText(
         recoveryTitle,
         mayBeOffline ? "This Agent may be offline" : `${version} deployment failed`,
       );
       const failure = modelCheck
-        ? `${version} failed its startup model check.`
-        : `${version} did not deploy successfully.`;
+        ? `${version} failed its startup model check`
+        : `${version} did not deploy successfully`;
       // Offer only links the caller's permission answer and this tab's remembered denials
       // allow; the API still authorizes each page they open (finding 1458).
       const logsAllowed =
@@ -2271,7 +2396,11 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
         // Without the Logs link this is the reader's only way to the logs (finding 1484).
         impact += " Ask someone with log access to check the failed version’s logs.";
       }
-      setText(recoveryMessage, `${failure} ${impact}`);
+      // The code ends the first sentence, so the reader can match it to Logs and to occ.
+      setText(recoveryLead, code ? `${failure} (` : `${failure}.`);
+      setText(recoveryCode, code ?? "");
+      setHidden(recoveryCode, !code);
+      setText(recoveryRest, code ? `). ${impact}` : ` ${impact}`);
       // Deploying again is the whole next step only where the API's message says so. The draft
       // it opens builds Deploy new version only from a readable Configuration, so the link waits
       // for a successful read of it (finding 1931).
@@ -2313,10 +2442,12 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
           : null;
         const logs = logsAllowed ? versionLink(`Open ${version} Logs`, latest.id, "logs") : null;
         const next = tab ? versionLink(nextLabel, "draft", tab) : null;
+        // The first action is the one primary on the page: Deploy again where the message says
+        // to, else the failed version's Logs. The others are secondary buttons.
         const actions = [again, logs, next].filter(Boolean);
-        if (actions.length) {
-          actions[0].className = "overview-primary";
-        }
+        actions.forEach((action, index) => {
+          action.className = index === 0 ? "button button--primary" : "button";
+        });
         recoveryActions.replaceChildren(...actions);
         recoveryActions.hidden = actions.length === 0;
       }
@@ -2498,6 +2629,11 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
                 }
               }
               renderLatestDeployment();
+              // A success is shown once the Agent reread makes the version current; until then
+              // the notice keeps "Deploying" rather than flash "Historical".
+              if (status !== "succeeded") {
+                renderVersionNotice();
+              }
               refreshDeployControls();
             },
           )
@@ -3258,6 +3394,8 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
       mountedTab = retained;
       showDraftEditorNavigationBlock = retained.showBlock;
       content.replaceChildren(...retained.nodes);
+      // The deployment may have settled while this tab was parked.
+      renderVersionNotice();
       retained.resumeDrafts();
       return;
     }
@@ -3442,6 +3580,16 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
         values,
         executionMode,
         readOnly: !draft,
+        // Every deployment needs a model authentication source, so the drawer asks for one only
+        // while the Agent has none; a deployed Agent with its key bound was told to set
+        // credentials "before first deploy" (finding 2063).
+        copy: {
+          drawerNotice: `New version. Changes affect future deployments using this Configuration.${
+            agent.harnessAuth
+              ? ""
+              : " Configure model credentials in the Credentials tab before deploying."
+          }`,
+        },
         drawerContext: {
           drafts: context.drafts,
           baseline: JSON.stringify([snapshot.id, snapshot.generation]),
@@ -3872,7 +4020,16 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
                 element(
                   "div",
                   { className: "form-actions" },
-                  button("Edit current Configuration", () => change("draft", "configuration")),
+                  button("Edit current Configuration", () => {
+                    // The draft this navigation opens takes it with its editor open. Saving
+                    // patches the Configuration, which the API authorizes on its own.
+                    linkedVersionView = {
+                      key: linkedKey("draft", "configuration"),
+                      load: consoleLoads + 1,
+                      edit: true,
+                    };
+                    context.navigate(target("draft", "configuration"));
+                  }),
                 ),
                 nativeDocument(values, "View admitted native configuration"),
               ),
@@ -4155,7 +4312,9 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
       render();
       editor.focus({ preventScroll: true });
     }
-    const edit = button("Edit Configuration", startEditing);
+    const edit = button("Edit Configuration", startEditing, {
+      "data-opens": "configuration-editor",
+    });
     const password = values.gateway?.auth?.password;
     const usesGeneratedGatewayPassword =
       password?.source === "env" &&
@@ -4513,7 +4672,7 @@ export async function renderAgentDetail(context, { agent: preloadedAgent = null 
     void renderTab({ activated: true });
     // Logs scrolls to its output once that has loaded.
     if (linked && nextTab !== "logs") {
-      openVersionDetail({ animate: true, deploy: linked.deploy });
+      openVersionDetail({ animate: true, deploy: linked.deploy, edit: linked.edit });
     }
     return true;
   });

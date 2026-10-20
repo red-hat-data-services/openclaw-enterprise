@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 
 import { InMemoryAuditSink } from "../../packages/audit/src/index.ts";
+import { DEPLOYMENT_POLL_MS } from "../../apps/controller/src/console/agents/detail.mjs";
 import { grantRole } from "../helpers/iam-grants.mjs";
 import { createRuntimeLogComputeDriver } from "../helpers/runtime-logs.mjs";
 import {
@@ -150,7 +151,7 @@ for (const tab of ["configuration", "logs", "channels"]) {
     // Only a successful read shows the Configuration is readable, so the page asks.
     await denied;
     await nextFrames(page);
-    assert.equal(await logs.getAttribute("class"), "overview-primary");
+    assert.equal(await logs.getAttribute("class"), "button button--primary");
     assert.equal(await recovery.getByRole("link", { name: "Deploy again" }).count(), 0);
     assert.equal(await page.evaluate(() => globalThis.deployAgainSeen), false);
     const configurationDenials = auditSink
@@ -202,7 +203,7 @@ test("A failed Configuration read leaves Deploy again hidden and is not repeated
       .length,
     1,
   );
-  assert.equal(await logs.getAttribute("class"), "overview-primary");
+  assert.equal(await logs.getAttribute("class"), "button button--primary");
   assert.equal(await page.evaluate(() => globalThis.deployAgainSeen), false);
 });
 
@@ -228,7 +229,7 @@ test("The draft offers no Deploy again when its Configuration read fails", async
   await failed;
   await page.locator('.content [aria-live="polite"][aria-busy="false"]').waitFor();
   await nextFrames(page);
-  assert.equal(await logs.getAttribute("class"), "overview-primary");
+  assert.equal(await logs.getAttribute("class"), "button button--primary");
   assert.equal(await recovery.getByRole("link", { name: "Deploy again" }).count(), 0);
   assert.equal(await page.evaluate(() => globalThis.deployAgainSeen), false);
 });
@@ -253,12 +254,12 @@ test("Recovery on another version offers Deploy again only after the Configurati
   await read.requested;
   await nextFrames(page);
   assert.equal(await recovery.getByRole("link", { name: "Deploy again" }).count(), 0);
-  assert.equal(await logs.getAttribute("class"), "overview-primary");
+  assert.equal(await logs.getAttribute("class"), "button button--primary");
 
   read.release();
   const again = recovery.getByRole("link", { name: "Deploy again" });
   await again.waitFor();
-  assert.equal(await again.getAttribute("class"), "overview-primary");
+  assert.equal(await again.getAttribute("class"), "button button--primary");
 });
 
 // Opens Deploy again from v1's Configuration tab with the draft's own Configuration read held, and
@@ -352,7 +353,7 @@ test("Recovery offers no Deploy again when the caller's permission answer fails"
   // The draft's Configuration read succeeded, so only the permission answer withholds the link.
   await page.getByRole("button", { name: "Deploy new version" }).waitFor();
   await nextFrames(page);
-  assert.equal(await logs.getAttribute("class"), "overview-primary");
+  assert.equal(await logs.getAttribute("class"), "button button--primary");
   assert.equal(await recovery.getByRole("link", { name: "Deploy again" }).count(), 0);
   assert.equal(await page.evaluate(() => globalThis.deployAgainSeen), false);
 });
@@ -396,14 +397,16 @@ test("A deployer who cannot read the Configuration gets no Open version draft", 
   assert.equal(answer.deploy, true);
   assert.equal(answer.update, false);
   const recovery = recoveryOf(page);
-  await recovery.getByText("v2 failed its startup model check.", { exact: false }).waitFor();
+  await recovery
+    .getByText("v2 failed its startup model check (RUNTIME_MODEL_PROBE_FAILED).", { exact: false })
+    .waitFor();
   const logs = recovery.getByRole("link", { name: "Open v2 Logs" });
   await logs.waitFor();
   // The link used to render with Logs, before any Configuration read.
   assert.equal(await page.evaluate(() => globalThis.openDraftSeen), false);
   await denied;
   await nextFrames(page);
-  assert.equal(await logs.getAttribute("class"), "overview-primary");
+  assert.equal(await logs.getAttribute("class"), "button button--primary");
   assert.equal(await recovery.getByRole("link", { name: "Open version draft" }).count(), 0);
   assert.equal(await page.evaluate(() => globalThis.openDraftSeen), false);
   const configurationDenials = auditSink
@@ -450,8 +453,114 @@ test("Open version draft waits for the Configuration read to succeed", async (t)
   await read.requested;
   await nextFrames(page);
   assert.equal(await openDraft.count(), 0);
-  assert.equal(await logs.getAttribute("class"), "overview-primary");
+  assert.equal(await logs.getAttribute("class"), "button button--primary");
 
   read.release();
   await openDraft.waitFor();
+});
+
+// While v2 deploys, v1 is still the current version. Right after Deploy new version the page
+// selected v2 and called it "Historical" beside "Selected version v1" until the deployment
+// finished (finding 2065). Its notice says it is deploying until it becomes current.
+async function deployingVersion(t, name) {
+  const { fixture, namespace } = await createReadyConsoleNamespace(t, name);
+  const agent = await fixture.createAgent(namespace.id, `${name} Agent`, nativeValues("v1"));
+  const { revision: current } = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
+  const next = await fixture.deployAgent(namespace.id, agent.id);
+  const { page } = await newPage(t, fixture, { browser });
+  const record = { status: "running" };
+  await page.route(
+    `${fixture.origin}/namespaces/${namespace.id}/agents/${agent.id}/deployments/${next.id}`,
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          data: {
+            deploymentId: next.id,
+            namespaceId: namespace.id,
+            agentId: agent.id,
+            status: record.status,
+            error:
+              record.status === "failed"
+                ? persistedDeploymentError("DEPENDENCY_UNAVAILABLE")
+                : null,
+            warnings: [],
+            progress: null,
+          },
+          meta: { requestId: "req_test_deploying_label" },
+        }),
+      }),
+  );
+  await page.clock.install({ time: new Date("2026-10-20T12:00:00Z") });
+  await login(page, fixture, detailUrl(fixture, namespace.id, agent.id, next.id, "configuration"));
+  const summary = page.getByRole("region", { name: "Agent state at a glance" });
+  await summary.getByText("v2 · In progress", { exact: true }).waitFor();
+  await page
+    .getByText(
+      "Deploying version · read-only admitted snapshot. It becomes the current version only if its deployment completes.",
+      { exact: true },
+    )
+    .waitFor();
+  return { fixture, namespace, agent, current, next, page, record, summary };
+}
+
+// Every text the version notice shows, in order, from now on.
+const watchNotice = (page) =>
+  page.evaluate(() => {
+    const seen = [];
+    globalThis.noticeTexts = seen;
+    const note = () => {
+      const text = globalThis.document.querySelector(".version-selection-notice")?.textContent;
+      if (text && seen.at(-1) !== text) {
+        seen.push(text);
+      }
+    };
+    new globalThis.MutationObserver(note).observe(globalThis.document.body, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+    });
+  });
+
+test("A version that is deploying is labelled Deploying, not Historical, until it becomes current", async (t) => {
+  const { fixture, namespace, agent, current, next, page, record, summary } =
+    await deployingVersion(t, "Deploying label");
+  // v1 is still the version selected for service.
+  assert.equal(await summary.getByText("v1", { exact: true }).count(), 1);
+  assert.equal(await page.getByText(/^Historical version/).count(), 0);
+
+  // v1 itself is still the current version.
+  await page.goto(detailUrl(fixture, namespace.id, agent.id, current.id, "configuration").href);
+  await page.getByText(/^Current version · read-only admitted snapshot/).waitFor();
+  await page.goBack();
+  await page.getByText(/^Deploying version · read-only admitted snapshot/).waitFor();
+
+  // Completion makes v2 current, and the notice goes from Deploying to Current with no
+  // Historical in between.
+  await watchNotice(page);
+  await fixture.activateRevision(namespace.id, agent.id, next.id, current.id);
+  record.status = "succeeded";
+  await page.clock.runFor(DEPLOYMENT_POLL_MS);
+  await page.getByText(/^Current version · read-only admitted snapshot/).waitFor();
+  await summary.getByText("v2", { exact: true }).waitFor();
+  assert.equal(await page.getByText(/^Deploying version/).count(), 0);
+  const labels = (await page.evaluate(() => globalThis.noticeTexts)).map(
+    (text) => text.split(" ·")[0],
+  );
+  assert.equal(labels.at(-1), "Current version");
+  assert.equal(labels.includes("Historical version"), false, labels.join(" → "));
+});
+
+// A Configuration tab parked while the deployment fails shows Historical when it comes back.
+test("A deploying version's parked Configuration tab says Historical once the deployment fails", async (t) => {
+  const { page, record } = await deployingVersion(t, "Deploying parked");
+  await page.getByRole("tab", { name: "Plugins", exact: true }).click();
+  await page.getByRole("tab", { name: "Plugins", exact: true, selected: true }).waitFor();
+  record.status = "failed";
+  await page.clock.runFor(DEPLOYMENT_POLL_MS);
+  await page.getByText("v2 · Failed", { exact: true }).waitFor();
+  await page.getByRole("tab", { name: "Configuration", exact: true }).click();
+  await page.getByText(/^Historical version · read-only admitted snapshot/).waitFor();
+  assert.equal(await page.getByText(/^Deploying version/).count(), 0);
 });
