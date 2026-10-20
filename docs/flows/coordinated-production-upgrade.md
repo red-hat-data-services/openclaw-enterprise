@@ -1,7 +1,7 @@
 ---
 created: 2026-09-23
-updated: "2026-10-18"
-last_updated_session: "authoring-run/ebb1c629-97b2-4b9a-aa67-a5e750346031"
+updated: "2026-10-20"
+last_updated_session: "authoring-run/9d1ff825-b9f4-492a-9420-1e316d820e28"
 ---
 
 # Production image upgrade flow
@@ -94,7 +94,11 @@ copies each rendered API and worker Pod template (selected controller image, env
 mounts, service account) into a one-shot Pod whose Installation volume reads a
 temporary Secret holding the candidate. The Pod runs `loadStartupConfigurationSnapshot`
 and `loadInstallationConfiguration`, which resolve Drivers and Preset files
-without the database. With the bundled Kubernetes Compute Driver it then runs
+without the database. On a typed configuration refusal,
+`apps/controller/src/startup-failure.ts:formatStartupConfigurationFailure` prints
+at most 32 filtered field diagnostics, using the API/worker log filter. The
+helper preserves these paths and messages in its component logs before stopping
+any writer. With the bundled Kubernetes Compute Driver it then runs
 `KubernetesComputeDriver.preflight` with the Pod's Kubernetes credentials (its
 service account in `inCluster` mode), as API and worker startup do; that check refuses, for example, single-cluster
 [split-layout Gateway storage](../reference/drivers/kubernetes-compute.md#existing-split-layout-installations).
@@ -281,6 +285,8 @@ checks the exported inventory before following the recovery procedure. Empty
 [keep this for the user to add notes. do not change between edits]
 
 ## Changelog
+
+- 2026-10-20 01:48: Preserve field diagnostics before quiescence. (authoring-run/9d1ff825-b9f4-492a-9420-1e316d820e28 - e7e5f3321cb0a8471d74964eba56ddd069a4e4c5)
 
 - 2026-10-18: The initialization hook checks the Installation before migration.
 - 2026-10-12 15:14: Record bootstrap Job grants required by the two-cluster upgrade preflight alongside the fixture correction. (authoring-run/ebb1c629-97b2-4b9a-aa67-a5e750346031 - 9578f6f7aaff9b8545346f43043cbc5b9bcf674e)
