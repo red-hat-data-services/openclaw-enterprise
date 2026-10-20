@@ -70,6 +70,7 @@ Image flags select images after this comparison.
 A runtime release also reads complete authorized inventory and records every running Agent's baseline
 version. Nonterminal deployment work, a missing selected version, or an unready
 Namespace stops preparation. Stopped and deleting Agents are excluded.
+Pending repository cleanup does not block preparation.
 
 For repository-enabled releases, the helper requires explicit immutable
 controller and broker images. It inventories every node matching the control
@@ -287,6 +288,7 @@ checks the exported inventory before following the recovery procedure. Empty
 ## Changelog
 
 - 2026-10-20 01:48: Preserve field diagnostics before quiescence. (authoring-run/9d1ff825-b9f4-492a-9420-1e316d820e28 - e7e5f3321cb0a8471d74964eba56ddd069a4e4c5)
+- 2026-10-19 22:34: Document that pending repository cleanup does not block upgrade preparation. (authoring-run/d59b973b-1f0b-46bb-b16f-d67bd24ed6d3 - 57acafe81482a890b02ae530793246f2c2e7be79)
 
 - 2026-10-18: The initialization hook checks the Installation before migration.
 - 2026-10-12 15:14: Record bootstrap Job grants required by the two-cluster upgrade preflight alongside the fixture correction. (authoring-run/ebb1c629-97b2-4b9a-aa67-a5e750346031 - 9578f6f7aaff9b8545346f43043cbc5b9bcf674e)

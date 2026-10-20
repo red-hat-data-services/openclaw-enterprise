@@ -243,6 +243,32 @@ test("Refocusing a loaded page keeps it steady while access is rechecked", async
   await page.waitForURL("**/console/agents/new**");
 });
 
+for (const moveToSidebar of [false, true]) {
+  test(`Agent revalidation ${moveToSidebar ? "preserves newer sidebar focus" : "restores header action focus"}`, async (t) => {
+    const { page } = await openList(t, "Header focus", "Header Agent", {
+      deploy: true,
+      running: true,
+    });
+    await openAgent(page, "Header Agent");
+    const action = page.locator(".page-header").getByRole("button", { name: "Create new version" });
+    const sidebar = page.getByRole("link", NAMESPACES);
+    await action.focus();
+    assert.equal(await isFocused(action), true);
+
+    const session = await holdOnce(t, page);
+    await refocus(page);
+    await session.requested;
+    await page.locator(heldView).waitFor();
+    assert.equal(await action.evaluate((node) => node.closest("[inert]") !== null), true);
+    if (moveToSidebar) {
+      await sidebar.focus();
+    }
+    session.release();
+    await page.locator(settledView).waitFor();
+    assert.equal(await isFocused(moveToSidebar ? sidebar : action), true);
+  });
+}
+
 test("Back after switching Namespace keeps the shown page until the return is admitted", async (t) => {
   const { fixture, page } = await signedOutPage(t);
   const first = await fixture.createNamespace("First scope", { ready: true });
@@ -406,7 +432,7 @@ test("A page held for Agents keeps its own navigation and header until Agents re
   ]);
 
   // A return from Settings: the retained list revalidates while Settings is held.
-  await page.getByRole("button", { name: /OpenClaw Enterprise/ }).click();
+  await page.locator(".account-toggle").click();
   await page.getByRole("menuitem", { name: "Settings" }).click();
   await page.locator(settledView).locator("dl.settings").waitFor();
   await shownFrames(page);
@@ -415,10 +441,11 @@ test("A page held for Agents keeps its own navigation and header until Agents re
   await returnRead.requested;
   returnRead.release();
   await listShown(page, "Shell Agent");
-  // The first entry is the state the recorder re-reads after the previous splice.
+  // The first entry is the state the recorder re-reads after the previous splice. Settings has
+  // no Namespace scope, so it shows no selector, held or not.
   assert.deepEqual(await shownFrames(page), [
-    "none | Settings | selector | Settings",
-    "none | Settings | selector | Settings (held)",
+    "none | Settings | no selector | Settings",
+    "none | Settings | no selector | Settings (held)",
     agentsShown,
   ]);
 });
@@ -538,7 +565,7 @@ for (const c of [
     prepare: (page) => openAgent(page, "Draft Agent"),
     enter: (page) =>
       page
-        .locator(".agent-overview-toolbar")
+        .locator(".content .page-header")
         .getByRole("button", { name: "Create new version" })
         .click(),
     revision: /revision=draft/,
@@ -1492,8 +1519,8 @@ test("Logout during a first visit's hold leaves nothing private, even after Back
   const agentRead = await holdAgent(t, page, namespace, agent);
   await page.getByRole("link", { name: "Held Agent" }).click();
   await agentRead.requested;
-  await page.getByRole("button", { name: /OpenClaw Enterprise/ }).click();
-  await page.getByRole("menuitem", { name: "Logout" }).click();
+  await page.locator(".account-toggle").click();
+  await page.getByRole("menuitem", { name: "Sign out" }).click();
   await page.getByRole("button", { name: "Login" }).waitFor();
   agentRead.release();
   await page.clock.runFor(400);
