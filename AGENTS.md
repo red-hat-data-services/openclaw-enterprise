@@ -152,6 +152,9 @@ Use [mermaid-diagrams](.agents/skills/mermaid-diagrams/SKILL.md) when a diagram
 clarifies a change, architecture, lifecycle, or dependency in documentation or a
 PR. It provides a shared template and distinguishes implemented from pending paths.
 
+Use [carry-pr](.agents/skills/carry-pr/SKILL.md) to carry an unmerged upstream PR
+into this fork.
+
 When the user or owning workflow requests an independent code review, use
 [autoreview](.agents/skills/autoreview/SKILL.md). Follow the
 [Enterprise review guide](docs/testing/autoreview.md) for usage and upstream sync.

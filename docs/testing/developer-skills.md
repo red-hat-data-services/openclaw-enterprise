@@ -17,6 +17,7 @@ Find the developer skill for your task and check how it is maintained.
 | Acceptance scenarios            | [oceinteg](../../.agents/skills/oceinteg/SKILL.md), only when explicitly invoked |
 | Diagrams                        | [mermaid-diagrams](../../.agents/skills/mermaid-diagrams/SKILL.md)               |
 | Behavior-neutral cleanup        | [deslop](../../.agents/skills/deslop/SKILL.md)                                   |
+| Carry an unmerged upstream PR   | [carry-pr](../../.agents/skills/carry-pr/SKILL.md)                               |
 | Requested independent review    | [autoreview](autoreview.md)                                                      |
 
 Default image-version changes require [native image verification](../../.agents/skills/local-dev/references/image-version-verification.md)
