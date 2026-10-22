@@ -1,7 +1,7 @@
 ---
 created: "2026-09-23"
-updated: "2026-10-20"
-last_updated_session: https://team.openclaw.ai/chat/roboclaw/dashboard/db15726a-e911-4eff-87c7-9f90ca5b2e3b
+updated: "2026-10-21"
+last_updated_session: authoring-run/aba975bf-8e97-4c9d-9e34-dc2c9c79d591
 ---
 
 # Agent provisioning flow
@@ -16,7 +16,7 @@ See [worker reconciliation](controller-worker.md) and [Harness topology](harness
 
 ## Entry Points
 
-- Console: `apps/controller/src/console/agents/create.mjs`, with the shared Slack Secret select/create modal in `apps/controller/src/console/channels/slack.mjs`.
+- Console: `apps/controller/src/console/agents/create.mts`, with the shared Slack Secret select/create modal in `apps/controller/src/console/channels/slack.mjs`.
 - API: `packages/contracts/src/api/routes.ts:provisionAgent`, `apps/controller/src/http/agents.ts:createAgentHandlers`, and `packages/occ/src/index.ts:OpenClawController.provisionAgent`.
 - Preconditions: a ready Namespace, Dedicated runtime and selected Drivers, PostgreSQL-backed work storage, required Agent/Configuration/deploy permissions, exact Secret access and existing transactional IAM authority. No provisioning-input keyring is required.
 
@@ -51,7 +51,7 @@ graph TD
 
 ### 1. Console saves credentials and freezes a provisioning request
 
-`apps/controller/src/console/agents/create.mjs:renderCreateAgent`
+`apps/controller/src/console/agents/create.mts:renderCreateAgent`
 
 Harness and execution mode are separate. OpenClaw defaults to Embedded; Dedicated
 requires reported native worker support. Dedicated OpenClaw retains its native
@@ -62,18 +62,18 @@ Service Accounts and Codex plugin browsing remain specific to Codex.
 
 The Slack modal saves tokens through `POST /namespaces/:namespaceId/secrets` before
 Agent creation, then clears inputs. Apply stages references/environment bindings;
-Cancel retains created Secrets. Model discovery uses unsaved credentials; Create Agent
+Cancel discards selections but retains created Secrets. Model discovery uses unsaved credentials; Create Agent
 saves the Namespace Secret, clears inputs and reuses its reference on retries.
-Presets retain their credential/provider. Recover a lost save response before retrying.
+Bound Presets retain their credential/provider. Recover a lost save response before retrying.
 
 A selected Credential Gateway's catalog directs Console to register the model
 Secret before source-backed provisioning. [Console recovery](../reference/console/create-and-deploy.md)
 reuses confirmed sources and safely retries uncertain registration.
 Installation discovery preserves catalog metadata.
 
-Create Agent submits inline Configuration, Secret and model-auth references, Agent options, repository bindings with an explicit access profile, and a stable request ID. The worker grants exact Secret access, including Slack. After uncertain admission, Console resends the same ID and inputs without resaving acknowledged Secrets.
+Create Agent sends a stable request ID, inline Configuration, Secret and model-auth references, Agent options, and repository bindings with an explicit access profile. The worker grants Secret access, including Slack. After uncertain admission, Retry sends the same ID and inputs without saving Secrets again.
 
-On ordinary draft creation paths, Console creates the Configuration and Agent, then grants access to the selected Slack Secrets. A grant failure retains the saved Agent and offers Retry credential access on that Agent, without repeating creation.
+For a draft, Console creates the Configuration and Agent, then grants access to selected Slack Secrets. Retry credential access keeps that Agent.
 
 ### 2. OCC admits one job
 
@@ -106,11 +106,15 @@ Source-backed provisioning records the canonical model source and grants only so
 Admission, replay, retry and execution recheck caller authority, source readiness and Gateway
 ownership. Queued or running work prevents source deletion.
 
-Kubernetes `kubernetesGatewayConfigurationDocument` renders trusted-proxy configuration
-without loopback HTTP. It preserves explicit human identities/scopes alongside
+Compute prepares runtime credentials without loopback HTTP. Kubernetes
+`kubernetesGatewayConfigurationDocument` renders trusted-proxy configuration
+and preserves explicit human identities/scopes alongside
 machine administration, defaulting to machine-only. Provisioning and deploy
-admission reject malformed identity grants and human admission with admin device
-scopes, including whitespace. See [Gateway authentication](../reference/drivers/kubernetes-compute/networking-and-isolation.md#gateway-authentication).
+admission reject unknown or padded operator scopes, blank or padded identity keys,
+grants for identities outside `allowUsers`, and human admission with admin device
+scopes, including whitespace. These refusals precede workload replacement.
+Human ingress and its network policy remain operator-managed; no OCE human
+account is required. See [Gateway authentication](../reference/drivers/kubernetes-compute/gateway-authentication.md).
 Provisioning supplies no Gateway token or trust override. Losing its claim cancels
 Kubernetes Configuration requests, freeing the worker.
 
@@ -123,9 +127,11 @@ defers work without consuming retries until that version activates or fails. The
 success or the deployment’s safe error; meanwhile `progress` names its wait. Stop during rollout yields `REVISION_STOPPED`; Stop or deletion
 before handoff yields `PROVISIONING_CANCELLED` and says which happened. Status retains the Agent ID; both IDs survive restart.
 
-Create Agent (`apps/controller/src/console/agents/create.mjs:waitForProvisioning`) shows the job's named
+Create Agent (`apps/controller/src/console/agents/create.mts:waitForProvisioning`) shows the job's named
 wait and waits one second between status reads, spending it on details such as a full Pod quota, cancelling unfinished reads
-at the next poll. Leaving the page stops polling, not provisioning.
+at the next poll. Admission, status and retry report the stored client `requestId`.
+If absent or different, Create keeps the original request and any confirmed job.
+`meta.requestId` identifies each HTTP request. Leaving stops polling, not provisioning.
 If the first deployment fails, open the existing Agent, correct the cause and deploy a new version.
 After an intentional Stop, deploy when ready. Reconciliation owns startup and activation;
 subsequent deployments use Deploy.
@@ -186,7 +192,9 @@ remain; for migration `0049` blockers, see [legacy bindings](../reference/settin
 
 ## Changelog
 
-- 2026-10-20 14:57: Preserve human Gateway identities and reject malformed or automatic administrator grants; consolidate PR #2596 history. (agent:roboclaw:dashboard:db15726a-e911-4eff-87c7-9f90ca5b2e3b - fd73e091f)
+- 2026-10-21 13:21: Validate native identity grants before rollout and clarify external human ingress; accompanying local changes. (authoring-run/aba975bf-8e97-4c9d-9e34-dc2c9c79d591 - 4accde87c)
+
+- 2026-10-20 14:57: Preserve human Gateway identities and reject malformed or automatic administrator grants; consolidate PR #2596 history. (PR #3049 - fd73e091f)
 
 - 2026-10-17: Bound optional deployment details to the provisioning poll interval. (PR #2685)
 

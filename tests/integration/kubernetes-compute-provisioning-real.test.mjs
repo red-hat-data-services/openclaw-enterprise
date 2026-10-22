@@ -343,12 +343,35 @@ test(
     // Dedicated workloads and the Harness workspace must remain inside the exact tenant.
     const agentId = `agt_${randomUUID()}`;
     const candidate = revision(driver, readyOwner, agentId, 1);
+    // Human ingress is external; this real Compute lifecycle proves the Gateway
+    // receives distinct identity grants, not just that OCC stores their input.
+    const gatewayAuth = {
+      mode: "trusted-proxy",
+      trustedProxy: {
+        userHeader: "x-occ-identity",
+        allowUsers: ["occ-workspace-files", "oidc:member-01"],
+      },
+      identityScopes: {
+        "occ-workspace-files": ["operator.admin"],
+        "oidc:member-01": ["operator.read", "operator.write"],
+      },
+    };
+    candidate.configuration.gateway.auth = gatewayAuth;
     await waitFor("discovered Agent gateway and immutable revision to become ready", async () => {
       const observation = await driver.prepareRevision(candidate, revisionContext(candidate));
       assert.equal(observation.namespaceId, owner.id);
       return observation.ready ? observation : undefined;
     });
     const gateway = await assertReadyGateway(existingName, agentId, owner.id, candidate);
+    const gatewayConfiguration = await resource(
+      "configmap",
+      `gateway-${hash(agentId)}-rev-${hash(candidate.id)}`,
+      existingName,
+    );
+    assert.deepEqual(
+      JSON.parse(gatewayConfiguration.data["openclaw.json"]).gateway.auth,
+      gatewayAuth,
+    );
     const workload = await resource("deployment", revisionName(candidate), existingName);
     const harnessClaim = await assertHarnessWorkspaceClaim(existingName, owner.id, agentId);
     assert.equal(
@@ -712,6 +735,26 @@ test(
         },
         "gateway.auth.identityScopes",
       ],
+      ...["operator.reed", " operator.read", "operator.read "].map((scope) => [
+        {
+          ...gatewayAuth,
+          identityScopes: {
+            ...gatewayAuth.identityScopes,
+            "oidc:member-01": [scope],
+          },
+        },
+        "gateway.auth.identityScopes",
+      ]),
+      ...["", " oidc:member-01", "oidc:member-01 ", "oidc:removed-03"].map((identity) => [
+        {
+          ...gatewayAuth,
+          identityScopes: {
+            ...gatewayAuth.identityScopes,
+            [identity]: ["operator.admin"],
+          },
+        },
+        "gateway.auth.identityScopes",
+      ]),
     ]) {
       const invalid = structuredClone(body);
       invalid.configuration.values.gateway.auth = auth;

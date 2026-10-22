@@ -167,7 +167,11 @@ implementations, plus channel and optional service-account, plugin, repository, 
 Credential Gateway integrations. [Driver development](contributing/driver-development.md)
 links to contracts; [selection](reference/drivers/selection.md) defines trusted
 package loading. [Backends](reference/backends.md) supply authenticated clients
-to related Drivers within their documented experimental scope.
+to related Drivers within their documented experimental scope. Driver-owned
+configuration definitions share schemas and validation across startup and Agent
+settings. A contribution registry binds them to existing resource owners, which
+retain authorization, persistence, and save/apply lifecycle; see
+[configuration discovery](reference/drivers/selection.md#configuration-definitions-and-discovery).
 
 Compute owns Namespace infrastructure and each Agent's gateway and workload
 lifecycle: preparation, readiness, activation, stop, retirement, and deletion.
@@ -246,6 +250,13 @@ Trusted human operators with exact-Agent `administer` permission can enter the
 OCC checks admission and session retention, but does not authorize or audit each
 native command. Operators share the selected gateway's exposed conversations
 and credentials; this grants no access to another Agent or platform IAM.
+
+Separately, Kubernetes Compute preserves explicit native human identities and
+grants for an operator-managed authenticated ingress. Those humans need no OCE
+account; OpenClaw owns their profiles and native access controls. This path
+shares the Agent's tools, credentials and workspace and does not grant OCC access.
+The operator owns ingress authentication and exact-Gateway network access;
+see the [ingress contract](reference/drivers/kubernetes-compute/gateway-authentication.md).
 
 Configuration and immutable AgentRevision records remain authoritative for
 managed deployments. Native edits may diverge; OCC neither imports them nor

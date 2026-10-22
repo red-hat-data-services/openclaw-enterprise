@@ -6,7 +6,8 @@ protected Helm values, Installation YAML and Kubernetes context. EKS also needs
 [strict mode](eks.md#enable-console-workspace-files).
 
 OCC API/worker Pods must share the private Envoy Service's cluster; OCC in
-Compose needs [hybrid routing](local-compose-kubernetes.md).
+Compose needs [hybrid routing](local-compose-kubernetes.md). Enabling a Helm
+value alone does not connect a Compose API to the private Service.
 The chart defaults to `gatewayRouting.enabled: false`, unlike production examples.
 Install routing controllers, create the service-key Secret, and configure Helm,
 Installation settings and [proxy trust](#configure-native-gateway-authentication)
@@ -141,8 +142,14 @@ writes or gateway Pod/exec access.
 
 ### Configure native gateway authentication
 
+These settings configure OCC's machine-identity route. Separate human identities
+require an operator-managed authenticated ingress and network access; see the
+[human ingress contract](../../reference/drivers/kubernetes-compute/gateway-authentication.md).
+Human traffic must not use the machine-identity route. No OCE user account is
+required for the separate ingress.
+
 > **Warning: shared human access is for trusted teammates only.** Review the
-> [shared-Agent trust boundary](../../reference/drivers/kubernetes-compute/networking-and-isolation.md#gateway-authentication)
+> [shared-Agent trust boundary](../../reference/drivers/kubernetes-compute/gateway-authentication.md)
 > before adding human identities. Removing login access or changing a role does
 > not guarantee that accepted work stops. Whether IdP account disablement or
 > group-membership removal blocks new admission depends on your ingress's
@@ -167,7 +174,7 @@ Compute renders trusted-proxy authentication, machine
 `x-occ-identity: occ-workspace-files`/`operator.admin`, proxy trust and real-IP
 fallback. Configurations/Presets may omit these fields; matching values are accepted.
 Unsupported authentication or conflicting tenant trust settings fail deployment.
-See the [authentication contract](../../reference/drivers/kubernetes-compute/networking-and-isolation.md#gateway-authentication).
+See the [authentication contract](../../reference/drivers/kubernetes-compute/gateway-authentication.md).
 
 For optional operator loopback access, set `gateway.auth.password` to the
 environment SecretRef
@@ -181,7 +188,9 @@ identity header, and sets `X-Real-IP` from its direct OCC connection. That
 fallback works when OCC and Envoy share a Pod CIDR. Do not fabricate an address
 or allow direct workload access to work around an attribution failure.
 
-NetworkPolicy must restrict native gateway ingress to those Envoy Pods. The
+NetworkPolicy must restrict OCC's native gateway ingress path to those Envoy Pods.
+A separate human proxy requires the additional exact-peer policy described in
+the [human ingress contract](../../reference/drivers/kubernetes-compute/gateway-authentication.md). The
 chart restricts proxy ingress to OCC API/worker Pods and Harness Pods in attached
 tenant namespaces, and permits its required routing
 and control-plane traffic. A trusted source CIDR by itself is not sufficient
