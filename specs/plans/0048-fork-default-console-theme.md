@@ -64,8 +64,8 @@ existing capability; it introduces no Driver, API, or Agent lifecycle behavior.
 | Native image requirements before merge            | Exact-head native image workflow: controller and runtime on AMD64 and ARM64                                                | Pending; local ARM64 proof does not replace this    |
 
 No model-runtime behavior changes. Packaging verification does not claim model
-execution, real-cluster deployment, or image publication. New public UI captures
-must retain the requested neutral branding.
+execution, real-cluster deployment, or image publication. Published UI evidence
+shows the actual RedClaw image default.
 
 ## Delivery record
 
@@ -77,9 +77,10 @@ startup with `CONSOLE_THEME_INVALID`. The production target was exercised with
 development composition; this does not establish production-mode deployment.
 
 A neutral replacement passed real browser sign-in, authenticated Namespace read,
-mobile rendering, and sign-out without page errors. Screenshots and an interaction
-video remain outside the checkout and use neutral branding. No Agent execution
-was exercised.
+mobile rendering, and sign-out without page errors. The same browser workflow
+also passed with the actual RedClaw default, without a theme override or mount.
+Screenshots and an interaction video remain outside the checkout and show that
+default. No Agent execution was exercised.
 
 Lint, workspace boundaries, full workspace formatting, scoped bundle/script/plan
 formatting, documentation links and length, and console flow validation passed.
@@ -99,5 +100,7 @@ fork-maintenance instructions. Publication remains a separate authorized step.
 
 ## Changelog
 
+- 2026-10-22: Replace neutral PR captures with the actual image default at the
+  user's request; retain the separate operator-override check.
 - 2026-10-22: Plan and begin the fork-owned default theme carry against the
   recorded source baseline.
