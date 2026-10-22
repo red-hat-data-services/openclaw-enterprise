@@ -42,6 +42,10 @@ RUN mkdir -p /app/.development/configurations /var/lib/openclaw/bootstrap \
 # (apps/controller/src/http/route-compilers.ts).
 RUN node apps/controller/src/precompile-route-schemas.mjs
 
+# Fork branding uses the upstream theme contract; keep this hook in both final stages.
+COPY deploy/branding/redclaw/ /etc/openclaw/console-theme/
+ENV OCC_CONSOLE_THEME_DIR=/etc/openclaw/console-theme
+
 USER node
 ENTRYPOINT ["node"]
 CMD ["apps/controller/src/server.mjs"]
@@ -79,6 +83,10 @@ COPY --chown=node:node deploy/presets deploy/presets
 COPY --chown=node:node scripts/production-healthcheck.mjs scripts/production-healthcheck.mjs
 # As in the development stage: precompiled route validators and serializers for this image.
 RUN node apps/controller/src/precompile-route-schemas.mjs
+
+# Fork branding uses the upstream theme contract; keep this hook in both final stages.
+COPY deploy/branding/redclaw/ /etc/openclaw/console-theme/
+ENV OCC_CONSOLE_THEME_DIR=/etc/openclaw/console-theme
 
 USER node
 ENTRYPOINT ["node"]
