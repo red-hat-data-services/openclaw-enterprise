@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "displayName": "RedClaw",
+  "logo": "logo.png",
+  "favicon": "favicon.png",
+  "appleTouchIcon": "touch.png",
+  "colors": {
+    "bg": "#F2F2F2",
+    "surface": "#FFFFFF",
+    "surface2": "#F2F2F2",
+    "surfaceHover": "#E0E0E0",
+    "border": "#C7C7C7",
+    "borderStrong": "#707070",
+    "text": "#292929",
+    "textStrong": "#151515",
+    "textMuted": "#4D4D4D",
+    "accent": "#EE0000",
+    "accentHover": "#A60000",
+    "accentSubtle": "#FEF0F0",
+    "onAccent": "#FFFFFF",
+    "link": "#0066CC",
+    "success": "#3D7317",
+    "successSubtle": "#E9F7DF",
+    "warning": "#73480B",
+    "warningSubtle": "#FFF4CC",
+    "danger": "#B1380B",
+    "dangerSubtle": "#FFE3D9",
+    "info": "#5E40BE",
+    "infoSubtle": "#ECE6FF",
+    "overlay": "#00000066",
+    "focus": "#0066CC"
+  }
+}

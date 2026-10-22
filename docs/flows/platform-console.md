@@ -1,7 +1,7 @@
 ---
 created: 2026-09-01
-updated: 2026-10-21
-last_updated_session: authoring-run/634a754f-a79e-4aac-94fe-0646caf6a287
+updated: 2026-10-22
+last_updated_session: authoring-run/22b185a7-9ab6-40ac-bcab-9efad66e89e0
 ---
 
 # Platform console request flow
@@ -100,6 +100,10 @@ graph TD
 ## Execution Trace
 
 ### 1. Compose discovery metadata and serve public assets
+
+Both final controller stages in the root `Dockerfile` select the fork's
+[bundle](../../deploy/branding/README.md) through `OCC_CONSOLE_THEME_DIR`.
+Overrides retain precedence. Host processes require explicit configuration.
 
 `apps/controller/src/api-startup.mjs:startApi` loads an optional
 [theme bundle](../reference/console/theming.md) once. Invalid bundles stop startup;
@@ -369,6 +373,8 @@ refresh and inspection.
 [keep this for the user to add notes. do not change between edits]
 
 ## Changelog
+
+- 2026-10-22 14:09: Record fork image defaults (authoring-run/22b185a7-9ab6-40ac-bcab-9efad66e89e0 - d265e167a860a27f793d68f7b42567c5d6a7550e)
 
 - 2026-10-21 22:22: Connect console themes to API startup and the shared shell. (authoring-run/634a754f-a79e-4aac-94fe-0646caf6a287 - 2c9e7f6c4)
 - 2026-10-20 15:53: Add Namespace Secret management and uncertain-write recovery in the accompanying console change. (authoring-run/9b10a6df-a6ce-4d38-859d-480a59d95cf0 - e8185dac8)
