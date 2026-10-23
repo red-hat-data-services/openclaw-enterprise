@@ -69,6 +69,8 @@ and middleware name to the configured peers. Keep the
 [OpenShell Backend and Sandbox configuration](../reference/drivers/openshell-credential-gateway.md).
 A packaged Driver instead takes configuration through its Sandbox selection;
 its matching Credential Proxy selection has an empty `configuration`.
+Either kind can add `requestCapacity` to size OCC's in-memory request bounds; see
+[request-time capacity](../reference/drivers/credential-proxy.md#request-time-capacity).
 
 The API owns the static authority listener. Development binds only to loopback.
 Production needs a reachable host and a certificate covering the Service DNS
@@ -220,7 +222,12 @@ Inspect the withdrawal state and reason:
   Agent; record the enforcement refusal and verify that no request reached the
   controlled origin.
 - **Runtime retirement required:** if the reason is
-  `CREDENTIAL_WITHDRAWAL_REQUIRES_RUNTIME_RETIREMENT`, follow the
+  `CREDENTIAL_WITHDRAWAL_REQUIRES_RUNTIME_RETIREMENT` and `revisionId` names a
+  version other than the selected one, see
+  [withdrawal](../reference/credential-sources/withdrawal.md#withdraw-a-source-from-an-agent).
+  For the selected version, if `withdrawalInProgress` is `true`, wait for that
+  attempt first: a version that just became selected gets one more attempt.
+  Otherwise follow the
   [retirement procedure](deploy/credential-proxy-upgrade.md#stop-and-settle-before-upgrading).
   Observe retirement of the exact execution, record the actual withdrawal state
   and reason, and leave pending custody with its original owner. Do not restart

@@ -11,6 +11,24 @@ import {
   type OpenShellProviderProfile,
 } from "../../apps/controller/src/drivers/sandbox/openshell-gateway-client.ts";
 import type { routeStore } from "../fixtures/openshell-git-route-store.mjs";
+import { unloggedFields } from "./occ-log-line.ts";
+
+// The worker logs the runtime's events through the production logger (worker.mjs), which keeps
+// only allowlisted fields. Every event a fixture emits is logged the same way here, and a field
+// the logger drops or changes is recorded (finding 2244).
+const unloggedRuntimeFields: { readonly event: unknown; readonly fields: readonly string[] }[] = [];
+
+function logRuntimeEvent(event: Readonly<Record<string, unknown>>): void {
+  const fields = unloggedFields(event);
+  if (fields.length > 0) {
+    unloggedRuntimeFields.push({ event: event.event, fields });
+  }
+}
+
+/** The runtime event fields the production logger dropped since the last call. */
+export function takeUnloggedRuntimeFields() {
+  return unloggedRuntimeFields.splice(0);
+}
 
 type Entry = NonNullable<Awaited<ReturnType<OpenShellGitRuntime["entries"]["get"]>>>;
 type Faults = {
@@ -355,7 +373,10 @@ export function openShellGitRuntimeFixture({
     resolveDelivery,
   );
   runtime["owner"] = owner;
-  runtime["emit"] = (event: Readonly<Record<string, unknown>>) => events.push(event);
+  runtime["emit"] = (event: Readonly<Record<string, unknown>>) => {
+    events.push(event);
+    logRuntimeEvent(event);
+  };
   runtime["routes"] = store as unknown as OpenShellGitRuntime["routes"];
   if (store !== undefined && !store.rows.has(revision.id)) {
     // The row this worker's own bootstrap left: fence 1, the bootstrap generation written.
