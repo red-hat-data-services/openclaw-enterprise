@@ -126,10 +126,10 @@ or handle cannot transfer custody. Closing the stream cancels it. Cancellation o
 releases material; pending policy or receipt work retains its slot until settled. No pipelining.
 
 `packages/occ/src/credential-proxy.ts:resolve` maps the peer to persisted installation state and classifies one exact
-route through its registered provider. Before asynchronous authorization, it reserves
+route through its registered provider. Only then, before capture or policy I/O, it reserves
 the UUIDv7 request ID; its creation time fixes the 30-second replay horizon. Pending
-resolution and replay state are bounded; unsupported or ambiguous operations refuse
-before Secret access.
+resolution and per-Sandbox replay state are [bounded](../reference/drivers/credential-proxy.md#request-time-capacity);
+unsupported or ambiguous operations refuse before reserving it.
 
 Supplier enrollment starts at its authenticated current supervisor hello, not the first
 exchange. The supplier must keep the corresponding private key outside the Agent and
@@ -268,6 +268,7 @@ operation fence. Confirmation grants no request authority.
 
 `apps/controller/src/drivers/egress-proxy/openshell-git-runtime.ts:reconcile`
 cancels only definitely unsent writes. Uncertain writes stay pending and blocked.
+`release` drops closed routes whose Sandbox is gone; refusal stays.
 See [restart behavior](../reference/repository-credentials/protected-openshell-git.md#route-state-restarts-and-recovery).
 
 Creation requires the exact live owner. Deletion retains custody but prevents live
