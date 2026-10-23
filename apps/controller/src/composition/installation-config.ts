@@ -18,6 +18,11 @@ import {
   type OpenShellProxyOptions,
 } from "../drivers/egress-proxy/openshell.ts";
 import type { EgressAuthorityConfiguration } from "./egress-authority.ts";
+import {
+  chartListeners,
+  InstallationFieldError,
+  requireChartListener,
+} from "./installation-fields.ts";
 import { assertConfigurationSchema, requireConfiguration } from "@openclaw-enterprise/contracts";
 import { validateSandboxNetworkGrants } from "@openclaw-enterprise/contracts";
 import type { SandboxNetworkGrant } from "@openclaw-enterprise/contracts";
@@ -706,6 +711,13 @@ export async function loadInstallationConfiguration(options: {
     }
   }
 
+  requireChartListener(egressAuthority, environment, chartListeners.egressAuthority);
+  requireChartListener(
+    repositoryTransportConfiguration?.authority,
+    environment,
+    chartListeners.openshellGit,
+  );
+
   const backends = backendConfiguration(
     configuration.backend,
     serviceAccount,
@@ -872,6 +884,23 @@ export async function loadInstallationConfiguration(options: {
         "repository.nativeSender requires an exact Kubernetes repository service peer on port 8443.",
       );
     }
+  } else if (
+    kubernetesCompute &&
+    (compute.configuration as unknown as KubernetesComputeDriverOptions).network
+      .repositoryCredentials !== undefined
+  ) {
+    // The peer makes Compute project and clean up repository material Secrets. Only native
+    // delivery creates them, and only its chart grants the worker Secret list, so a peer
+    // left behind after a switch to protected Git fails every stop, retire and delete with a
+    // 403 (finding 2212). A field error, so startup logs name the field (finding 2226).
+    throw new InstallationFieldError([
+      {
+        path: "/drivers/compute/configuration/network/repositoryCredentials",
+        code: "INVALID_VALUE",
+        message:
+          "drivers.compute.configuration.network.repositoryCredentials requires repository.nativeSender; remove it for protected Git or when no repository is configured.",
+      },
+    ]);
   }
   const sandbox =
     sandboxSelection === undefined

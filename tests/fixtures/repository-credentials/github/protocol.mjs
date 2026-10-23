@@ -27,9 +27,14 @@ export function createGitHubProtocol({
   beforeMetadataResponse,
   issueResponse = (response) => response,
   issueResponseGate,
+  /** Awaited after GitHub revokes a token, before its answer is sent. */
+  revokeResponseGate,
   draftResponse = (body) => body,
   revokeStatus = 204,
+  issueStatus = 201,
 }) {
+  /** @type {string | undefined} */
+  let issueBody;
   const { privateKey, publicKey } = keyPair;
   const authority = createTokenAuthority({
     clock,
@@ -86,6 +91,20 @@ export function createGitHubProtocol({
         url.pathname === `/app/installations/${fixtureInstallationId}/access_tokens`
       ) {
         await beforeIssue?.();
+        if (issueBody !== undefined) {
+          // A raw answer in place of minting: malformed or ambiguous provider bodies.
+          if (!disconnect(request, response, url)) {
+            response.writeHead(issueStatus, { "content-type": "application/json" });
+            response.end(issueBody);
+          }
+          return;
+        }
+        if (issueStatus !== 201) {
+          // GitHub refuses before minting: a rejected App key (401), an unknown installation
+          // (404) or a repository outside it (422) answers with no token.
+          json(issueStatus, { message: "Refused", status: String(issueStatus) });
+          return;
+        }
         // The provider owns the token before response gates can delay or lose its delivery.
         const { token, expires, permissions } = authority.issue(
           request.headers.authorization,
@@ -115,6 +134,7 @@ export function createGitHubProtocol({
           return;
         }
         authority.revoke(request.headers.authorization);
+        await revokeResponseGate?.();
         if (!disconnect(request, response, url)) {
           response.writeHead(204).end();
         }
@@ -186,6 +206,14 @@ export function createGitHubProtocol({
     tokenState: authority.tokenState,
     setRevokeStatus(status) {
       revokeStatus = status;
+    },
+    /**
+     * Answer issue requests with this status and no token (201 issues again), or with this
+     * raw body in place of minting.
+     */
+    setIssueStatus(status, body = undefined) {
+      issueStatus = status;
+      issueBody = body;
     },
     disconnectAfterMutation(method, target) {
       disconnectMutation = `${method} ${target}`;

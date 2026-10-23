@@ -121,11 +121,11 @@ are unchanged.
 Empty hosts retain Service DNS for listeners and Certificate SANs.
 
 `apps/controller/src/drivers/compute/kubernetes/index.ts:validateDnsHostname`
-refuses rewritten/parser-invalid IPv4 with `ConfigurationFailure` before persistence;
-Helm also refuses rendering. IPv4 admission does not establish TLS.
+refuses rewritten/parser-invalid IPv4 with `ConfigurationFailure` before persistence.
+IPv4 admission does not establish TLS.
 `validateSandboxDomain` refuses numeric/hex suffixes, including canonical IPv4.
 Correct Helm values and Installation YAML with the
-[hostname correction procedure](../guides/deploy/breaking-changes.md#2026-10-14-gateway-hostnames-must-not-be-rewritten-ipv4)
+[hostname correction procedure](../guides/deploy/breaking-changes-before-2026-10-15.md#2026-10-14-gateway-hostnames-must-not-be-rewritten-ipv4)
 before upgrade/restart.
 
 `deploy/helm/openclaw-enterprise/templates/_network-policies.tpl:openclaw.networkPolicy.matchLabels`
@@ -135,7 +135,10 @@ On upgrades, `deploy/helm/openclaw-enterprise/files/check-installation.mjs` vali
 Installation without database/Kubernetes access; refusal stops migration and API
 replacement. The check uses `apps/controller/src/startup-failure.ts:formatStartupConfigurationFailure`
 and the API/worker filter `apps/controller/src/logging.ts:configurationLogDetails`: at most 32 field
-diagnostics, without submitted values.
+diagnostics, without submitted values, except
+`apps/controller/src/composition/installation-fields.ts:requireChartListener`:
+`CHART_LISTENER_MISMATCH` names ports, hosts or paths refused when
+`OCC_EGRESS_AUTHORITY_PORT`/`OCC_OPENSHELL_GIT_PORT` is set.
 
 The hook keeps the release name and bounds its suffix to 63 characters. Both
 database containers optionally mount the CA. Helm validates distinct application and
@@ -207,8 +210,8 @@ It allows DNS, database egress to every `database.cidrs` host, and
 Kubernetes API egress to every `cluster.cidrs` host. Collectors use their separate
 DNS, API, and exporter policy; unknown or missing component labels retain
 default-deny. Pre-install initialization has only its hook DNS/database grants.
-Each configured database or API destination must be an explicit IPv4 `/32`;
-refresh the values when a managed endpoint's addresses change.
+Destinations must be explicit IPv4 `/32` hosts; refresh them when managed
+endpoint addresses change. Chart ports take no leading zeros: `0443` fails.
 
 `deploy/helm/openclaw-enterprise/templates/networkpolicies.yaml` also renders
 an API-only TCP 443 egress policy when `api.modelDiscoveryCidrs` contains
@@ -234,14 +237,14 @@ preflight with the same advisory warning, emits `worker.started`, and polls
 durable Namespace/AgentRevision work. Readiness requires fresh queue-health
 observations; neither process mounts the bootstrap PVC.
 
-`apps/controller/src/composition/repository-credentials/platform.ts:composeRepoDriver`
+`apps/controller/src/composition/repository-credentials/platform.ts:composeRepositoryAccess`
 
-When selected, both processes load the same canonical registry and public CA,
-construct the GitHub Backend with a lazy Unix client, and register
-`GitHubRepoDriver` under the optional `repo` capability. The configured Backend
-member and `drivers.repo` must select the same Driver ID. API startup performs no control operation and loads no App key or
-session engine. The worker owns subsequent session lifecycle calls through the
-selected Driver; API readiness remains database-backed.
+With `repository` selected, both processes load the same registry and construct
+`GitHubRepositoryPolicy`; the GitHub Backend's `drivers.repo` member must equal
+`repository.id`. Native delivery adds the public CA and a lazy Unix client for
+`GitHubNativeRepositorySender`. Startup refuses the retired Installation
+`drivers.repo`. API startup performs no control operation and loads no App key.
+The worker owns session lifecycle; API readiness remains database-backed.
 
 `apps/controller/src/composition/repository-credentials/projected-inputs.ts:prepareProjectedInputs`
 
@@ -290,7 +293,6 @@ until tenant deployment/TUI procedures run.
   inspected; initialization never repairs its ledger.
 - The API emits `listening`; the worker emits `worker.started`, then `worker.health`.
   `listening` reports `startupMs` (since process start) and per-phase `phasesMs`.
-  A stopping API emits `shutdown.started` and then `shutdown.completed`.
 - `compute.preflight-warning` code `KUBERNETES_VERSION_BELOW_MINIMUM`: upgrade
   Kubernetes to 1.35 or later for support.
 - `startup-error` or `worker.startup-error` with code

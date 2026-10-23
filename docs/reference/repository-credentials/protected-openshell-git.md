@@ -13,7 +13,9 @@ The bundled OpenShell Driver therefore refuses `git-write` delivery: deploy retu
 `409 REPOSITORY_GIT_SENDER_UNQUALIFIED` and creates no revision, and a revision
 admitted before this check fails with the same code instead of waiting for the
 convergence deadline. Use [native prepared Git](prepared-native-git.md) or a separately
-installed sender qualified for the profile, or remove the binding.
+installed sender qualified for the profile, or remove the binding. A `git-read` or
+`git-full` binding has no protected delivery profile, so deploy refuses it on any
+Credential Proxy with `409 REPOSITORY_GIT_PROFILE_UNSUPPORTED`.
 
 For an existing installation, first follow the
 [compatibility upgrade](../../guides/deploy/credential-proxy-upgrade.md#check-compatibility-before-interrupting-access).
@@ -45,11 +47,18 @@ from the same Driver registration. Use the
 [OpenShell Installation fragment](../../../deploy/examples/repository-credentials/openshell.fragment.yaml).
 Keep `repository.preparedGitHub`, `repository.openShell`, the session duration,
 and the GitHub Backend registry at `/etc/openclaw/repository-registry/registry.json`.
-Omit `controlSocket`, `publicCaPath`, and `repository.nativeSender`.
+Omit `controlSocket`, `publicCaPath`, and `repository.nativeSender`. Remove
+`network.repositoryCredentials` from the Compute configuration: startup refuses it
+without `repository.nativeSender`.
 
 Set Helm `openshellGit.enabled: true`, `openshellGit.mode: protected`,
 `repositoryCredentials.enabled: false`, and
-`repositoryCredentials.authority: prepared-git`. The `repositoryCredentials`
+`repositoryCredentials.authority: prepared-git`. Keep
+`repository.openShell.authority` on host `0.0.0.0` (or `::`) and on the
+`openshellGit.port` value (default 8445), with the chart's files
+`/etc/openclaw/openshell-git/tls.crt`, `tls.key` and `gateway-public.pem`.
+Startup and the upgrade check refuse another host, port or path with
+`CHART_LISTENER_MISMATCH`. The `repositoryCredentials`
 inputs select the registry ConfigMap, worker-only App-key and existing custody
 Secrets, and approved issuer CIDRs. Preserve the custody key across restarts;
 never put either key in Agent configuration or Helm values.
@@ -240,10 +249,13 @@ can require runtime retirement instead. An empty OpenShell profile workspace
 selects the platform profile, not a same-named Workspace profile.
 
 A failed read closes the route until the same installation verifies, with retry
-backoff from 1 s to 10 s. After restart, the worker reads durable delivery facts,
-re-observes the installation and reads eligible prepared material. It does not
-replay an uncertain provider write. Generic fences and pending-write rules are
-in [Credential Proxy lifecycle](../drivers/credential-proxy.md#cancellation-retries-and-uncertainty).
+backoff from 1 s to 10 s. A failed read before the route's first provider write
+is retried by the next preparation pass; a refused identity still closes the
+route. A provider write runs to its own deadline, not the rest of a pass's read
+budget. After restart, the worker reads durable delivery facts, re-observes the
+installation and reads eligible prepared material. It does not replay an
+uncertain provider write. Generic fences and pending-write rules are in
+[Credential Proxy lifecycle](../drivers/credential-proxy.md#cancellation-retries-and-uncertainty).
 Prepared-material expiry, quarantine and retirement belong to
 [Token Service lifecycle](../repository-credentials.md#token-service-lifecycle) and
 its [source flow](../../flows/credential-source-refresh.md#6-oce-prepared-github-core).

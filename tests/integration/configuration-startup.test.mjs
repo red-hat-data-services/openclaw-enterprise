@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { createHash, randomUUID } from "node:crypto";
+import {
+  createHash,
+  createPublicKey,
+  generateKeyPairSync,
+  randomBytes,
+  randomUUID,
+} from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -15,6 +21,7 @@ import {
   isDevelopmentBrowserOrigin,
 } from "../../apps/controller/src/auth/configuration.ts";
 import { PresetFileError } from "../../apps/controller/src/composition/installation-presets.ts";
+import { openShellRepositoryConfiguration } from "../../apps/controller/src/composition/installation-fields.ts";
 import { DEVELOPMENT_HARNESS_DESCRIPTOR } from "../../apps/controller/src/composition/production-harness.ts";
 import { kubernetesNamespaceName } from "../../apps/controller/src/drivers/compute/kubernetes/index.ts";
 import { formatStartupConfigurationFailure } from "../../apps/controller/src/startup-failure.ts";
@@ -27,8 +34,12 @@ import { validateSelectedBackendDrivers } from "../../packages/occ/src/index.ts"
 import { spawnSync } from "node:child_process";
 import { captureChild, concurrencyLimit, settled } from "../helpers/child-processes.mjs";
 import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs";
-import { createInstallationDriverConfiguration as installation } from "../helpers/installation-driver-configuration.mjs";
+import {
+  createCredentialProxyInstallationConfiguration as credentialProxyInstallation,
+  createInstallationDriverConfiguration as installation,
+} from "../helpers/installation-driver-configuration.mjs";
 import { createTlsMaterial } from "../fixtures/repository-credentials/process.mjs";
+import { socketDirectory } from "../helpers/socket-directory.mjs";
 import { syntheticCredentialUrl } from "../fixtures/synthetic-credential-url.mjs";
 
 function jsonLines(text) {
@@ -127,72 +138,6 @@ async function fixture(t, configuration = installation()) {
   // JSON is valid YAML; mutations exercise the same real SDK YAML parser as controller startup.
   await writeFile(path, JSON.stringify(configuration), "utf8");
   return path;
-}
-
-function credentialProxyInstallation() {
-  const configuration = installation();
-  configuration.backend = [
-    {
-      id: "openshell",
-      type: "openshell",
-      configuration: {
-        endpoint: "https://openshell.example.test:8080",
-        auth: { mode: "bearerTokenFile", path: "/etc/openclaw/openshell/token" },
-      },
-      drivers: {
-        sandbox: "openshell-sandbox",
-        credential_gateway: "openshell-credentials",
-        credential_proxy: "openshell-egress",
-      },
-    },
-  ];
-  configuration.drivers.sandbox = {
-    id: "openshell-sandbox",
-    configuration: {
-      gateway: { workspaceMode: "operator" },
-      kubernetes: {
-        runtimeClassName: "openshell-sandbox",
-        serviceAccount: { mode: "gatewayConfigured" },
-        sandboxDataMount: {
-          subPath: "workspace",
-          mountPath: "/sandbox/enterprise",
-          readOnly: false,
-        },
-      },
-      policy: {
-        process: { runAsUser: "1000", runAsGroup: "1000" },
-        networkPolicies: [
-          {
-            name: "inference",
-            endpoints: [{ host: "provider.example.test", ports: [443] }],
-            binaries: [{ path: "/usr/bin/model-client" }],
-          },
-        ],
-      },
-    },
-  };
-  configuration.drivers.credential_gateway = {
-    id: "openshell-credentials",
-    configuration: { binaries: ["/usr/bin/model-client"] },
-  };
-  configuration.drivers.credential_proxy = {
-    id: "openshell-egress",
-    configuration: {
-      middlewareName: "oce-authority",
-      authorityScope: "execution",
-      authority: {
-        host: "127.0.0.1",
-        port: 9444,
-        certificatePath: "/etc/openclaw/egress/tls/tls.crt",
-        privateKeyPath: "/etc/openclaw/egress/tls/tls.key",
-        issuerPublicKeyPath: "/etc/openclaw/egress/issuer/issuer.pub",
-        issuer: "openshell-gateway:openshell-gateway",
-        audience: "oce-egress",
-        keyId: "current",
-      },
-    },
-  };
-  return configuration;
 }
 
 test("Credential Proxy startup preserves the selection and refuses retired keys", async (t) => {
@@ -917,6 +862,91 @@ test("repository startup constructs the same local resolver without a private so
   assert.equal(startupDiagnostic(server.stderr, "startup-error").code, "PERSISTENCE_UNAVAILABLE");
 });
 
+test("the worker refuses a repository App key that cannot sign before it reports ready", async (t) => {
+  // Finding 2217: the worker read the App key only at its first token preparation, so it
+  // reported ready and each pass logged PREPARED_GITHUB_MAINTENANCE_FAILED without a reason.
+  const { configuration, registry, registrySource } = await repositoryInstallation(t);
+  // The prepared owner admits only one explicit write ref per Namespace.
+  Object.assign(registry.repositories[0].namespaces[0], {
+    profiles: ["git-write"],
+    transport: "git-only",
+    pushRefAllowlist: ["refs/heads/review"],
+  });
+  await writeFile(registrySource, JSON.stringify(registry));
+  const { preparedGitHub } = configuration.repository;
+  // Each case binds its own control and prepared-git-use sockets under a short directory.
+  const sockets = await socketDirectory(t, "occ-app-key-", {
+    longest: "group-writable/prepared-git-use.sock",
+  });
+  await writeFile(preparedGitHub.custodyKeyPath, randomBytes(32), { mode: 0o600 });
+  const directory = dirname(preparedGitHub.custodyKeyPath);
+  const rsa = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey;
+  const pkcs8 = { type: "pkcs8", format: "pem" };
+  const keys = [
+    ["valid", rsa.export(pkcs8), 0o600],
+    ["group-writable", rsa.export(pkcs8), 0o620, "app_key_unreadable"],
+    ["missing", undefined, 0o600, "app_key_unreadable"],
+    [
+      "public",
+      createPublicKey(rsa).export({ type: "spki", format: "pem" }),
+      0o600,
+      "app_key_unparsable",
+    ],
+    [
+      "encrypted",
+      rsa.export({ ...pkcs8, cipher: "aes-256-cbc", passphrase: "unused-passphrase" }),
+      0o600,
+      "app_key_unparsable",
+    ],
+    [
+      "ec",
+      generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey.export(pkcs8),
+      0o600,
+      "app_key_unsupported",
+    ],
+  ];
+  await Promise.all(
+    keys.map(async ([name, pem, mode, reason]) => {
+      const keyPath = join(directory, `${name}.pem`);
+      if (pem !== undefined) {
+        await writeFile(keyPath, pem, { mode });
+        await chmod(keyPath, mode);
+      }
+      const mutated = structuredClone(configuration);
+      mutated.repository.preparedGitHub.privateKeyPath = keyPath;
+      mutated.repository.nativeSender.controlSocket = join(sockets, name, "control.sock");
+      const worker = await boot("apps/controller/src/worker.mjs", {
+        PATH: process.env.PATH,
+        NODE_ENV: "production",
+        OCC_CONFIG_PATH: await fixture(t, mutated),
+        OCC_DATABASE_URL: "postgresql://127.0.0.1:1/occ",
+      });
+      assert.equal(worker.status, 1, name);
+      const diagnostic = startupDiagnostic(worker.stderr, "worker.startup-error");
+      // A usable key gets past the owner to the unreachable database.
+      assert.deepEqual(
+        [diagnostic.code, diagnostic.reason],
+        reason === undefined
+          ? ["PERSISTENCE_UNAVAILABLE", undefined]
+          : ["PREPARED_GITHUB_APP_KEY_INVALID", reason],
+        `${name}: ${worker.stderr}`,
+      );
+      assert.ok(!worker.stderr.includes("-----BEGIN") && !worker.stderr.includes(directory));
+    }),
+  );
+});
+
+function nativeSenderRefusal(path, code) {
+  return (error) => {
+    assert.equal(error.name, "ConfigurationValidationError");
+    assert.deepEqual(
+      error.error.details.map((detail) => [detail.path, detail.code]),
+      [[path, code]],
+    );
+    return true;
+  };
+}
+
 test("repository startup rejects unmatched ownership, registry identity, duration and CA inputs", async (t) => {
   const { configuration: baseline, tls, writableCaPath } = await repositoryInstallation(t);
   for (const [mutate, expected] of [
@@ -953,6 +983,14 @@ test("repository startup rejects unmatched ownership, registry identity, duratio
     ],
     [(value) => (value.repository.nativeSender.publicCaPath = tls.keyFile), /invalid-public-ca/],
     [(value) => (value.repository.nativeSender.publicCaPath = writableCaPath), /invalid-public-ca/],
+    // The native sender's path contract (finding 2214): an existing CA file under a
+    // non-canonical path is refused at load. The control socket client checks its own path.
+    [
+      (value) =>
+        (value.repository.nativeSender.publicCaPath =
+          value.repository.nativeSender.publicCaPath.replace(/\/ca\.crt$/, "/./ca.crt")),
+      nativeSenderRefusal("", "INVALID_VALUE"),
+    ],
     [(value) => (value.repository.package = "@example/driver"), /unsupported option package/],
     [(value) => (value.repository.implementation = "other"), /unsupported option implementation/],
     [(value) => (value.drivers.compute.id = "compute-ssh"), /bundled Kubernetes/],
@@ -963,6 +1001,15 @@ test("repository startup rejects unmatched ownership, registry identity, duratio
     [
       (value) => (value.drivers.compute.configuration.network.repositoryCredentials.port = 443),
       /repository service peer/,
+    ],
+    // Without native delivery no repository material Secret exists and the chart grants no
+    // Secret list, so a peer left behind is refused rather than looping on 403 (finding 2212).
+    [
+      (value) => {
+        delete value.repository;
+        delete value.backend;
+      },
+      /drivers\.compute\.configuration\.network\.repositoryCredentials requires repository\.nativeSender/,
     ],
     [
       (value) => (value.backend[0].drivers.repo = "ghp_notarealtoken123456"),
@@ -2020,6 +2067,186 @@ test("API and worker name a Preset file failure in their startup error code", as
       assert.ok(!worker.stderr.includes(dirname(path)), worker.stderr);
     }),
   );
+});
+
+test("API and worker name a chart listener mismatch and both values in their startup error", async (t) => {
+  // On a fresh install no upgrade check runs, so startup's log is the operator's only clue
+  // that the Installation authority is not on the port the chart routes (finding 2213).
+  const configuration = credentialProxyInstallation();
+  configuration.drivers.credential_proxy.configuration.authority.host = "0.0.0.0";
+  const shared = {
+    PATH: process.env.PATH,
+    NODE_ENV: "production",
+    OCC_CONFIG_PATH: await fixture(t, configuration),
+    OCC_DATABASE_URL: "postgresql://127.0.0.1:1/occ",
+    OCC_EGRESS_AUTHORITY_PORT: "9555",
+    OCC_OPENSHELL_GIT_PORT: "disabled",
+  };
+  const [server, worker] = await settled([
+    boot("apps/controller/src/server.mjs", { ...shared, ...productionServer }),
+    boot("apps/controller/src/worker.mjs", shared),
+  ]);
+  for (const [result, event] of [
+    [server, "startup-error"],
+    [worker, "worker.startup-error"],
+  ]) {
+    assert.equal(result.status, 1, result.stderr);
+    const diagnostic = startupDiagnostic(result.stderr, event);
+    assert.equal(diagnostic.code, "CHART_LISTENER_MISMATCH");
+    assert.deepEqual(diagnostic.details, [
+      {
+        path: "/drivers/credential_proxy/configuration/authority/port",
+        code: "INVALID_VALUE",
+        message:
+          "drivers.credential_proxy.configuration.authority.port is 9444, but Helm egressAuthority.port is 9555.",
+      },
+    ]);
+  }
+});
+
+test("an authority block names each refused field and never its value", async (t) => {
+  // Finding 2216: nine faults shared one message about "a loopback development listener",
+  // and API and worker logs said only STARTUP_FAILED.
+  const field = "/drivers/credential_proxy/configuration/authority";
+  const sentinel = "sentinel-7c1e";
+  const block = (value) => (configuration) =>
+    (configuration.drivers.credential_proxy.configuration.authority = value);
+  const fieldOf = (mutate) => (configuration) =>
+    mutate(configuration.drivers.credential_proxy.configuration.authority);
+  const cases = [
+    ["production", block(undefined), [[field, "REQUIRED"]]],
+    ["production", block([]), [[field, "INVALID_TYPE"]]],
+    // An unknown key is reported at the block: the key itself could be anything.
+    ["production", fieldOf((a) => (a[`${sentinel}/~`] = 1)), [[field, "UNKNOWN_FIELD"]]],
+    ["production", fieldOf((a) => delete a.issuer), [[`${field}/issuer`, "REQUIRED"]]],
+    ["production", fieldOf((a) => (a.keyId = "")), [[`${field}/keyId`, "INVALID_VALUE"]]],
+    ["production", fieldOf((a) => (a.audience = 7)), [[`${field}/audience`, "INVALID_TYPE"]]],
+    ["production", fieldOf((a) => delete a.port), [[`${field}/port`, "REQUIRED"]]],
+    ["production", fieldOf((a) => (a.port = "9444")), [[`${field}/port`, "INVALID_TYPE"]]],
+    ["production", fieldOf((a) => (a.port = 65536)), [[`${field}/port`, "INVALID_RANGE"]]],
+    [
+      "production",
+      fieldOf((a) => {
+        a.certificatePath = `${sentinel}.crt`;
+        a.privateKeyPath = `${sentinel}.key`;
+        a.issuerPublicKeyPath = `${sentinel}.pub`;
+      }),
+      ["certificatePath", "privateKeyPath", "issuerPublicKeyPath"].map((key) => [
+        `${field}/${key}`,
+        "INVALID_FORMAT",
+      ]),
+    ],
+    ["development", fieldOf((a) => (a.host = "0.0.0.0")), [[`${field}/host`, "INVALID_VALUE"]]],
+  ];
+  for (const [mode, mutate, expected] of cases) {
+    const configuration = credentialProxyInstallation();
+    mutate(configuration);
+    await assert.rejects(
+      loadInstallationConfiguration({
+        mode,
+        environment: { OCC_CONFIG_PATH: await fixture(t, configuration) },
+      }),
+      (error) => {
+        // What the startup log and the upgrade check print, after the log filter.
+        const failure = formatStartupConfigurationFailure(error);
+        const prefix = "DRIVER_CONFIGURATION_INVALID: ";
+        assert.ok(failure?.startsWith(prefix), String(error));
+        assert.deepEqual(
+          JSON.parse(failure.slice(prefix.length)).map((detail) => [detail.path, detail.code]),
+          expected,
+          failure,
+        );
+        for (const value of [sentinel, "0.0.0.0", "9444"]) {
+          assert.ok(!failure.includes(value), failure);
+        }
+        return true;
+      },
+    );
+  }
+  // The same field and code reach both processes' startup logs.
+  const configuration = credentialProxyInstallation();
+  configuration.drivers.credential_proxy.configuration.authority.privateKeyPath = "tls.key";
+  const shared = {
+    PATH: process.env.PATH,
+    NODE_ENV: "production",
+    OCC_CONFIG_PATH: await fixture(t, configuration),
+    OCC_DATABASE_URL: "postgresql://127.0.0.1:1/occ",
+  };
+  const [server, worker] = await settled([
+    boot("apps/controller/src/server.mjs", { ...shared, ...productionServer }),
+    boot("apps/controller/src/worker.mjs", shared),
+  ]);
+  for (const [result, event] of [
+    [server, "startup-error"],
+    [worker, "worker.startup-error"],
+  ]) {
+    assert.equal(result.status, 1, result.stderr);
+    const diagnostic = startupDiagnostic(result.stderr, event);
+    assert.equal(diagnostic.code, "DRIVER_CONFIGURATION_INVALID", result.stderr);
+    assert.deepEqual(diagnostic.details, [
+      {
+        path: `${field}/privateKeyPath`,
+        code: "INVALID_FORMAT",
+        message:
+          "drivers.credential_proxy.configuration.authority.privateKeyPath must be an absolute mounted-file path.",
+      },
+    ]);
+  }
+});
+
+test("a repository OpenShell authority refusal names its own block", () => {
+  // The Installation and the repository transport share the validator, not the field path.
+  const authority = credentialProxyInstallation().drivers.credential_proxy.configuration.authority;
+  delete authority.keyId;
+  assert.throws(
+    () => openShellRepositoryConfiguration({ registrationName: "git", authority }, "production"),
+    (error) => {
+      assert.deepEqual(error.details, [
+        {
+          path: "/repository/openShell/authority/keyId",
+          code: "REQUIRED",
+          message: "repository.openShell.authority.keyId must be a nonempty string.",
+        },
+      ]);
+      return true;
+    },
+  );
+});
+
+test("a leftover repository broker peer names its field in API and worker startup logs", async (t) => {
+  // Finding 2226: the refusal was a plain Error, so API and worker logged only STARTUP_FAILED
+  // and WORKER_STARTUP_FAILED, and only the upgrade check printed which field to remove.
+  // installation-change-preflight.test.mjs checks the upgrade check's line.
+  const { configuration } = await repositoryInstallation(t);
+  delete configuration.repository;
+  delete configuration.backend;
+  const shared = {
+    PATH: process.env.PATH,
+    NODE_ENV: "production",
+    OCC_CONFIG_PATH: await fixture(t, configuration),
+    OCC_DATABASE_URL: "postgresql://127.0.0.1:1/occ",
+  };
+  const details = [
+    {
+      path: "/drivers/compute/configuration/network/repositoryCredentials",
+      code: "INVALID_VALUE",
+      message:
+        "drivers.compute.configuration.network.repositoryCredentials requires repository.nativeSender; remove it for protected Git or when no repository is configured.",
+    },
+  ];
+  const [server, worker] = await settled([
+    boot("apps/controller/src/server.mjs", { ...shared, ...productionServer }),
+    boot("apps/controller/src/worker.mjs", shared),
+  ]);
+  for (const [result, event] of [
+    [server, "startup-error"],
+    [worker, "worker.startup-error"],
+  ]) {
+    assert.equal(result.status, 1, result.stderr);
+    const diagnostic = startupDiagnostic(result.stderr, event);
+    assert.equal(diagnostic.code, "DRIVER_CONFIGURATION_INVALID", result.stderr);
+    assert.deepEqual(diagnostic.details, details);
+  }
 });
 
 test("closed Installation observes only its operator-bound Namespace, including Secret and Configuration custody", async (t) => {
