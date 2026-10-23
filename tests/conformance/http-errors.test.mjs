@@ -43,7 +43,9 @@ import {
   PluginDiscoveryError,
   PluginPolicyValidationError,
   PostgresCommitOutcomeUnknownError,
+  ProtectedExecutionNetworkPolicyError,
   ProvisioningSecretDriverError,
+  RepositoryGitSenderUnqualifiedError,
   ResourceConflictError,
   ResourceStateConflictError,
   RuntimeCredentialsForbiddenByClusterError,
@@ -182,6 +184,26 @@ const cases = [
       code: "CREDENTIAL_WITHDRAWAL_IN_PROGRESS",
       message:
         "A credential withdrawal is still queued or running for an Agent revision that held the source. Wait for it to finish (it retries for up to about an hour), or delete that revision's Agent, then retry.",
+    },
+  ],
+  [
+    "network policy additions refused at deploy under protected execution name the rule",
+    new ProtectedExecutionNetworkPolicyError("deploy"),
+    {
+      status: 409,
+      code: "SANDBOX_POLICY_PROTECTED_EXECUTION",
+      message:
+        "Protected execution keeps only the Credential Proxy egress policy, so this Agent's network policy additions are refused. Remove them, then deploy.",
+    },
+  ],
+  [
+    "a git-write deploy on a Credential Proxy with no qualified sender names the alternatives",
+    new RepositoryGitSenderUnqualifiedError(),
+    {
+      status: 409,
+      code: "REPOSITORY_GIT_SENDER_UNQUALIFIED",
+      message:
+        "The selected Credential Proxy cannot enforce the Agent's git-write repository binding: no OpenShell release is qualified for it. Use native prepared Git or a qualified installed sender, or remove the binding, then deploy again.",
     },
   ],
   [
