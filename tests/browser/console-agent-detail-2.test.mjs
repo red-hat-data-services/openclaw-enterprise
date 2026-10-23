@@ -1152,7 +1152,7 @@ test("Agent detail opens native admin UI only after real API access checks pass"
   assert.deepEqual([...deniedTabWrites, ...nonAuthWriteRequests(requests)], []);
 });
 
-test("Agent detail rereads native admin access once when a pending deployment activates", async (t) => {
+test("Agent detail rereads native admin access once when a pending deployment activates, and Refresh access keeps keyboard focus", async (t) => {
   const cookieDomain = "oce.example.test";
   const consoleHost = `console.${cookieDomain}`;
   const nativeDomain = `agents.${cookieDomain}`;
@@ -1246,6 +1246,37 @@ test("Agent detail rereads native admin access once when a pending deployment ac
   // The button returns from "Refreshing…" only after the reread Agent was applied.
   await activity.getByRole("button", { name: "Refresh deployment", disabled: false }).waitFor();
   assert.equal(pathRequests(requests, "GET", nativeAdminPath).length, 2);
+
+  // A keyboard reader who refreshes access keeps focus on the button through the read: a second
+  // Enter while it reads sends nothing, and the next Tab continues from the card (issue 3311).
+  const reload = card.getByRole("button", { name: "Refresh access" });
+  const isFocused = (locator) =>
+    locator.evaluate((node) => node === node.ownerDocument.activeElement);
+  const readSettled = async () => {
+    await waitForEnabled(reload);
+    // Chromium moves focus off a disabled control when it next renders.
+    await page.evaluate(() => new Promise(globalThis.requestAnimationFrame));
+  };
+  let held = await holdRequests(t, page, `${fixture.origin}${nativeAdminPath}`, { once: true });
+  await reload.focus();
+  await page.keyboard.press("Enter");
+  await held.requested;
+  await page.keyboard.press("Enter");
+  held.release();
+  await readSettled();
+  assert.equal(pathRequests(requests, "GET", nativeAdminPath).length, 3);
+  assert.equal(await isFocused(reload), true);
+
+  // Focus the reader moves during a read stays where they put it.
+  held = await holdRequests(t, page, `${fixture.origin}${nativeAdminPath}`, { once: true });
+  await page.keyboard.press("Enter");
+  await held.requested;
+  await page.keyboard.press("Tab");
+  const next = page.locator("summary", { hasText: "What this page can tell you" });
+  assert.equal(await isFocused(next), true);
+  held.release();
+  await readSettled();
+  assert.equal(await isFocused(next), true);
 });
 
 for (const [dmPolicy, groupPolicy, enterpriseOrgInstall] of [
@@ -1996,7 +2027,7 @@ test("Agent sharing grants existing people exact discovery and native access, th
   await panel.getByRole("button", { name: "Share Agent", exact: true }).click();
   await panel.getByText("Agent access is shared.", { exact: false }).waitFor();
   await panel.screenshot({ path: join(artifacts, "agent-sharing-granted.png") });
-  const bindings = (await fixture.request("GET", `${policyPath}/access-bindings`)).data;
+  const bindings = await fixture.addedAccessBindings(namespace.id);
   assert.equal(bindings.length, 2);
   assert.equal(
     bindings.some((binding) => binding.roleId === misleadingRole.data.id),
@@ -2113,7 +2144,7 @@ test("Agent sharing grants existing people exact discovery and native access, th
   await panel.getByRole("button", { name: "Remove binding", exact: true }).click();
   await panel.getByText("Binding removed.", { exact: false }).waitFor();
   await panel.screenshot({ path: join(artifacts, "agent-sharing-removed.png") });
-  const after = (await fixture.request("GET", `${policyPath}/access-bindings`)).data;
+  const after = await fixture.addedAccessBindings(namespace.id);
   assert.deepEqual(
     after.map((binding) => binding.id).sort(),
     [
@@ -2543,11 +2574,13 @@ test("Credentials retries denied and interrupted grants without repeating the au
   const fixture = await createConsoleAppFixture(t);
   const installation = await fixture.bootstrap();
   const namespace = await fixture.createNamespace("Credential access recovery", { ready: true });
+  // No model credential yet: its listed grant would leave an exact Secret operate role for the
+  // console to reuse, and this test checks the role the console creates.
   const agent = await fixture.createAgent(
     namespace.id,
     "Recovery Agent",
     createHarnessConfiguration("codex", "gpt-4.1"),
-    { executionMode: "dedicated" },
+    { executionMode: "dedicated", harnessAuth: null },
   );
   const replacement = await fixture.createSecret(
     namespace.id,
@@ -2558,11 +2591,15 @@ test("Credentials retries denied and interrupted grants without repeating the au
   const bindingsPath = `/namespaces/${namespace.id}/iam/access-bindings`;
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
+  const probe = page.waitForResponse(`${fixture.origin}/observability`);
   await login(
     page,
     fixture,
     `/console/agents/${agent.id}?namespace=${namespace.id}&revision=draft&tab=credentials`,
   );
+  // The session knows this actor administers the Installation before the denial below, so it
+  // sends the grant request; a member's session sends none (finding 2259).
+  assert.equal((await probe).status(), 200);
   // Native IAM denies the actor's grant authority while the Agent update remains authorized.
   fixture.policy.restrictions.push({
     id: "deny-update-credential-grant",
@@ -2575,7 +2612,9 @@ test("Credentials retries denied and interrupted grants without repeating the au
   await selectSecret(page, "Service account token Secret", replacement);
   await page.getByRole("button", { name: "Save authentication source" }).click();
   await page
-    .getByText(/Authentication source saved, but this Agent's Secret access could not be confirmed/)
+    .getByText(
+      /Authentication source saved, but the request to grant this Agent access to the selected Secret was refused/,
+    )
     .waitFor();
   assert.equal(await page.getByLabel("Authentication source").isDisabled(), true);
   assert.equal(await page.getByRole("button", { name: "Deploy new version" }).isDisabled(), true);
@@ -4313,6 +4352,15 @@ test("Credentials preserves an existing OpenClaw credential source without offer
     await page.getByRole("button", { name: "Sign in with OAuth", exact: true }).isVisible(),
     false,
   );
+  // No grant lets the Agent operate this source yet: the administrator's tab reads the IAM policy,
+  // names the step that grants it and holds Deploy (finding 2260).
+  await page
+    .getByText(
+      "This Agent has no access to its authentication credential source, so deploying it would be refused. Select Save authentication source to grant it.",
+      { exact: true },
+    )
+    .waitFor();
+  assert.equal(await page.getByRole("button", { name: "Deploy new version" }).isDisabled(), true);
   const granted = page.waitForResponse(
     (response) =>
       response.request().method() === "POST" && response.url().endsWith("/access-bindings"),
@@ -4328,6 +4376,12 @@ test("Credentials preserves an existing OpenClaw credential source without offer
     (request) => request.method === "PATCH" && request.path.endsWith(`/agents/${agent.id}`),
   );
   assert.deepEqual(save.body.harnessAuth, harnessAuth);
+  // The rebuilt tab reads the new grant: nothing is missing any more.
+  await page.getByRole("status").filter({ hasText: "Authentication source saved." }).waitFor();
+  assert.equal(
+    await page.getByText(/has no access to its authentication credential source/).count(),
+    0,
+  );
 });
 
 async function checkStatusRefreshFocus(page, url, name) {

@@ -150,6 +150,7 @@ import {
   SandboxRepositoryRecipientUnverifiedError,
   imageReferenceProblem,
   keyedSettingPath,
+  KubernetesSecretWriteForbiddenError,
   provisionsDedicatedOpenClaw,
   requireOpenClawRoster,
   resolveConfiguredHarnessId,
@@ -199,6 +200,7 @@ import {
 import { nodeProgramArguments } from "../node-program.ts";
 import { codexGatewayModelConfiguration } from "../codex-model-configuration.ts";
 import { discoverHarnessModels } from "../model-discovery.ts";
+import { failureAfterCleanup, mapPrimaryFailure } from "../cleanup-failure.ts";
 import {
   ComputeStopYieldedError,
   computeStopShouldYield,
@@ -898,8 +900,9 @@ function kubernetesApiFailureEvidence(
 /**
  * The error a failed private Secret write raises in place of the client error: a transient
  * Kubernetes API failure stays transient, so the worker waits within the deadline instead of
- * spending its attempt budget; anything else becomes `message`. Either keeps only sanitized
- * API evidence as its cause.
+ * spending its attempt budget; a 403 is a refusal that no retry clears (an RBAC grant, an
+ * admission policy or a ResourceQuota), so the worker fails the deployment at once (finding
+ * 1770); anything else becomes `message`. Each keeps only sanitized API evidence as its cause.
  */
 function privateWriteFailure(message: string, error: unknown): Error {
   const evidence = kubernetesApiFailureEvidence(error);
@@ -907,7 +910,10 @@ function privateWriteFailure(message: string, error: unknown): Error {
   if (transient instanceof TransientDependencyError) {
     return transient;
   }
-  const failure = new DependencyUnavailableError(message);
+  const failure =
+    evidence instanceof KubernetesApiFailureEvidence && evidence.code === 403
+      ? new KubernetesSecretWriteForbiddenError()
+      : new DependencyUnavailableError(message);
   if (evidence !== undefined) {
     failure.cause = evidence;
   }
@@ -6028,7 +6034,7 @@ export class KubernetesComputeDriver implements ComputeDriver {
     try {
       return await this.prepareRevisionWorkloads(revision, context);
     } catch (error) {
-      throw transientKubernetesFailure(error);
+      throw mapPrimaryFailure(error, transientKubernetesFailure);
     }
   }
 
@@ -7308,18 +7314,13 @@ export class KubernetesComputeDriver implements ComputeDriver {
       }
       return agentReadiness;
     } catch (error) {
-      const failures = [error];
-      if (launchPrepared) {
-        try {
-          await this.lifecycle.beforeWorkloadStop(revision, { cleanup: true });
-        } catch (cleanupError) {
-          failures.push(cleanupError);
-        }
-      }
-      if (failures.length > 1) {
-        throw new AggregateError(failures, "Agent workload preparation and cleanup failed.");
-      }
-      throw error;
+      throw await failureAfterCleanup(
+        error,
+        "Agent workload preparation and cleanup failed.",
+        launchPrepared
+          ? [() => this.lifecycle.beforeWorkloadStop(revision, { cleanup: true })]
+          : [],
+      );
     }
   }
 
@@ -7331,7 +7332,7 @@ export class KubernetesComputeDriver implements ComputeDriver {
     try {
       await this.activateRevisionWorkloads(revision, context);
     } catch (error) {
-      throw transientKubernetesFailure(error);
+      throw mapPrimaryFailure(error, transientKubernetesFailure);
     }
   }
 
@@ -7497,8 +7498,11 @@ export class KubernetesComputeDriver implements ComputeDriver {
             namespace,
           );
         } catch (error) {
-          await this.lifecycle.beforeWorkloadStop(revision, { cleanup: true });
-          throw error;
+          throw await failureAfterCleanup(
+            error,
+            "Agent workload activation and lifecycle cleanup failed.",
+            [() => this.lifecycle.beforeWorkloadStop(revision, { cleanup: true })],
+          );
         }
         // The Recreate Gateway no longer runs the older revision it served, and the
         // active pointer already names this one. Its copies go now: if this
@@ -7643,8 +7647,11 @@ export class KubernetesComputeDriver implements ComputeDriver {
           }
           await this.reconcile(replacement, { ...ownership, revisionId: revision.id }, namespace);
         } catch (error) {
-          await this.lifecycle.beforeWorkloadStop(revision, { cleanup: true });
-          throw error;
+          throw await failureAfterCleanup(
+            error,
+            "Agent workload activation and lifecycle cleanup failed.",
+            [() => this.lifecycle.beforeWorkloadStop(revision, { cleanup: true })],
+          );
         }
         deployment = await this.getOwned("Deployment", revisionName, namespace, {
           ...ownership,
@@ -9856,6 +9863,9 @@ export class KubernetesComputeDriver implements ComputeDriver {
     namespace: KubernetesNamespaceAddress,
     ownership: Ownership,
   ): Promise<boolean> {
+    if (!(await this.deleteOrphanedNamespaceObjects(namespace, ownership))) {
+      return false;
+    }
     const clients = await this.clients(namespace.plane);
     const infrastructure = [
       ["ResourceQuota", "openclaw-quota"],
@@ -9907,6 +9917,97 @@ export class KubernetesComputeDriver implements ComputeDriver {
         ownership,
       );
       if (remaining !== undefined) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * A Secret, Configuration or ServiceAccount credential whose create applied but whose OCC
+   * transaction then failed for real (a crash, or an unknown COMMIT outcome that was a failure)
+   * leaves an object no record names, and nothing revisits it (finding 1400). A managed namespace
+   * takes such orphans with it; an existing one outlives the OCC Namespace. OCC deletes the
+   * Namespace only after its Secrets, Configurations, service accounts and Agents are gone, and
+   * nothing creates them once it is `deleting`, so every object here that carries this
+   * Namespace's full ownership metadata is an orphan. Objects without that exact metadata (the
+   * operator's own, another tenant's) are kept. A list or delete error throws, so the teardown
+   * never reads as clean; an object that is still present afterwards (a finalizer) makes the
+   * caller retry. Secrets are swept only where the worker may list them: the tenant worker role
+   * grants Secret `list` only with repository credentials (finding 2201).
+   */
+  private async deleteOrphanedNamespaceObjects(
+    namespace: KubernetesNamespaceAddress,
+    ownership: Ownership,
+  ): Promise<boolean> {
+    const clients = await this.clients(namespace.plane);
+    const labelSelector = labelsToSelector({
+      "app.kubernetes.io/managed-by": MANAGER,
+      "openclaw.dev/namespace": ownership.namespaceId,
+    });
+    const kinds: readonly ("ConfigMap" | "ServiceAccount" | "Secret")[] =
+      this.options.network.repositoryCredentials === undefined
+        ? ["ConfigMap", "ServiceAccount"]
+        : ["ConfigMap", "ServiceAccount", "Secret"];
+    const owned = async (kind: (typeof kinds)[number]) => {
+      const request = { namespace: namespace.name, labelSelector };
+      const listed = await this.request(() =>
+        kind === "ConfigMap"
+          ? clients.core.listNamespacedConfigMap(request)
+          : kind === "Secret"
+            ? clients.core.listNamespacedSecret(request)
+            : clients.core.listNamespacedServiceAccount(request),
+      );
+      const items = completeKubernetesList(listed as { items?: readonly unknown[] });
+      const objects: { readonly name: string; readonly uid: string }[] = [];
+      // Check every object before deleting one: the selector is advisory to this code.
+      for (const item of items) {
+        const metadata = asRecord(asRecord(item)?.metadata);
+        const labels = asRecord(metadata?.labels);
+        const annotations = asRecord(metadata?.annotations);
+        if (
+          !isNonEmptyString(metadata?.name) ||
+          !isNonEmptyString(metadata.uid) ||
+          (metadata.namespace !== undefined && metadata.namespace !== namespace.name) ||
+          labels?.["app.kubernetes.io/managed-by"] !== MANAGER ||
+          labels["openclaw.dev/namespace"] !== ownership.namespaceId
+        ) {
+          throw new OwnershipFailure(`The Kubernetes ${kind} list is invalid.`);
+        }
+        // OCE writes the Namespace-ID annotation with the labels; labels alone are not ownership.
+        if (annotations?.["openclaw.dev/namespace-id"] === ownership.namespaceId) {
+          objects.push({ name: metadata.name, uid: metadata.uid });
+        }
+      }
+      return objects;
+    };
+    for (const kind of kinds) {
+      for (const { name, uid } of await owned(kind)) {
+        const request = {
+          name,
+          namespace: namespace.name,
+          body: { preconditions: { uid } },
+        };
+        try {
+          await this.request(
+            async () => {
+              if (kind === "ConfigMap") {
+                await clients.core.deleteNamespacedConfigMap(request);
+              } else if (kind === "Secret") {
+                await clients.core.deleteNamespacedSecret(request);
+              } else {
+                await clients.core.deleteNamespacedServiceAccount(request);
+              }
+            },
+            { mutating: true },
+          );
+        } catch (error) {
+          if (numericErrorStatus(error) !== 404) {
+            throw error;
+          }
+        }
+      }
+      if ((await owned(kind)).length > 0) {
         return false;
       }
     }
