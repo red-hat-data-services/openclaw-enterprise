@@ -62,6 +62,7 @@ import {
 import { assertCleanupFailure } from "../helpers/compute-cleanup-failure.mjs";
 import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs";
 import { syntheticCredentialUrl } from "../fixtures/synthetic-credential-url.mjs";
+import { createOccLogger, emitOccLogEvent } from "../../apps/controller/src/logging.ts";
 import { harnessTlsFixture } from "../helpers/harness-tls.mjs";
 import { conformanceKubeconfig } from "../helpers/kubernetes-compute.mjs";
 import {
@@ -7007,28 +7008,113 @@ test("the canonical Kubernetes runtime validates channel proxy configuration", (
   }
 });
 
-test("the canonical Kubernetes runtime validates the dedicated Codex model endpoint", () => {
+test("the canonical Kubernetes runtime validates the dedicated Codex model endpoint", async () => {
   const runtime = { transportSecretPrefix: "transport", gatewayStorageClassName: "local-path" };
+  const clients = {
+    version: {
+      async getCode() {
+        return { gitVersion: "v1.35.0" };
+      },
+    },
+    core: {
+      async listNamespace() {
+        return { items: [] };
+      },
+    },
+  };
+  const started = (codexModelBaseUrl) => {
+    const driver = createKubernetesComputeDriver(
+      options({ runtime: { ...runtime, codexModelBaseUrl } }),
+    );
+    driver.apiClients = Promise.resolve(clients);
+    return driver;
+  };
   for (const codexModelBaseUrl of [
     "https://models.example.test/v1",
     "https://models.example.test/api/v1/",
     "https://API.OpenAI.com:443/v1/",
-    "https://models.example.test:8443/v1",
+    "https://models.example.test:443/v1",
     "https://bücher.example.test/v1",
     "https://192.0.2.1/v1",
     "https://192.0.2.1\\v1",
     "https:\\\\192.0.2.1/v1",
     "HTTPS://192.0.2.1/v1",
-    // These concrete URL forms remain valid here; this does not prove provider
-    // support or reachability through a deployment's network policy.
-    "https://[2001:db8::1]/v1",
-    "https://[::1]/v1",
+    // Public IPv4 just outside each range the model egress policy excludes.
+    "https://11.0.0.1/v1",
+    "https://100.128.0.1/v1",
+    "https://172.32.0.1/v1",
+    "https://192.169.0.1/v1",
+    "https://169.255.0.1/v1",
     "https://models.example.test./v1",
   ]) {
-    assert.doesNotThrow(() =>
-      createKubernetesComputeDriver(options({ runtime: { ...runtime, codexModelBaseUrl } })),
-    );
+    assert.deepEqual(await started(codexModelBaseUrl).preflight(), { warnings: [] });
   }
+  // The generated Harness model egress policy admits only TCP/443 to IPv4 outside its excluded
+  // ranges. Kubernetes admits the union of NetworkPolicies, so an operator's own policy can open
+  // these: startup accepts them and its preflight warns (findings 1740, 2284).
+  const lines = [];
+  const logger = createOccLogger({
+    component: "occ-worker",
+    destination: {
+      write(chunk) {
+        lines.push(String(chunk));
+        return true;
+      },
+    },
+  });
+  const port = "uses port 8443 but Harness model egress allows only TCP/443";
+  const ipv6 = "is an IPv6 address but Harness model egress allows only IPv4";
+  const excluded = (cidr) => `has an IPv4 host in ${cidr} which Harness model egress excludes`;
+  for (const [codexModelBaseUrl, blocked] of [
+    ["https://models.example.test:8443/v1", port],
+    // Every blocked property is named in the one warning.
+    ["https://10.0.0.5:8443/v1", `${port} and ${excluded("10.0.0.0/8")}`],
+    ["https://192.0.2.1:444/v1", port.replace("8443", "444")],
+    ["https://[2001:db8::1]/v1", ipv6],
+    ["https://[::1]/v1", ipv6],
+    ["https://[::ffff:203.0.113.1]/v1", ipv6],
+    ["https://10.1.2.3/v1", excluded("10.0.0.0/8")],
+    ["https://100.127.255.255/v1", excluded("100.64.0.0/10")],
+    ["https://172.31.0.1/v1", excluded("172.16.0.0/12")],
+    ["https://192.168.0.10/v1", excluded("192.168.0.0/16")],
+    ["https://169.254.169.254/v1", excluded("169.254.0.0/16")],
+  ]) {
+    const message = `Codex model endpoint ${blocked}: the generated policy will not admit it unless another NetworkPolicy does.`;
+    const result = await started(codexModelBaseUrl).preflight();
+    assert.deepEqual(
+      result,
+      { warnings: [{ code: "KUBERNETES_MODEL_EGRESS_BLOCKED", message }] },
+      codexModelBaseUrl,
+    );
+    // API and worker startup log each warning; the log keeps the plain text, never the URL.
+    lines.length = 0;
+    for (const warning of result.warnings) {
+      emitOccLogEvent(logger, { event: "compute.preflight-warning", ...warning });
+    }
+    assert.equal(lines.length, 1);
+    assert.deepEqual(
+      (({ code, message }) => ({ code, message }))(JSON.parse(lines[0])),
+      result.warnings[0],
+    );
+    assert.equal(lines[0].includes(new URL(codexModelBaseUrl).hostname), false);
+    assert.equal(lines[0].includes("://"), false);
+  }
+  // The warning changes no policy: the model egress grant is the one without the endpoint.
+  const revision = {
+    id: "revision-model-egress-1",
+    namespaceId: tenant.id,
+    agentId: "agent-model-egress",
+    servicePrincipalId: "service-principal-model-egress",
+    harness: { id: "codex", version: "1.0.0", mode: "dedicated" },
+    harnessAuth: apiKeyAuth,
+  };
+  const target = { name: kubernetesNamespaceName(tenant.id), plane: "execution" };
+  const modelEgress = (driver) =>
+    driver.agentAuthenticationNetworkPolicy(revision, target).spec.egress;
+  assert.deepEqual(
+    modelEgress(started("https://10.0.0.5:8443/v1")),
+    modelEgress(createKubernetesComputeDriver(options({ runtime }))),
+  );
   for (const codexModelBaseUrl of [
     "not-a-url",
     "http://models.example.test/v1",
