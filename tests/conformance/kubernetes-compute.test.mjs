@@ -12065,6 +12065,15 @@ test("model provider credential headers and request auth are refused on every pr
       error.message ===
         `Configuration setting models.providers.p.headers ${credentialHeader(`x-${"a".repeat(37)}…`)}.`,
   );
+  // A 40-character name, a credential by its -token suffix, is shown whole.
+  const fullName = `x-${"a".repeat(32)}-token`;
+  assert.throws(
+    () => driver.validateConfiguration(provider("p", { headers: { [fullName]: "${K}" } })),
+    {
+      name: "ConfigurationHarnessError",
+      message: `Configuration setting models.providers.p.headers ${credentialHeader(fullName)}.`,
+    },
+  );
   // Providers reached only through other selection keys are refused too.
   for (const agents of [
     { defaults: { model: "openai/gpt-5", imageModel: "anthropic/claude-x" } },
@@ -13957,6 +13966,21 @@ test("revision lifecycle rejects another driver or missing identity before clust
       withEntry({ thinkingLevelMap: { high: 3 } }),
       "models.providers.openai.models.0.thinkingLevelMap",
       "must map thinking levels to strings or null",
+    ],
+    // Preparation refused this only after a dedicated deployment stopped its predecessors.
+    [
+      {
+        ...dedicatedNativeConfiguration,
+        agents: {
+          ...dedicatedNativeConfiguration.agents,
+          defaults: {
+            ...dedicatedNativeConfiguration.agents.defaults,
+            embeddedAgent: { runtimeServer: { url: "ws://127.0.0.1:1" } },
+          },
+        },
+      },
+      "agents.defaults.embeddedAgent.runtimeServer",
+      "must be unset on Dedicated OpenClaw: the selected Compute Driver owns the runtime transport",
     ],
   ]) {
     assert.throws(
