@@ -6,13 +6,13 @@
 //
 // `images` builds the controller and runtime images from this checkout (reading
 // the hosted image caches when available), adds a private test CA to the
-// runtime image's trust store, and pushes both to a loopback registry so Local
-// Setup can select them by digest. `run` starts the Kubernetes-only Local Setup
-// with those images, answers api.openai.com from a stand-in Responses provider,
-// runs scripts/first-agent.mjs for an embedded OpenClaw Agent, deploys one
-// dedicated Codex Agent through the API, reads both Agents' logs through
-// `occ agent logs`, stops and starts each once, and checks that every reported
-// status matches the cluster and a real model turn.
+// runtime image's trust store, and publishes both to a local registry, reachable
+// on loopback, so Local Setup can select them by digest. `run` starts the
+// Kubernetes-only Local Setup with those images, answers api.openai.com from a
+// stand-in Responses provider, runs scripts/first-agent.mjs for an embedded
+// OpenClaw Agent, deploys one dedicated Codex Agent through the API, reads both
+// Agents' logs through `occ agent logs`, stops and starts each once, and checks
+// that every reported status matches the cluster and a real model turn.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -41,6 +41,7 @@ import {
   createModelProviderFiles,
   writeModelProviderTrust,
 } from "../../tests/helpers/runtime-model-provider.mjs";
+import { ensureImage } from "./image-pull.mjs";
 import { compareEvents, eventObservedTime } from "./kubernetes-event-time.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -289,7 +290,7 @@ async function exportEnvironment(values) {
 // ---------------------------------------------------------------------------
 // images
 
-function cacheArguments(role) {
+function cacheSources(role) {
   // Restore only: main's cache is written by the warm workflow alone.
   if (
     process.env.GITHUB_ACTIONS !== "true" ||
@@ -299,7 +300,11 @@ function cacheArguments(role) {
     return [];
   }
   const scope = `oce-ci-${role}-${process.platform}-${process.arch}-v1`;
-  return ["--cache-from", `type=gha,version=2,scope=${scope},timeout=60s`];
+  return [`type=gha,version=2,scope=${scope},timeout=60s`];
+}
+
+function cacheArguments(role) {
+  return cacheSources(role).flatMap((source) => ["--cache-from", source]);
 }
 
 // The image lanes and the warm job build with a fixed SOURCE_DATE_EPOCH, and
@@ -308,10 +313,22 @@ function cacheArguments(role) {
 // smoke run reinstalled both images' packages (finding 1273). It sets only
 // timestamps (image config, history, WORKDIR); the smoke reads none of them.
 // RUN steps do not see it: an `ARG SOURCE_DATE_EPOCH` would change their keys.
-const cacheBuildArguments = ["--build-arg", "SOURCE_DATE_EPOCH=0"];
+const cacheEpoch = "0";
+const cacheBuildArguments = ["--build-arg", `SOURCE_DATE_EPOCH=${cacheEpoch}`];
 
+// Local Setup selects images by registry digest, which the engine records when it
+// pushes or pulls a tag.
 async function pushedDigest(tag) {
   await run("docker", ["push", tag], { timeout: 10 * minute });
+  return recordedDigest(tag);
+}
+
+async function pulledDigest(tag) {
+  await run("docker", ["pull", tag], { timeout: 10 * minute });
+  return recordedDigest(tag);
+}
+
+async function recordedDigest(tag) {
   const { stdout } = await run("docker", [
     "image",
     "inspect",
@@ -322,6 +339,95 @@ async function pushedDigest(tag) {
   const repository = tag.slice(0, tag.lastIndexOf(":"));
   const reference = JSON.parse(stdout).find((digest) => digest.startsWith(`${repository}@`));
   assert.match(reference ?? "", /@sha256:[a-f0-9]{64}$/, `no registry digest for ${tag}`);
+  return reference;
+}
+
+// Local Setup's PostgreSQL pin: developmentPostgres in internal/occdev/openshell_k3d.go.
+export const postgresImage =
+  "docker.io/library/postgres:18.6@sha256:86c951e05bf56c93d95d397747fb8820ac76cc3bedb78f43abd83eedbe3666ae";
+
+// The image-pull.mjs retry helper over `run`.
+async function pullExecFile(command, args, { timeoutMs }) {
+  try {
+    return await run(command, args, { timeout: timeoutMs });
+  } catch (error) {
+    error.stderr = error.result?.stderr ?? "";
+    error.timedOut = error.result?.signal === "SIGKILL";
+    throw error;
+  }
+}
+
+// Fetch an image manifest from the loopback registry by digest and check its
+// bytes against that digest.
+export async function registryManifest({ registry, path, digest, fetchRegistry = fetch }) {
+  const reference = `${registry}/${path}@${digest}`;
+  const response = await fetchRegistry(`http://${registry}/v2/${path}/manifests/${digest}`, {
+    headers: {
+      accept:
+        "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json",
+    },
+    redirect: "error",
+    signal: AbortSignal.timeout(30_000),
+  });
+  assert.ok(response.ok, `registry manifest ${reference}: HTTP ${response.status}`);
+  const manifest = Buffer.from(await response.arrayBuffer());
+  assert.equal(
+    `sha256:${createHash("sha256").update(manifest).digest("hex")}`,
+    digest,
+    `the registry manifest does not match ${reference}`,
+  );
+  return JSON.parse(manifest.toString("utf8"));
+}
+
+// Copy the pinned PostgreSQL image into the loopback registry, so the k3d node
+// pulls it by digest like the checkout's images, instead of Local Setup pulling
+// it from Docker Hub and exporting and importing it beside the cluster checks.
+// The engine verified the pin when it pulled the image. Its push recompresses
+// the layers, so the registry digest differs from the pin, but the registry's
+// manifest must name the pinned image's config, which fixes every layer's
+// uncompressed digest (containerd checks them as it unpacks). The engine's
+// containerd image store reports other IDs and pushes indexes, so there the
+// copy is skipped and PostgreSQL keeps the archive path.
+export async function publishPostgresImage({
+  registry,
+  runCommand = run,
+  fetchRegistry = fetch,
+  pull = (image) => ensureImage(image, { execFile: pullExecFile }),
+}) {
+  assert.match(registry, /^127\.0\.0\.1:\d+$/, "the PostgreSQL copy needs a loopback registry");
+  const { stdout: driverStatus } = await runCommand("docker", [
+    "info",
+    "--format",
+    "{{json .DriverStatus}}",
+  ]);
+  if (driverStatus.includes("io.containerd.snapshotter")) {
+    log("PostgreSQL keeps the archive path: the engine uses the containerd image store");
+    return undefined;
+  }
+  await pull(postgresImage);
+  const id = (
+    await runCommand("docker", ["image", "inspect", "--format", "{{.Id}}", postgresImage])
+  ).stdout.trim();
+  assert.match(id, /^sha256:[a-f0-9]{64}$/, `no image ID for ${postgresImage}`);
+  const tag = `${registry}/oce-smoke/postgres:${/:([^:/@]+)@/.exec(postgresImage)[1]}`;
+  await runCommand("docker", ["tag", id, tag]);
+  // This push's own digest: a long-lived engine keeps every digest it ever
+  // recorded for the image.
+  const { stdout } = await runCommand("docker", ["push", tag], { timeout: 10 * minute });
+  const digest = /: digest: (sha256:[a-f0-9]{64}) size: \d+/.exec(stdout)?.[1];
+  assert.ok(digest, `docker push reported no digest for ${tag}`);
+  const reference = `${registry}/oce-smoke/postgres@${digest}`;
+  const manifest = await registryManifest({
+    registry,
+    path: "oce-smoke/postgres",
+    digest,
+    fetchRegistry,
+  });
+  assert.equal(
+    manifest.config?.digest,
+    id,
+    `the registry copy of PostgreSQL is not the pinned image: ${reference}`,
+  );
   return reference;
 }
 
@@ -356,8 +462,164 @@ async function buildImages({ preparedGit = false } = {}) {
     ]),
   );
   const controllerTag = `${registry}/oce-smoke/controller:${revision}`;
-  const runtimeTag = `${registry}/oce-smoke/runtime-base:${revision}`;
   const smokeRuntimeTag = `${registry}/oce-smoke/runtime:${revision}`;
+  // The only difference from the checkout's runtime image: the stand-in
+  // provider's private CA in the system store (Codex) and for Node (OpenClaw).
+  // Labels, user, entrypoint and every other layer are inherited unchanged.
+  const context = join(workDirectory, "runtime-trust");
+  await writeModelProviderTrust({ context, caPath: join(modelDirectory, "ca.pem") });
+  const driver = await builderDriver();
+  // Both finish before a failure is reported, so neither keeps running unseen.
+  const settled = await Promise.allSettled([
+    driver === "docker-container"
+      ? bakeAndPushImages({ revision, controllerTag, smokeRuntimeTag, context })
+      : buildAndPushImages({ revision, controllerTag, smokeRuntimeTag, context }),
+    // The prepared-Git acceptance keeps the archive path for every image.
+    preparedGit
+      ? undefined
+      : step("PostgreSQL image to the loopback registry", () => publishPostgresImage({ registry })),
+  ]);
+  const failure = settled.find(({ status }) => status === "rejected");
+  if (failure) {
+    throw failure.reason;
+  }
+  const [[controller, runtime], postgres] = settled.map(({ value }) => value);
+  const repository = {};
+  if (preparedGit) {
+    const tag = `${registry}/oce-smoke/repository:${revision}`;
+    await step("repository service image build", () =>
+      run(
+        "docker",
+        [
+          "buildx",
+          "build",
+          "--load",
+          ...cacheArguments("runtime"),
+          ...cacheBuildArguments,
+          "--file",
+          "deploy/runtime/Dockerfile",
+          "--target",
+          "repository-credentials-service",
+          "--label",
+          `org.opencontainers.image.revision=${revision}`,
+          "--tag",
+          tag,
+          ".",
+        ],
+        { timeout: 30 * minute, label: "repository-build" },
+      ),
+    );
+    repository.OCC_DEVELOPMENT_REPOSITORY_IMAGE = await pushedDigest(tag);
+    repository.OCC_SKIPPER_IMAGE_REGISTRY_CONTAINER = registryContainer.stdout.trim();
+  }
+  await exportEnvironment({
+    ...repository,
+    // The k3d node pulls the controller, runtime and PostgreSQL images from
+    // this loopback registry by digest instead of importing exported archives.
+    ...(preparedGit
+      ? {}
+      : {
+          OCC_DEVELOPMENT_IMAGE_REGISTRY_CONTAINER: slotNames.registryContainer,
+          ...(postgres ? { OCC_DEVELOPMENT_POSTGRES_IMAGE: postgres } : {}),
+        }),
+    OCC_DEVELOPMENT_CONTROLLER_IMAGE: controller,
+    OCC_KUBERNETES_RUNTIME_IMAGE: runtime,
+    OCC_FIRST_AGENT_SMOKE_MODEL_DIRECTORY: modelDirectory,
+  });
+  log(`controller ${controller}`);
+  log(`runtime ${runtime}`);
+  if (postgres) {
+    log(`PostgreSQL ${postgres}`);
+  }
+}
+
+async function builderDriver() {
+  const { stdout } = await run("docker", ["buildx", "inspect"]);
+  return /^Driver:\s+(\S+)/m.exec(stdout)?.[1] ?? "";
+}
+
+// A builder in its own container (the hosted job's) builds, adds the trust
+// layer and pushes both images in one bake. The push sends the compressed
+// layers the hosted cache already holds, so only layers this checkout changed
+// are compressed, and the base runtime image is never loaded into the engine.
+// The builder reaches the registry over the default bridge network, so it must
+// run there (setup-buildx's default) or on the host network; the engine pulls
+// the same tags back from loopback, which records their digests without
+// copying layers it already loaded.
+async function bakeAndPushImages({ revision, controllerTag, smokeRuntimeTag, context }) {
+  const address = (
+    await run("docker", [
+      "inspect",
+      "--format",
+      '{{with index .NetworkSettings.Networks "bridge"}}{{.IPAddress}}{{end}}',
+      slotNames.registryContainer,
+    ])
+  ).stdout.trim();
+  assert.match(address, /^\d+\.\d+\.\d+\.\d+$/, "registry has no bridge address");
+  const outputs = (tag) => [
+    `type=docker,name=${tag}`,
+    `type=image,name=${address}:5000${tag.slice(registry.length)},push=true,registry.insecure=true`,
+  ];
+  const definition = {
+    target: {
+      "smoke-controller": {
+        context: root,
+        target: "runtime",
+        args: { NODE_BASE_IMAGE: nodeBaseImage, SOURCE_DATE_EPOCH: cacheEpoch },
+        labels: { "org.opencontainers.image.revision": revision },
+        "cache-from": cacheSources("controller"),
+        pull: false,
+        output: outputs(controllerTag),
+      },
+      "smoke-runtime-base": {
+        context: root,
+        dockerfile: "deploy/runtime/Dockerfile",
+        args: { OCC_BUILD_REVISION: revision, SOURCE_DATE_EPOCH: cacheEpoch },
+        "cache-from": cacheSources("runtime"),
+        pull: false,
+      },
+      "smoke-runtime": {
+        context,
+        contexts: { "smoke-runtime-base": "target:smoke-runtime-base" },
+        args: { RUNTIME_IMAGE: "smoke-runtime-base" },
+        output: outputs(smokeRuntimeTag),
+      },
+    },
+  };
+  const file = join(workDirectory, "images.bake.json");
+  await writeFile(file, `${JSON.stringify(definition, null, 2)}\n`);
+  // Both builds read the hosted caches main's warm job (ci-image-cache.yml) writes.
+  await step("controller and runtime image builds", () =>
+    // The trust context lies outside the working directory, so bake needs an
+    // explicit read grant for it (its check sometimes missed it, by target order).
+    run(
+      "docker",
+      [
+        "buildx",
+        "bake",
+        `--allow=fs.read=${context}`,
+        "--file",
+        file,
+        "smoke-controller",
+        "smoke-runtime",
+      ],
+      {
+        // Single-platform image manifests without attestation indexes, so the
+        // recorded digest is the image manifest's.
+        env: { ...process.env, BUILDX_NO_DEFAULT_ATTESTATIONS: "1" },
+        timeout: 40 * minute,
+        label: "image-bake",
+      },
+    ),
+  );
+  return step("registry digests", () =>
+    Promise.all([pulledDigest(controllerTag), pulledDigest(smokeRuntimeTag)]),
+  );
+}
+
+// The engine's own builder: build, add the trust layer, then push.
+async function buildAndPushImages({ revision, controllerTag, smokeRuntimeTag, context }) {
+  const runtimeTag = `${registry}/oce-smoke/runtime-base:${revision}`;
   // Both builds read the hosted caches main's warm job (ci-image-cache.yml) writes.
   await step("controller and runtime image builds", () =>
     Promise.all([
@@ -403,11 +665,6 @@ async function buildImages({ preparedGit = false } = {}) {
       ),
     ]),
   );
-  // The only difference from the checkout's runtime image: the stand-in
-  // provider's private CA in the system store (Codex) and for Node (OpenClaw).
-  // Labels, user, entrypoint and every other layer are inherited unchanged.
-  const context = join(workDirectory, "runtime-trust");
-  await writeModelProviderTrust({ context, caPath: join(modelDirectory, "ca.pem") });
   await step("runtime trust layer", () =>
     run("docker", [
       "buildx",
@@ -422,45 +679,9 @@ async function buildImages({ preparedGit = false } = {}) {
       context,
     ]),
   );
-  const [controller, runtime] = await step("registry digests", () =>
+  return step("registry digests", () =>
     Promise.all([pushedDigest(controllerTag), pushedDigest(smokeRuntimeTag)]),
   );
-  const repository = {};
-  if (preparedGit) {
-    const tag = `${registry}/oce-smoke/repository:${revision}`;
-    await step("repository service image build", () =>
-      run(
-        "docker",
-        [
-          "buildx",
-          "build",
-          "--load",
-          ...cacheArguments("runtime"),
-          ...cacheBuildArguments,
-          "--file",
-          "deploy/runtime/Dockerfile",
-          "--target",
-          "repository-credentials-service",
-          "--label",
-          `org.opencontainers.image.revision=${revision}`,
-          "--tag",
-          tag,
-          ".",
-        ],
-        { timeout: 30 * minute, label: "repository-build" },
-      ),
-    );
-    repository.OCC_DEVELOPMENT_REPOSITORY_IMAGE = await pushedDigest(tag);
-    repository.OCC_SKIPPER_IMAGE_REGISTRY_CONTAINER = registryContainer.stdout.trim();
-  }
-  await exportEnvironment({
-    ...repository,
-    OCC_DEVELOPMENT_CONTROLLER_IMAGE: controller,
-    OCC_KUBERNETES_RUNTIME_IMAGE: runtime,
-    OCC_FIRST_AGENT_SMOKE_MODEL_DIRECTORY: modelDirectory,
-  });
-  log(`controller ${controller}`);
-  log(`runtime ${runtime}`);
 }
 
 // ---------------------------------------------------------------------------
