@@ -429,7 +429,13 @@ export const scenarios = {
     name: "Mobile",
     path: "/console/secrets",
     mobile: true,
-    description: "The Secret list and dialogs at phone width. Simulated UI proof.",
+    actions: [{ selector: "#secret-search", value: "sec_demo_model" }],
+    description:
+      "Compare the same 390 × 844 page with one search result, then with a list that scrolls.",
+    steps: [
+      "Open the one Secret, then Replace value. The top bar, dimmed page and sheet reach the right edge, with no empty strip. Press Escape without entering a value.",
+      "Clear Search Secrets, scroll to the last Secret and open it. The sheet reaches the available edge: beside a classic scrollbar, or under an overlay scrollbar. Escape returns focus to that Secret.",
+    ],
   },
   secretsSearch: {
     group: "Pages/Secrets",
@@ -1118,8 +1124,9 @@ export const scenarios = {
     deployed: true,
     actions: [{ selector: '[aria-label="Delete Research assistant"]', click: true }],
     description:
-      "The row's Delete icon opens the permanent-deletion confirmation, including the commands that remove the kept Configuration and model Secret.",
+      "The confirmation says what deletion removes and what stays in the Namespace. Separate cleanup commands are available on request.",
     steps: [
+      "Open View separate cleanup commands. Copying a command leaves the confirmation open.",
       "Select Permanently delete Agent. The row shows Deleting and both icons are disabled.",
       "Select Refresh: the row still shows Deleting, because the list keeps an Agent until its cleanup finishes.",
     ],
@@ -3660,6 +3667,19 @@ export const scenarios = {
     steps: [
       "Confirm the refusal names the missing Sandbox Driver and no Retry provisioning request button appears.",
       "Choose Codex, or Embedded execution if the installation selects no Sandbox Driver, then create the Agent again.",
+    ],
+  },
+  createPreflightTimeout: {
+    group: "Pages/Create Agent",
+    name: "Configuration check timed out",
+    path: create,
+    unsupportedProvisioning: true,
+    rules: [{ suffix: "/agents/validate", method: "POST", hold: true, once: true }],
+    actions: readyForm,
+    description: "The first configuration check stays pending until the Console stops waiting.",
+    steps: [
+      "Select Create Agent. After 15 seconds, the timeout message takes focus and the button is available again.",
+      "Select Create Agent again to check the same entries and continue creating the draft.",
     ],
   },
   createPluginPreflightRefusal: {
@@ -7193,7 +7213,7 @@ export const scenarios = {
     path: draft,
     actions: [click("Delete Agent")],
     description:
-      "A focused confirmation dialog describes irreversible Agent, revision, and workspace deletion. Namespace Configurations and Secrets remain.",
+      "The confirmation names what will be permanently deleted and what stays in the Namespace. Open View separate cleanup commands to find the full resource IDs.",
   },
   deleting: {
     group: "Components/Deletion",
@@ -7216,7 +7236,21 @@ export const scenarios = {
     deleting: true,
     actions: [click("Request deletion again")],
     description:
-      "A manual repeated deletion requires confirmation. Queued or running cleanup remains unchanged.",
+      "A manual repeated deletion requires confirmation. Queued or running cleanup remains unchanged, and separate cleanup commands stay collapsed until opened.",
+  },
+  deletionRetryAccessEnded: {
+    group: "Components/Deletion",
+    name: "Status access ends during repeat confirmation",
+    path: draft,
+    deleting: true,
+    rules: [{ suffix: "/agents/agt_00000000-0000-4000-8000-000000000001", skip: 1, status: 403 }],
+    actions: [click("Request deletion again")],
+    description:
+      "The Agent was already marked for deletion. The next status check is refused while the repeat confirmation is open.",
+    steps: [
+      "Leave the confirmation open. It closes when the status check returns, without sending another deletion request.",
+      "Focus returns to Delete Agent. The notice says you can no longer check whether cleanup finished.",
+    ],
   },
   deletionRetryUnknown: {
     group: "Components/Deletion",
@@ -7732,6 +7766,7 @@ export const scenarios = {
       "Interactive deletion through the actual console controls, with simulated asynchronous cleanup.",
     steps: [
       "Scroll to Delete Agent and open its confirmation dialog.",
+      "Read what stays in the Namespace. Open View separate cleanup commands to copy a command without running it.",
       "Cancel once to inspect the safe exit, then reopen and confirm Permanently delete Agent.",
       "The page marks deletion requested, removes edit/deploy controls, and keeps confirmed manual recovery available.",
       "Click Refresh deletion status. The fixture now reports completion and the console returns to the Agent list.",
