@@ -956,6 +956,14 @@ func TestAgentRuntimePrintsALostHarnessSandboxFirst(t *testing.T) {
 			"Harness Sandbox: starting (HARNESS_RESTARTING). The Harness process exited",
 		},
 		{map[string]any{"state": "unknown", "code": "UNAVAILABLE"}, "Harness Sandbox: unknown (UNAVAILABLE)\n\n"},
+		// Only a starting Harness is restarting: any other state keeps the bare code.
+		{
+			map[string]any{"state": "running", "code": "HARNESS_RESTARTING", "exitCode": float64(1), "restarts": float64(2)},
+			"Harness Sandbox: running (HARNESS_RESTARTING)\n\n",
+		},
+		// A code is echoed up to OCC's 64-character limit.
+		{map[string]any{"state": "unknown", "code": strings.Repeat("A", 64)}, "Harness Sandbox: unknown (" + strings.Repeat("A", 64) + ")\n\n"},
+		{map[string]any{"state": "unknown", "code": strings.Repeat("A", 65)}, "Harness Sandbox: unknown\n\n"},
 		// Anything but OCC's fixed states and codes is not echoed to the terminal.
 		{map[string]any{"state": "lost\u202e", "code": "x\u001b[2J"}, "Harness Sandbox: unknown\n\n"},
 		{nil, "No resources found."},
@@ -1160,6 +1168,8 @@ func TestRedirectIsReportedWithItsTargetAndNotFollowed(t *testing.T) {
 		location string
 		want     string
 		hostCase bool
+		// schemeChange redirects to https on the origin's own host: another origin.
+		schemeChange bool
 	}{
 		{
 			name:     "other origin",
@@ -1167,6 +1177,8 @@ func TestRedirectIsReportedWithItsTargetAndNotFollowed(t *testing.T) {
 			want:     "redirected to https://" + strings.TrimPrefix(target.URL, "http://") + "/installation; occ does not follow redirects, so set OCC_URL (or --url) to https://" + strings.TrimPrefix(target.URL, "http://") + " ",
 		},
 		{name: "same origin", location: "/elsewhere/installation", want: "/elsewhere/installation; occ does not follow redirects, and OCC_URL must be the origin that serves the OCC API directly"},
+		// want is built in the subtest: it names the origin server's own host.
+		{name: "same host over https", schemeChange: true},
 		{name: "same origin host case", hostCase: true, want: "/elsewhere/installation; occ does not follow redirects, and OCC_URL must be the origin that serves the OCC API directly"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -1176,6 +1188,9 @@ func TestRedirectIsReportedWithItsTargetAndNotFollowed(t *testing.T) {
 				location := testCase.location
 				if testCase.hostCase {
 					location = "http://" + strings.ToLower(r.Host) + "/elsewhere/installation"
+				}
+				if testCase.schemeChange {
+					location = "https://" + r.Host + "/installation"
 				}
 				w.Header().Set("location", location)
 				w.WriteHeader(http.StatusPermanentRedirect)
@@ -1192,6 +1207,10 @@ func TestRedirectIsReportedWithItsTargetAndNotFollowed(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected the redirect to fail the command")
 			}
+			if testCase.schemeChange {
+				host := strings.TrimPrefix(origin.URL, "http://")
+				testCase.want = "redirected to https://" + host + "/installation; occ does not follow redirects, so set OCC_URL (or --url) to https://" + host + " "
+			}
 			if !strings.Contains(err.Error(), "HTTP 308") || !strings.Contains(err.Error(), testCase.want) {
 				t.Fatalf("error = %q, want it to contain HTTP 308 and %q", err, testCase.want)
 			}
@@ -1205,6 +1224,31 @@ func TestRedirectIsReportedWithItsTargetAndNotFollowed(t *testing.T) {
 				t.Fatalf("origin key = %q, redirect followed = %v", sawKey, followed)
 			}
 		})
+	}
+}
+
+// OCC_URL must be a bare origin: occ adds every path itself and never sends a
+// query, fragment, or userinfo with the service key.
+func TestOCCURLMustBeABareOrigin(t *testing.T) {
+	const origin = "OCC URL must be an origin without credentials, a path, a query, or a fragment"
+	for _, testCase := range []struct{ url, want string }{
+		{"ftp://occ.example.test", "OCC URL must use http or https"},
+		{"https://occ.example.test/api", origin},
+		{"https://occ.example.test?", origin},
+		{"https://occ.example.test?region=1", origin},
+		{"https://occ.example.test#top", origin},
+		{"https://user@occ.example.test", origin},
+		{"https:///", origin},
+	} {
+		if _, _, err := runHelp(t, "installation", "get", "--url", testCase.url, "--service-key-file", "unused"); err == nil || err.Error() != testCase.want {
+			t.Fatalf("--url %q error = %v, want %q", testCase.url, err, testCase.want)
+		}
+	}
+	// Control: an origin with or without a trailing slash passes, and the key file is read next.
+	for _, value := range []string{"https://occ.example.test", "http://occ.example.test:8080/"} {
+		if _, _, err := runHelp(t, "installation", "get", "--url", value, "--service-key-file", "unused"); err == nil || !strings.HasPrefix(err.Error(), "failed to read service-key file unused") {
+			t.Fatalf("--url %q error = %v, want the key file read failure", value, err)
+		}
 	}
 }
 
@@ -1329,7 +1373,9 @@ func TestExplicitEmptyFlagValuesAreRefusedBeforeAnyWork(t *testing.T) {
 	}
 }
 
-func TestAgentPolicyFacetMustBeNetworkingBeforeAnyRequest(t *testing.T) {
+// Every agent policy command checks its flags before a request: the facet, and for apply and
+// recommendations the revision ID and expected version.
+func TestAgentPolicyFlagsAreCheckedBeforeAnyRequest(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		requests++
@@ -1342,28 +1388,32 @@ func TestAgentPolicyFacetMustBeNetworkingBeforeAnyRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	connection := []string{"--url", server.URL, "--service-key-file", keyFile, "--namespace", "ns_1"}
-	for _, args := range [][]string{
-		{"agent", "policy", "get", "agt_1", "--facet="},
-		{"agent", "policy", "get", "agt_1", "--facet", "filesystem"},
-		{"agent", "policy", "get", "agt_1", "--facet", "process"},
-		{"agent", "policy", "update", "agt_1", "--facet", "filesystem", "--file", file},
-		{"agent", "policy", "apply", "agt_1", "--facet=", "--revision", "rev_1", "--expected-version", "1"},
-		{"agent", "policy", "editing", "agt_1", "--facet", "filesystem", "--enabled=false"},
-		{"agent", "policy", "recommendations", "agt_1", "--facet", "process", "--revision", "rev_1"},
+	const notNetworking = "--facet must be networking"
+	const emptyFacet = "--facet must name a sandbox policy facet such as networking"
+	const notRevision = `"deploy-1" is not a valid deployment ID: OCC accepts IDs that start with "rev_", not names; run "occ --namespace ns_1 agent revisions AGENT_ID" to find the ID`
+	for _, test := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"agent", "policy", "get", "agt_1", "--facet="}, emptyFacet},
+		{[]string{"agent", "policy", "get", "agt_1", "--facet", "filesystem"}, notNetworking},
+		{[]string{"agent", "policy", "get", "agt_1", "--facet", "process"}, notNetworking},
+		{[]string{"agent", "policy", "update", "agt_1", "--facet", "filesystem", "--file", file}, notNetworking},
+		{[]string{"agent", "policy", "apply", "agt_1", "--facet=", "--revision", "rev_1", "--expected-version", "1"}, emptyFacet},
+		{[]string{"agent", "policy", "editing", "agt_1", "--facet", "filesystem", "--enabled=false"}, notNetworking},
+		{[]string{"agent", "policy", "recommendations", "agt_1", "--facet", "process", "--revision", "rev_1"}, notNetworking},
+		{[]string{"agent", "policy", "apply", "agt_1", "--revision", "rev_1", "--expected-version", "0"}, "--expected-version must be positive"},
+		{[]string{"agent", "policy", "apply", "agt_1", "--revision", "deploy-1", "--expected-version", "1"}, notRevision},
+		{[]string{"agent", "policy", "recommendations", "agt_1", "--revision", "deploy-1"}, notRevision},
 	} {
 		requests = 0
 		command := New(io.Discard, io.Discard)
-		command.SetArgs(append(slices.Clone(connection), args...))
-		err := command.Execute()
-		want := "--facet must be networking"
-		if slices.Contains(args, "--facet=") {
-			want = "--facet must name a sandbox policy facet such as networking"
-		}
-		if err == nil || err.Error() != want {
-			t.Errorf("%v: error = %v, want %q", args, err, want)
+		command.SetArgs(append(slices.Clone(connection), test.args...))
+		if err := command.Execute(); err == nil || err.Error() != test.want {
+			t.Errorf("%v: error = %v, want %q", test.args, err, test.want)
 		}
 		if requests != 0 {
-			t.Errorf("%v: sent %d requests", args, requests)
+			t.Errorf("%v: sent %d requests", test.args, requests)
 		}
 	}
 	requests = 0

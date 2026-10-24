@@ -29,7 +29,13 @@ import type {
   SandboxPolicyRecommendations,
   SandboxPolicyRecommendation,
 } from "@openclaw-enterprise/contracts";
-import { asRecord, immutableCopy, isNonEmptyString, sha256Hex } from "@openclaw-enterprise/utils";
+import {
+  asRecord,
+  immutableCopy,
+  isNonEmptyString,
+  MAX_TIMER_DELAY_MS,
+  sha256Hex,
+} from "@openclaw-enterprise/utils";
 import {
   KubernetesObjectApi,
   type KubernetesObject,
@@ -53,7 +59,6 @@ import {
 } from "@openclaw-enterprise/occ";
 import { setTimeout as delay } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
-import { MAX_TIMER_DELAY_MS } from "../../worker/timer-settings.ts";
 import type {
   AgentRevision,
   EgressInstallation,
@@ -1245,10 +1250,12 @@ async function waitForGatewayReadiness(
       }
       unavailable = "OpenShell gateway Pod is not ready.";
     }
-    if (Date.now() >= deadline) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
       throw new OpenShellSandboxConfigurationFailure(unavailable);
     }
-    await delay(pollIntervalMs, undefined, { signal: context.signal });
+    // Check once more at the deadline rather than a whole poll interval past it.
+    await delay(Math.min(pollIntervalMs, remaining), undefined, { signal: context.signal });
   }
 }
 
@@ -1829,14 +1836,89 @@ function sandboxDataMount(
   };
 }
 
+const FILESYSTEM_PATH_RULE =
+  "Use an absolute path that is not the filesystem root and has no .. segment.";
+
+/**
+ * The gateway's filesystem path rule (`validate_filesystem_paths`), narrowed to exact
+ * non-root paths: startup and Sandbox provisioning both apply it.
+ */
+function isFilesystemPolicyPath(path: unknown): path is string {
+  return (
+    typeof path === "string" &&
+    path.startsWith("/") &&
+    !/^\/+$/u.test(path) &&
+    !path.includes("\0") &&
+    !path.split("/").includes("..")
+  );
+}
+
 function validateFilesystemPolicyPath(path: string, description: string): string {
-  const value = nonempty(path, description);
-  if (value === "/" || !value.startsWith("/") || value.includes("\0")) {
+  if (!isFilesystemPolicyPath(path)) {
     throw new OpenShellSandboxConfigurationFailure(
       `${description} must be an exact non-root absolute path.`,
     );
   }
-  return value;
+  return path;
+}
+
+// OpenShell's `is_valid_sandbox_identity`: its own user name, or a numeric ID that is not
+// root and not the u32 sentinel.
+const MAX_SANDBOX_IDENTITY = 4_294_967_294;
+
+function isSandboxIdentity(value: unknown): boolean {
+  if (value === "sandbox") {
+    return true;
+  }
+  if (typeof value !== "string" || !/^\+?[0-9]+$/u.test(value)) {
+    return false;
+  }
+  const id = Number(value);
+  return id >= 1 && id <= MAX_SANDBOX_IDENTITY;
+}
+
+/**
+ * Settings the gateway refuses only in CreateSandbox, which a dedicated deploy reaches after
+ * its predecessors have stopped, so startup refuses them first (findings 2331, 2332).
+ */
+function validatePolicySettings(options: OpenShellSandboxDriverOptions): void {
+  const details: ErrorDetail[] = [];
+  for (const field of ["runAsUser", "runAsGroup"] as const) {
+    if (!isSandboxIdentity(options.policy.process[field])) {
+      details.push({
+        path: `/policy/process/${field}`,
+        code: "INVALID_VALUE",
+        message: `Use sandbox or a numeric ID from 1 to ${MAX_SANDBOX_IDENTITY}; OpenShell refuses other identities.`,
+      });
+    }
+  }
+  const filesystem = options.policy.filesystem;
+  for (const field of ["readOnly", "readWrite"] as const) {
+    filesystem?.[field]?.forEach((path, index) => {
+      if (!isFilesystemPolicyPath(path)) {
+        details.push({
+          path: `/policy/filesystem/${field}/${index}`,
+          code: "INVALID_VALUE",
+          message: FILESYSTEM_PATH_RULE,
+        });
+      }
+    });
+  }
+  const dataMount = options.kubernetes.sandboxDataMount;
+  const writable = dataMount.readOnly
+    ? (filesystem?.readWrite?.indexOf(dataMount.mountPath) ?? -1)
+    : -1;
+  if (writable !== -1) {
+    details.push({
+      path: `/policy/filesystem/readWrite/${writable}`,
+      code: "INVALID_VALUE",
+      message: "The Sandbox data mount is read-only; remove it from readWrite.",
+    });
+  }
+  const [first, ...rest] = details;
+  if (first !== undefined) {
+    throw new ConfigurationValidationError([first, ...rest]);
+  }
 }
 
 function filesystemPolicy(
@@ -2168,8 +2250,7 @@ function validateOptions(options: OpenShellSandboxDriverOptions): void {
       "OpenShell policy.landlockCompatibility must be hard_requirement or omitted; best_effort is not supported.",
     );
   }
-  nonempty(options.policy.process.runAsUser, "OpenShell process runAsUser");
-  nonempty(options.policy.process.runAsGroup, "OpenShell process runAsGroup");
+  validatePolicySettings(options);
   if (
     !Array.isArray(options.policy.networkPolicies) ||
     options.policy.networkPolicies.length === 0
@@ -2254,12 +2335,31 @@ export const configurationSchema = Object.freeze({
       type: "object",
       properties: {
         serviceAccount: { type: "object", properties: { mode: { const: "gatewayConfigured" } } },
+        agentResources: {
+          type: "object",
+          properties: { requests: { type: "object" }, limits: { type: "object" } },
+        },
       },
     },
     policy: {
       type: "object",
+      required: ["process", "networkPolicies"],
       properties: {
+        filesystem: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            includeWorkdir: { type: "boolean" },
+            readOnly: { type: "array", items: { type: "string" } },
+            readWrite: { type: "array", items: { type: "string" } },
+          },
+        },
         landlockCompatibility: { const: "hard_requirement" },
+        process: {
+          type: "object",
+          required: ["runAsUser", "runAsGroup"],
+          properties: { runAsUser: { type: "string" }, runAsGroup: { type: "string" } },
+        },
         networkPolicies: {
           type: "array",
           minItems: 1,
@@ -2693,6 +2793,12 @@ export class OpenShellSandboxDriver implements SandboxDriver {
     if (harness.id !== "openclaw" && harness.id !== "codex") {
       throw new OpenShellSandboxConfigurationFailure(
         "OpenShell SandboxDriver does not support the selected Harness runtime.",
+      );
+    }
+    // prepareNativeWorkspace refuses this only after a deploy has stopped its predecessors.
+    if (harness.id === "openclaw" && this.options.kubernetes.userNamespaces !== false) {
+      throw new ConfigurationHarnessError(
+        "Dedicated OpenClaw needs kubernetes.userNamespaces: false in the OpenShell Sandbox Driver configuration. Select Codex, or ask an operator to set it.",
       );
     }
     const agents = optionalAgentConfiguration(

@@ -17,6 +17,67 @@ then follow the [upgrade checklist](upgrade-checklist.md) and
 Entries are newest first. Steps marked _untested_ have not been run against a
 real Installation.
 
+## 2026-10-24: chart NetworkPolicy peers are checked at render
+
+**What breaks.** `helm install` and `helm upgrade` refuse a
+`gatewayRouting.sandbox.ingressPeers` or `openshellGit.clients` entry that the
+Kubernetes API would refuse or that has fields a NetworkPolicy peer lacks: an
+invalid `ipBlock.cidr` or `except` CIDR (including leading-zero octets such as
+`010.0.0.0/8`), `ipBlock` together with selectors, a
+`matchExpressions` entry with an invalid key, an operator other than `In`,
+`NotIn`, `Exists` or `DoesNotExist`, or values that do not fit the operator,
+invalid `openshellGit.clients` label keys or values, and unknown keys such as
+`podSelectors`. Earlier builds rendered these and failed when Helm applied the
+NetworkPolicy, after other objects of the release had changed.
+
+**Who is affected.** Releases that set one of these peers by hand with such a
+value.
+
+**How to tell.** Helm fails before applying anything, naming the entry, for
+example `gatewayRouting.sandbox.ingressPeers[0].ipBlock.cidr requires an IPv4 or
+IPv6 CIDR`.
+
+**Steps.** Correct or remove the named field, then run the upgrade again.
+
+## 2026-10-24: OpenShell refuses OpenClaw Agents without user namespaces off
+
+**What breaks.** With the OpenShell Sandbox Driver, Agent save and deployment
+refuse a dedicated OpenClaw Agent with a 400 unless the Driver sets
+`kubernetes.userNamespaces: false`. Earlier builds saved and admitted it, then
+failed every new revision in workspace preparation, after its predecessors had
+stopped.
+
+**Who is affected.** OpenShell Installations that leave
+`kubernetes.userNamespaces` unset or `true` and run OpenClaw Agents; none of
+those Agents could deploy. Codex Agents are unaffected.
+
+**How to tell.** The refusal names `kubernetes.userNamespaces: false`.
+Provisioning status reads still report earlier requests.
+
+**Steps.** Set `kubernetes.userNamespaces: false` in the OpenShell Sandbox
+Driver configuration and restart the controller, or switch the Agent to Codex.
+
+## 2026-10-24: OpenShell Sandbox policy settings are checked at startup
+
+**What breaks.** Controller startup refuses OpenShell Sandbox settings that the
+Gateway refuses when it creates a Sandbox: a `policy.process.runAsUser` or
+`runAsGroup` other than `sandbox` or a number from 1 to 4294967294, a
+`policy.filesystem` path that is relative, only slashes or has a `..` segment, a
+read-only `kubernetes.sandboxDataMount` listed in `policy.filesystem.readWrite`,
+an unknown key under `policy.filesystem`, and `kubernetes.agentResources`
+`requests` or `limits` that are not objects. Earlier builds started, then
+failed each dedicated deploy after its predecessors had stopped.
+
+**Who is affected.** Only Installations whose OpenShell Sandbox settings use
+one of these values. Apart from a slash-only path such as `//` in
+`policy.filesystem.readOnly` (earlier builds refused only `/` there), none of
+them could deploy an Agent.
+
+**How to tell.** Startup fails with `STARTUP_FAILED`, and the Installation
+loader names the setting, for example `/policy/process/runAsUser`.
+
+**Steps.** Correct the named setting, then start the controller again.
+
 ## 2026-10-24: OpenShell readiness poll interval is capped at 2147483647 ms
 
 **What breaks.** Controller startup refuses an OpenShell Sandbox
