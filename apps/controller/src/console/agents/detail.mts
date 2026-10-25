@@ -782,8 +782,14 @@ export async function renderAgentDetail(
       badge.dataset.tone = tone;
     }
     liveServingNote.classList.toggle("stat-help-line", expected);
+    // Nothing sends a running version a request to verify it, so "Not verified" says why
+    // (finding 2367); a Sandbox note takes its place.
+    const unchecked =
+      tone === undefined && !deleting && currentRuntimeState === "running" && currentRevisionId
+        ? "OCC sends no test request."
+        : "";
     if (!expected) {
-      setText(liveServingNote, "");
+      setText(liveServingNote, unchecked);
     } else if (answer === null) {
       setDelayedText(liveServingNote, "", "Checking Sandbox…");
     } else if (lost) {
@@ -800,7 +806,7 @@ export async function renderAgentDetail(
       setText(liveServingNote, "Sandbox starting.");
     } else {
       // The Sandbox Driver keeps no record of this Sandbox.
-      setText(liveServingNote, "");
+      setText(liveServingNote, unchecked);
     }
   }
   function setLiveServing(mayBeOffline: boolean) {
@@ -1923,11 +1929,20 @@ export async function renderAgentDetail(
     renderVersionNotice();
   }
 
+  // The failed version the recovery block leads with, if any. The viewed version's record does
+  // not repeat that version's error below it (finding 2368).
+  let recoveryRevisionId: string | null = null;
+  function showRecovery(failure: Parameters<typeof recovery.show>[0]) {
+    recovery.show(failure);
+    recoveryRevisionId = failure?.latest.id ?? null;
+    versionRecord?.setFailureShownAbove(recoveryRevisionId === selected);
+  }
+
   function renderLatestDeployment() {
     markVersionOutcomes();
     const latest = visibleRevisions[0];
     if (!latest) {
-      recovery.show(null);
+      showRecovery(null);
       delete latestDeploymentValue.dataset.outcome;
       if (latestRevisionResult) {
         const rejected = latestRevisionResult.status === "rejected";
@@ -2058,7 +2073,7 @@ export async function renderAgentDetail(
       currentHidden ||
       currentUnknown ||
       !callerPermissionsSettled;
-    recovery.show(
+    showRecovery(
       hideRecovery
         ? null
         : {
@@ -2372,6 +2387,7 @@ export async function renderAgentDetail(
         operateAllowed: latestPermissionsRead.then((permissions) => permissions?.operate),
       });
       versionEvidence.append(...versionRecord.panels);
+      versionRecord.setFailureShownAbove(recoveryRevisionId === selected);
       if (latestDeploymentRecord?.deploymentId === selected) {
         versionRecord.show(latestDeploymentRecord);
       }

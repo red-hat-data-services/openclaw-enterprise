@@ -825,34 +825,60 @@ test("OpenShell configures only the selected dedicated Harness runtime", () => {
     () => driver.configureAgent(configuration, harness("openclaw", "embedded")),
     /supports only dedicated Harness revisions/,
   );
+  assert.throws(
+    () => driver.configureAgent(configuration, harness("other")),
+    /does not support the selected Harness runtime/,
+  );
 });
 
-// Native OpenClaw's private workspace preparation needs userNamespaces: false, and it runs
-// only after a dedicated deploy has stopped its predecessors. Agent save and deploy
-// admission call configureAgent, so they refuse the pair first (finding 2334).
-test("OpenShell refuses dedicated OpenClaw unless user namespaces are off", () => {
+// Native OpenClaw's private workspace preparation needs userNamespaces: false and at most one
+// operator-mode ServiceAccount, and it runs only after a dedicated deploy has stopped its
+// predecessors. Agent save and deploy admission call configureAgent, so they refuse those
+// settings first (findings 2334, 2346).
+test("OpenShell refuses dedicated OpenClaw on settings its workspace preparation refuses", () => {
   const configuration = { agents: { defaults: { model: "openai/gpt-5" } } };
   const harness = (id) => ({ id, version: "1.0.0", mode: "dedicated" });
-  for (const userNamespaces of [undefined, true]) {
+  const userNamespaces =
+    "Dedicated OpenClaw needs kubernetes.userNamespaces: false in the OpenShell Sandbox Driver configuration. Select Codex, or ask an operator to set it.";
+  const accounts =
+    "Dedicated OpenClaw needs at most one ServiceAccount in gateway.operatorWorkspaceResources of the OpenShell Sandbox Driver configuration. Select Codex, or ask an operator to remove the others.";
+  const serviceAccount = (name) => ({
+    apiVersion: "v1",
+    kind: "ServiceAccount",
+    metadata: { name },
+  });
+  const role = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "Role",
+    metadata: { name: "r" },
+  };
+  for (const [settings, message] of [
+    [(options) => delete options.kubernetes.userNamespaces, userNamespaces],
+    [(options) => (options.kubernetes.userNamespaces = true), userNamespaces],
+    [
+      (options) =>
+        (options.gateway.operatorWorkspaceResources = [serviceAccount("a"), serviceAccount("b")]),
+      accounts,
+    ],
+    // Control: one ServiceAccount beside other resources still prepares.
+    [(options) => (options.gateway.operatorWorkspaceResources = [serviceAccount("a"), role])],
+  ]) {
     const options = sandboxInstallation().drivers.sandbox.configuration;
-    if (userNamespaces === undefined) {
-      delete options.kubernetes.userNamespaces;
-    } else {
-      options.kubernetes.userNamespaces = userNamespaces;
-    }
+    settings(options);
     const driver = openShellDriver(workspaceGatewayClient(), options);
-    assert.throws(
-      () => driver.configureAgent(configuration, harness("openclaw")),
-      (error) => {
-        // workspace-setup-api.test.mjs proves the API's 400 with this message.
-        assert.ok(error instanceof ConfigurationHarnessError);
-        assert.equal(
-          error.message,
-          "Dedicated OpenClaw needs kubernetes.userNamespaces: false in the OpenShell Sandbox Driver configuration. Select Codex, or ask an operator to set it.",
-        );
-        return true;
-      },
-    );
+    if (message === undefined) {
+      assert.ok(driver.configureAgent(configuration, harness("openclaw")));
+    } else {
+      assert.throws(
+        () => driver.configureAgent(configuration, harness("openclaw")),
+        (error) => {
+          // workspace-setup-api.test.mjs proves the API's 400 with these messages.
+          assert.ok(error instanceof ConfigurationHarnessError);
+          assert.equal(error.message, message);
+          return true;
+        },
+      );
+    }
     // Codex never runs the preparation, so it is still admitted.
     assert.ok(driver.configureAgent(configuration, harness("codex")).plugins.entries.codex);
   }
@@ -884,6 +910,9 @@ test("OpenShell pins the Codex sandbox and approval reviewer while preserving ot
     });
     assert.equal(configuration.plugins.entries.codex.config.appServer, appServer);
     assert.equal(appServer.sandbox, "read-only");
+    // A disabled Codex plugin entry is enabled: the dedicated Codex Harness runs through it.
+    configuration.plugins.entries.codex.enabled = false;
+    assert.equal(driver.configureAgent(configuration, harness).plugins.entries.codex.enabled, true);
     // Status reads rerun the hook on stored work, so the pin must be idempotent.
     assert.deepEqual(driver.configureAgent(configured, harness), configured);
   }
@@ -1021,9 +1050,18 @@ test("OpenShell admits initial files only for its projected main workspace", () 
         ),
       /agents.entries.*must hold only main/,
     );
+    // A snapshot the hook never projected names the managed workspace, which is not the mount.
+    assert.throws(
+      () => driver.validateWorkspaceSetup(harness, {}),
+      /agents.defaults.workspace.*must be \/sandbox\/custom-workspace/,
+    );
     assert.throws(
       () => driver.validateWorkspaceSetup({ ...harness, mode: "embedded" }, configured),
       /require a dedicated/,
+    );
+    assert.throws(
+      () => driver.validateWorkspaceSetup({ ...harness, id: "other" }, configured),
+      /require a dedicated Codex or OpenClaw Harness/,
     );
   }
 });
@@ -3716,6 +3754,203 @@ test("startup refuses OpenShell filesystem paths before any Sandbox is created",
     (c) => (sandboxOf(c).policy.filesystem = { readwrite: ["/data"] }),
     structuralRefusal("/policy/filesystem", "additionalProperties", "UNKNOWN_FIELD"),
   );
+});
+
+// A quoted "false" reached the Gateway as user_namespaces=true, and an endpoint without ports
+// started and failed every CreateSandbox (findings 2355, 2354).
+test("startup refuses a non-boolean userNamespaces and an endpoint without ports", async (t) => {
+  for (const userNamespaces of ["false", 0, null]) {
+    await rejectsAtStartup(
+      t,
+      (c) => (sandboxOf(c).kubernetes.userNamespaces = userNamespaces),
+      structuralRefusal("/kubernetes/userNamespaces", "type", "INVALID_TYPE"),
+    );
+  }
+  await rejectsAtStartup(
+    t,
+    (c) => (sandboxOf(c).policy.networkPolicies[0].endpoints[0].ports = []),
+    structuralRefusal("/policy/networkPolicies/0/endpoints/0/ports", "minItems"),
+  );
+});
+
+// Typos in these objects were ignored, and the Gateway refused Agent resources it cannot
+// decode, or the API server their quantities, after a deploy stopped its predecessors
+// (findings 2353, 2356).
+test("startup refuses unknown OpenShell settings and invalid Agent resource quantities", async (t) => {
+  for (const [change, path] of [
+    [(c) => (sandboxOf(c).kubernetes.userNamespace = false), "/kubernetes"],
+    [
+      (c) => (sandboxOf(c).kubernetes.serviceAccount.name = "sandbox"),
+      "/kubernetes/serviceAccount",
+    ],
+    [
+      (c) => (sandboxOf(c).kubernetes.sandboxDataMount.readonly = true),
+      "/kubernetes/sandboxDataMount",
+    ],
+    [
+      (c) => (sandboxOf(c).kubernetes.agentResources = { request: {} }),
+      "/kubernetes/agentResources",
+    ],
+    [(c) => (sandboxOf(c).policy.filesytem = { readWrite: ["/data"] }), "/policy"],
+    [(c) => (sandboxOf(c).policy.process.runAsUserName = "sandbox"), "/policy/process"],
+    [
+      (c) => (sandboxOf(c).gateway.readiness = { ...readinessWait, timeoutMs: 1, pollInterval: 5 }),
+      "/gateway/readiness",
+    ],
+  ]) {
+    await rejectsAtStartup(
+      t,
+      change,
+      structuralRefusal(path, "additionalProperties", "UNKNOWN_FIELD"),
+    );
+  }
+  const quantity =
+    "Each value must be a quoted, non-negative Kubernetes quantity, such as 500m or 1Gi.";
+  for (const agentResources of [
+    { requests: { cpu: "one" } },
+    { limits: { memory: 5 } },
+    // Quantities are strings: without the type check 512 would parse as a quantity (5 does not).
+    { requests: { memory: 512 } },
+    { limits: { cpu: "1", "example.com/gpu": "1 Gi" } },
+    { requests: { cpu: "-500m" } },
+  ]) {
+    const [section] = Object.keys(agentResources);
+    await rejectsAtStartup(
+      t,
+      (c) => (sandboxOf(c).kubernetes.agentResources = agentResources),
+      invalidValue(`/kubernetes/agentResources/${section}`, quantity),
+    );
+  }
+  await rejectsAtStartup(
+    t,
+    (c) =>
+      (sandboxOf(c).kubernetes.agentResources = {
+        requests: { cpu: "1500m", memory: "1Gi" },
+        limits: { cpu: "1", memory: "2Gi" },
+      }),
+    [
+      {
+        path: "/kubernetes/agentResources/requests",
+        code: "INVALID_RANGE",
+        message: "The cpu request (1500m) cannot exceed its limit (1).",
+      },
+    ],
+  );
+  // Every resource is compared, not only the first.
+  await rejectsAtStartup(
+    t,
+    (c) =>
+      (sandboxOf(c).kubernetes.agentResources = {
+        requests: { cpu: "1", memory: "3Gi" },
+        limits: { cpu: "1", memory: "2Gi" },
+      }),
+    [
+      {
+        path: "/kubernetes/agentResources/requests",
+        code: "INVALID_RANGE",
+        message: "The memory request (3Gi) cannot exceed its limit (2Gi).",
+      },
+    ],
+  );
+  // An invalid limit is reported once, without also comparing the request against it.
+  await rejectsAtStartup(
+    t,
+    (c) =>
+      (sandboxOf(c).kubernetes.agentResources = {
+        requests: { cpu: "1" },
+        limits: { cpu: "-1" },
+      }),
+    invalidValue("/kubernetes/agentResources/limits", quantity),
+  );
+  // Control: every known key, and quantities in each spelling the API server accepts, load.
+  const accepted = sandboxInstallation();
+  Object.assign(sandboxOf(accepted).kubernetes, {
+    // Zero is a valid quantity, and a request needs no limit.
+    agentResources: {
+      requests: { cpu: "500m", memory: "1Gi", "example.com/gpu": "1", "ephemeral-storage": "0" },
+      limits: { cpu: "0.5", memory: "4e9", "example.com/gpu": "1" },
+    },
+  });
+  sandboxOf(accepted).kubernetes.sandboxDataMount.claimName = "workspace";
+  sandboxOf(accepted).gateway.readiness = { ...readinessWait, timeoutMs: 1, pollIntervalMs: 5 };
+  await loadInstallationFile(t, accepted);
+});
+
+// The Gateway refuses these protocols at CreateSandbox (finding 2335): unknown names, L7
+// protocols without an access preset, access or enforcement on tcp, enforce on sql, and json-rpc
+// or mcp, which need rules.
+test("startup refuses OpenShell endpoint protocols the gateway refuses", async (t) => {
+  const unknown =
+    "Use tcp, rest, websocket, graphql or sql, or omit protocol; OpenShell needs rules for json-rpc and mcp, which this setting cannot express.";
+  const tcpExtras =
+    "Protocol tcp takes neither an access preset nor enforcement; remove them, or use an L7 protocol.";
+  for (const [endpoint, message] of [
+    [{ protocol: "http" }, unknown],
+    [{ protocol: "json-rpc" }, unknown],
+    [{ protocol: "mcp", access: "full" }, unknown],
+    [{ protocol: "rest" }, "Protocol rest needs an access preset (read_only, read_write or full)."],
+    [
+      { protocol: "WebSocket" },
+      "Protocol websocket needs an access preset (read_only, read_write or full).",
+    ],
+    [{ protocol: "tcp", access: "full" }, tcpExtras],
+    [{ protocol: "TCP", enforcement: "audit" }, tcpExtras],
+    [
+      { protocol: "sql", access: "read_only", enforcement: "enforce" },
+      "Protocol sql supports enforcement audit only, since OpenShell cannot fully parse SQL.",
+    ],
+  ]) {
+    await rejectsAtStartup(
+      t,
+      (c) => Object.assign(endpointOf(c), endpoint),
+      invalidValue("/policy/networkPolicies/0/endpoints/0/protocol", message),
+    );
+  }
+  // Every policy and endpoint is checked, and each detail names its own indexes.
+  await rejectsAtStartup(
+    t,
+    (c) => {
+      policiesOf(c)[0].endpoints.push({
+        host: "tools.example.test",
+        ports: [443],
+        protocol: "http",
+      });
+      policiesOf(c).push({
+        name: "database",
+        endpoints: [{ host: "db.example.test", ports: [5432], protocol: "rest" }],
+        binaries: [{ path: "/app/bin/model-client" }],
+      });
+    },
+    [
+      ...invalidValue("/policy/networkPolicies/0/endpoints/1/protocol", unknown),
+      ...invalidValue(
+        "/policy/networkPolicies/1/endpoints/0/protocol",
+        "Protocol rest needs an access preset (read_only, read_write or full).",
+      ),
+    ],
+  );
+  // Control: the protocols the Gateway accepts without rules.
+  for (const endpoint of [
+    { protocol: "tcp" },
+    { protocol: "TCP" },
+    { protocol: "" },
+    { protocol: "rest", access: "read_only" },
+    { protocol: "sql", access: "full" },
+    { protocol: "SQL", access: "full", enforcement: "audit" },
+    { protocol: "graphql", access: "read_write", enforcement: "enforce" },
+  ]) {
+    const configuration = sandboxInstallation();
+    Object.assign(endpointOf(configuration), endpoint);
+    await loadInstallationFile(t, configuration);
+    // Some Gateway checks compare lowercase names, so the policy carries the protocol lowercase.
+    const driver = new OpenShellSandboxDriver(sandboxOf(configuration), {
+      id: "openshell-sandbox",
+      implementation: "openshell",
+      backend: backendFor(workspaceGatewayClient()),
+    });
+    const [sent] = driver.admitNetworkPolicy([], 1).defaults["model-egress"].endpoints;
+    assert.equal(sent.protocol, endpoint.protocol.toLowerCase());
+  }
 });
 
 // The schema leaves these open, so the Driver's own checks are the only refusal. Startup

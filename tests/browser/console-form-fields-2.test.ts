@@ -175,8 +175,8 @@ test("the workspace file editor shows an oversized file's error under the file",
   await page.getByText("AGENTS.md loaded.", { exact: true }).waitFor();
   await editor.fill("a".repeat(16_385));
   const save = page.getByRole("button", { name: "Save AGENTS.md", exact: true });
-  const error =
-    "Use valid Unicode without NUL characters in AGENTS.md, within 16 KiB of UTF-8 content.";
+  // Only the rule the file breaks (finding 2366).
+  const error = "Use at most 16 KiB (16,384 UTF-8 bytes) in AGENTS.md.";
   // A second Save without an edit is checked the same way, not by the browser.
   for (let attempt = 0; attempt < 2; attempt += 1) {
     await save.click();
@@ -192,15 +192,27 @@ test("the workspace file editor shows an oversized file's error under the file",
   );
   await editor.fill("after");
   assert.equal(await shownError(editor), null);
+  await editor.fill("x\0y");
+  await save.click();
+  await assertShownError(editor, "Use valid Unicode without NUL characters in AGENTS.md.");
+  assert.deepEqual(writes, []);
+  // A saved file keeps focus on its editor, though Save is disabled while it saves and after
+  // (finding 2366).
+  await editor.fill("after");
+  await save.click();
+  await page.getByText("AGENTS.md saved.", { exact: true }).waitFor();
+  assert.equal(await hasFocus(editor), true, "focus stays on the saved file");
   // Reload replaces the file without an input event; the error goes with the refused text.
   await editor.fill("a".repeat(16_385));
   await save.click();
   await assertShownError(editor, error);
-  await page.getByRole("button", { name: "Reload AGENTS.md", exact: true }).click();
+  const reload = page.getByRole("button", { name: "Reload AGENTS.md", exact: true });
+  await reload.click();
   await page.getByText("AGENTS.md loaded.", { exact: true }).waitFor();
   assert.equal(await editor.inputValue(), "before");
   assert.equal(await shownError(editor), null);
   assert.equal(await editor.getAttribute("aria-invalid"), null);
+  assert.equal(await hasFocus(reload), true, "focus returns to Reload");
 });
 
 // A Reload that finds the file gone empties the editor for a new file: the refused text's error
@@ -249,10 +261,7 @@ test("the workspace file editor drops an oversized file's error when Reload find
   await page.getByText("AGENTS.md loaded.", { exact: true }).waitFor();
   await editor.fill("a".repeat(16_385));
   await page.getByRole("button", { name: "Save AGENTS.md", exact: true }).click();
-  await assertShownError(
-    editor,
-    "Use valid Unicode without NUL characters in AGENTS.md, within 16 KiB of UTF-8 content.",
-  );
+  await assertShownError(editor, "Use at most 16 KiB (16,384 UTF-8 bytes) in AGENTS.md.");
   // Removed elsewhere since it loaded.
   missing = true;
   await page.getByRole("button", { name: "Reload AGENTS.md", exact: true }).click();
@@ -461,17 +470,19 @@ test("Create Agent refuses what the API would refuse before any write", async (t
     const agents = page.getByLabel("AGENTS.md", { exact: true });
     const create = page.getByRole("button", { name: "Create Agent", exact: true });
     const advanced = page.locator(".launch-advanced");
-    for (const content of ["a".repeat(16_385), "\u00e9".repeat(8_193), "x\0y"]) {
+    const tooLarge = "Use at most 16 KiB (16,384 UTF-8 bytes) in AGENTS.md.";
+    for (const [content, error] of [
+      ["a".repeat(16_385), tooLarge],
+      ["\u00e9".repeat(8_193), tooLarge],
+      ["x\0y", "Use valid Unicode without NUL characters in AGENTS.md."],
+    ] as const) {
       await agents.fill(content);
       // Advanced settings closes, so the check must open it to show the file.
       await advanced.locator("> summary").click();
       await create.click();
       assert.deepEqual(await invalidEvents(), [], "no browser validation bubble");
       assert.equal(await advanced.evaluate((node) => (node as HTMLDetailsElement).open), true);
-      await assertShownError(
-        agents,
-        "Use valid Unicode without NUL characters in AGENTS.md, within 16 KiB of UTF-8 content.",
-      );
+      await assertShownError(agents, error);
     }
     assert.deepEqual(nonAuthWriteRequests(requests), [], "nothing is saved");
   });
@@ -480,16 +491,39 @@ test("Create Agent refuses what the API would refuse before any write", async (t
   // dropped a pasted value's line breaks.
   await t.test("the inline Create Secret dialog follows the API's Secret rules", async (t) => {
     const { page, invalidEvents, requests } = await createForm(t, "Secret dialog rules");
+    // The suggested Name carries the Agent name and arrives without an input event: the submit
+    // checks it too.
+    await page.getByLabel("Agent name", { exact: true }).fill("Support\tbot");
     await openCreateSecretDialog(page, "API key Secret");
     const dialog = page.getByRole("dialog", { name: "Create model credential Secret" });
     const name = dialog.getByLabel("Name", { exact: true });
     const value = dialog.getByLabel("Value", { exact: true });
     const submit = dialog.getByRole("button", { name: "Create Secret", exact: true });
-    await name.fill("model\tkey");
+    assert.equal(await name.inputValue(), "Support\tbot model credential");
     await value.fill("token");
     await submit.click();
     assert.deepEqual(await invalidEvents(), [], "no browser validation bubble");
     await assertShownError(name, NAME_RULE);
+    // An edited Name is checked too.
+    await name.fill("model\tkey");
+    await submit.click();
+    assert.deepEqual(await invalidEvents(), [], "no browser validation bubble");
+    await assertShownError(name, NAME_RULE);
+    // Show value unmasks the value and says so; pressing it again masks it.
+    const reveal = dialog.getByRole("button", { name: "Show value", exact: true });
+    await reveal.click();
+    const hide = dialog.getByRole("button", { name: "Hide value", exact: true });
+    assert.equal(await hide.getAttribute("aria-pressed"), "true");
+    assert.equal(
+      await value.evaluate((node) => node.classList.contains("secret-value--masked")),
+      false,
+    );
+    await hide.click();
+    assert.equal(await reveal.getAttribute("aria-pressed"), "false");
+    assert.equal(
+      await value.evaluate((node) => node.classList.contains("secret-value--masked")),
+      true,
+    );
     await name.fill("Model key");
     for (const [content, rule] of [
       ["to\0ken", "Use valid UTF-8 without NUL characters."],
