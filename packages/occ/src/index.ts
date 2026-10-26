@@ -312,6 +312,7 @@ import {
   RuntimeLogsSandboxNotFoundError,
   ScopeViolationError,
   SecretBindingDriverError,
+  ServiceAccountBackendBindingError,
   ServiceAccountDriverNotConfiguredError,
   SecretBindingValidationError,
   SecretDriverOwnershipError,
@@ -441,6 +442,7 @@ export {
   CredentialProxyRepositoryOnlyError,
   CredentialSourceConfigError,
   CredentialSourceDriverError,
+  CredentialSourceRegistrationConfigError,
   CredentialSourceRevisionError,
   CredentialSourceTypeNotOfferedError,
   CredentialSourceUnprotectedError,
@@ -488,12 +490,14 @@ export {
   SavedRepositorySelectionError,
   ScopeViolationError,
   SecretBindingDriverError,
+  ServiceAccountBackendBindingError,
   ServiceAccountCredentialSecretExistsError,
   ServiceAccountDriverNotConfiguredError,
   SecretBindingValidationError,
   SecretDriverOwnershipError,
   SecretStorageDriverError,
   SecretValueError,
+  StoredCredentialSourceConfigError,
   TransientDependencyError,
   type ActivationFailedCode,
   type ActivationPendingCode,
@@ -1430,8 +1434,9 @@ function provisioningFailureMessage(code: string, error: unknown): string {
       error instanceof ComputeProvisioningRefusedError ||
       // Fixed, id-free text that names the fix (save replacement Secrets, submit a new request).
       error instanceof SecretDriverOwnershipError ||
-      // Fixed, id-free text naming the missing ChatGPT Backend.
+      // Fixed, id-free texts naming the missing or mismatched ChatGPT Backend.
       error instanceof ServiceAccountDriverNotConfiguredError ||
+      error instanceof ServiceAccountBackendBindingError ||
       // Fixed, id-free text naming the missing repository settings (finding 2362).
       error instanceof RepositoryDriverNotConfiguredError ||
       // Fixed, id-free repository and protected admission texts (finding 2536): a Compute
@@ -5295,6 +5300,37 @@ export class OpenClawController {
         }
       }
       return Object.freeze(denied.sort());
+    });
+  }
+
+  /**
+   * How many of the Namespace's Secrets among `secretIds` the principal may neither read nor
+   * operate: an advisory count for a client that deploys a draft binding them, which needs operate
+   * on each (finding D756). It names none, since the principal may not read them. Decisions as in
+   * listSecretsOperateDenied: one read unit, and a false decision is an answer, not an audited
+   * attempt. The caller checks Namespace read first.
+   */
+  async countUnreadableSecretsOperateDenied(
+    principalId: string,
+    namespaceId: string,
+    secretIds: ReadonlySet<string>,
+  ): Promise<number> {
+    const namespace = await this.getNamespace(principalId, namespaceId);
+    return this.read(async (state) => {
+      let count = 0;
+      for (const secret of await state.secrets.listSecrets(namespace.id)) {
+        if (!secretIds.has(secret.id)) {
+          continue;
+        }
+        const resource: ResourceRef = { kind: "secret", id: secret.id, namespaceId: namespace.id };
+        if (
+          !(await this.canRead(principalId, resource)) &&
+          !(await this.authorizationDecision(principalId, "operate", resource)).decision.allowed
+        ) {
+          count += 1;
+        }
+      }
+      return count;
     });
   }
 

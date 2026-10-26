@@ -13,6 +13,7 @@ import {
   apiRequests,
   detailUrl,
   expectNoText,
+  grantMember,
   grantSecretOperate,
   hasFocus,
   holdRequests,
@@ -49,12 +50,15 @@ import {
   CHANNEL_SECRETS_CONFIGURATION_CHANGED,
   CONFIGURATION_SAVE_DENIED,
   DEPENDENCY_UNAVAILABLE,
+  deployUnreadableSecrets,
   GENERIC_DENIAL,
   NAMESPACE_NOT_READY,
   READ_UNAVAILABLE,
   REPOSITORY_EDITS_PENDING,
   RESOURCE_CONFLICT,
-  permissionRefused,
+  notIncluded,
+  POLICY_EDITING_SETTING_REFUSED,
+  GRANT_EXCEEDS_CEILING,
 } from "../helpers/refusal-text.mjs";
 
 test("Agent policy ceiling rejection is announced in view and preserves unsaved additions", async (t) => {
@@ -116,10 +120,7 @@ test("Agent policy ceiling rejection is announced in view and preserves unsaved 
   // The list names the setting as a dotted path, as the API's refusals do, never a JSON pointer
   // (finding 2538).
   await page
-    .getByText(
-      "Configuration setting additions[0]: The grant exceeds the Installation delegation ceiling.",
-      { exact: true },
-    )
+    .getByText(`Configuration setting additions[0]: ${GRANT_EXCEEDS_CEILING}`, { exact: true })
     .waitFor();
   assert.equal(await page.getByText(/^\/additions/).count(), 0);
   assert.equal(
@@ -213,6 +214,33 @@ test("Policy denials reads the Sandbox log of a version a Sandbox Driver provisi
   }
 });
 
+// The editing setting needs Installation administer and Agent administer, which no Namespace Role
+// grants. An administrator whose Restriction denies Agent administer on this Agent is told who
+// can change it, not "You do not have permission" (finding D753).
+test("A refused policy editing change says who can change it", async (t) => {
+  const { fixture, namespace, agent } = await createPolicyConsole(t);
+  const { revision } = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
+  fixture.policy.restrictions.push({
+    id: "deny-agent-administer",
+    namespaceId: namespace.id,
+    resourceKind: "agent",
+    resourceId: agent.id,
+    action: "administer",
+    effect: "deny",
+  });
+  const { page } = await newPage(t, fixture);
+  await login(page, fixture, detailUrl(fixture, namespace.id, agent.id, revision.id, "policy"));
+  const tab = page.locator(".sandbox-policy");
+  const refused = page.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/agents/${agent.id}/sandbox-policy/networking/editing`) &&
+      response.request().method() === "PATCH",
+  );
+  await tab.getByRole("button", { name: "Disable policy editing", exact: true }).click();
+  assert.equal((await refused).status(), 403);
+  await tab.getByText(POLICY_EDITING_SETTING_REFUSED, { exact: true }).waitFor();
+});
+
 // A member whose grants do not include the Agent's SandboxPolicy gets a refusal; Retry would only
 // ask again for the same answer (finding 2060). With a permission answer the console skips the
 // read instead (finding 2454), so the answer is withheld here to reach the API's refusal.
@@ -247,11 +275,11 @@ test("A refused policy read offers no Retry", async (t) => {
   await tab
     .getByRole("alert")
     .filter({
-      hasText: permissionRefused("read this Agent’s policy", "SandboxPolicy read on it"),
+      hasText: notIncluded("reading this Agent’s policy", "SandboxPolicy read on it"),
     })
     .waitFor();
   await tab
-    .getByText(permissionRefused("read policy suggestions", "SandboxPolicy read on it"))
+    .getByText(notIncluded("reading policy suggestions", "SandboxPolicy read on it"))
     .waitFor();
   assert.equal(await tab.getByRole("button", { name: "Retry policy read" }).count(), 0);
   assert.equal(await tab.getByRole("button", { name: "Refresh suggestions" }).count(), 0);
@@ -688,11 +716,7 @@ test("Agent policy combined save distinguishes ceiling rejection from a saved po
   await page.getByRole("spinbutton", { name: "Start port", exact: true }).fill("443");
   await page.getByRole("spinbutton", { name: "End port", exact: true }).fill("443");
   await page.getByRole("button", { name: "Review changes", exact: true }).click();
-  await page
-    .getByRole("alert")
-    .filter({ hasText: "The grant exceeds the Installation delegation ceiling" })
-    .first()
-    .waitFor();
+  await page.getByRole("alert").filter({ hasText: GRANT_EXCEEDS_CEILING }).first().waitFor();
   assert.equal(
     pathRequests(requests, "POST", `${base}/apply`).length,
     0,
@@ -1529,6 +1553,66 @@ test("Deploy names the bound Secrets an operator may not operate", async (t) => 
     await deploy.click();
     assert.equal((await admitted).status(), 202);
     await page.waitForURL(/revision=rev_/);
+  }
+});
+
+// Finding D756. A bound Secret the operator may not read is not in the Secret operate answer's
+// list, which names only Secrets she may read. Deploying still needs Secret operate on it, so the
+// answer counts the bound Secrets she may neither read nor operate, and Deploy is disabled beside
+// a reason that names no Secret, instead of "Ready to deploy." and a 403 on click. Operate alone
+// is enough to deploy: with it and still no read, the same operator deploys. An Installation
+// administrator may operate every Secret, so the gate never holds for one.
+test("Deploy says a bound Secret the operator may neither read nor operate needs a grant", async (t) => {
+  const { fixture, namespace, agent, path } = await deployableRepositoryAgent(
+    t,
+    "Unlisted Secret Agent",
+  );
+  const operator = await fixture.createNamespaceMember("unlisted-operator", namespace.id, [
+    ...AGENT_READ,
+    ["deploy", "agent"],
+    ["operate", "agent"],
+  ]);
+  const reason = deployUnreadableSecrets(1);
+  const url = detailUrl(fixture, namespace.id, agent.id, "draft", "configuration");
+  const deployed = async (page) => {
+    const deploy = page.getByRole("button", { name: "Deploy new version" });
+    await expectNoText(page, reason, () => waitForEnabled(deploy));
+    const admitted = page.waitForResponse(
+      (response) =>
+        response.url() === `${fixture.origin}${path}/deploy` &&
+        response.request().method() === "POST",
+    );
+    await deploy.click();
+    assert.equal((await admitted).status(), 202);
+    await page.waitForURL(/revision=rev_/);
+  };
+
+  {
+    const { page } = await newPage(t, fixture);
+    const requests = apiRequests(page, fixture.origin);
+    await login(page, fixture, url, operator.credentials);
+    await page.getByRole("heading", { name: "Unlisted Secret Agent" }).waitFor();
+    await page.getByText(reason, { exact: true }).waitFor();
+    const deploy = page.getByRole("button", { name: "Deploy new version" });
+    assert.equal(await deploy.isDisabled(), true);
+    assert.equal(await page.getByText("Ready to deploy.").count(), 0);
+    assert.equal(await page.getByText("Demo model credential").count(), 0);
+    assert.deepEqual(pathRequests(requests, "POST", `${path}/deploy`), []);
+  }
+
+  {
+    const { page } = await newPage(t, fixture);
+    await login(page, fixture, url);
+    await page.getByRole("heading", { name: "Unlisted Secret Agent" }).waitFor();
+    await deployed(page);
+  }
+
+  grantMember(fixture, "unlisted-operator", [["operate", "secret"]]);
+  {
+    const { page } = await newPage(t, fixture);
+    await login(page, fixture, url, operator.credentials);
+    await page.getByRole("heading", { name: "Unlisted Secret Agent" }).waitFor();
+    await deployed(page);
   }
 });
 

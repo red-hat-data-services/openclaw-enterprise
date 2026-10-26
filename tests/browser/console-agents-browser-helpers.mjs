@@ -95,6 +95,27 @@ export function revokeAdministratorGrant(fixture, grant) {
   return revokeRoleGrant(role, "the administrator", grant);
 }
 
+/**
+ * Binds the Installation administrator Role the fixture seeds to `principal`, as another
+ * administrator grants Installation administration while that account is signed in. Returns a
+ * function that removes that binding again, as another administrator revokes it.
+ */
+export function grantInstallationAdministration(fixture, principal) {
+  const role = fixture.policy.roles.find(({ name }) => name === "Installation administrator");
+  assert.ok(role, "the fixture's administrator has a Role");
+  const binding = fixture.policy.bindings.find(({ roleId }) => roleId === role.id);
+  assert.ok(binding, "the fixture's administrator holds the Role through a binding");
+  const granted = {
+    ...binding,
+    id: `installation-administrator-${principal.id}`,
+    subjectId: principal.id,
+  };
+  fixture.policy.bindings.push(granted);
+  return () => {
+    fixture.policy.bindings.splice(fixture.policy.bindings.indexOf(granted), 1);
+  };
+}
+
 function revokeRoleGrant(role, holder, [action, resourceKind]) {
   const before = role.permissions;
   role.permissions = before.filter(
@@ -547,6 +568,15 @@ export async function waitForInputValue(locator, expected, timeoutMs = 10_000) {
     expected,
     `input value was ${JSON.stringify(value)}, not ${JSON.stringify(expected)}, after ${timeoutMs} ms`,
   );
+}
+
+// The Agent page builds its tab while the view is still held back (display: none) for its first
+// reads, and a picker's Secret list can load before the view is shown (findings 2034, 2626). A
+// test that measures layout waits through this, not waitForInputValue alone: a hidden field
+// measures 0 x 0.
+export async function waitForShownInputValue(locator, expected, timeoutMs = 10_000) {
+  await waitForInputValue(locator, expected, timeoutMs);
+  await locator.waitFor({ state: "visible", timeout: timeoutMs });
 }
 
 // A control becomes enabled when the page state behind it settles, which can be a task or more
@@ -1018,6 +1048,35 @@ export function routeOneVersionPerPage(page, fixture, namespace, agent, olderRea
       });
     },
   );
+}
+
+// Denies AgentRevision read on one version, as an administrator's per-version restriction does.
+// State reads the policy on each request, so it applies from the next read on.
+export function denyRevisionRead(fixture, namespace, revision) {
+  fixture.policy.restrictions.push({
+    id: `deny-read-${revision.id}`,
+    namespaceId: namespace.id,
+    resourceKind: "agent_revision",
+    resourceId: revision.id,
+    action: "read",
+    effect: "deny",
+  });
+}
+
+// The Stop Agent button in its row on the Agent page.
+export const stopAgentButton = (page) =>
+  page
+    .getByRole("region", { name: "Stop Agent", exact: true })
+    .getByRole("button", { name: "Stop Agent", exact: true });
+
+// The authorization denials an InMemoryAuditSink recorded for `action`: an exact action name, or
+// a RegExp for a family of actions.
+export function authorizationDenials(auditSink, action) {
+  const matches =
+    typeof action === "string" ? (name) => name === action : (name) => action.test(name);
+  return auditSink
+    .list()
+    .filter((event) => event.kind === "authorization_denial" && matches(event.action));
 }
 
 // WCAG 2 contrast between two sRGB colours given as [r, g, b] in 0-255.

@@ -100,6 +100,9 @@ import {
   secretOperateRefused,
   stopRefused,
   stopStatusRefreshFailed,
+  NO_TEST_REQUEST,
+  PLUGINS_READ_ONLY,
+  READ_ONLY_DRAFT_NOTICE,
 } from "../helpers/refusal-text.mjs";
 
 test("Agent detail separates the current version, viewed version, and latest deployment", async (t) => {
@@ -164,10 +167,7 @@ test("Agent detail separates the current version, viewed version, and latest dep
   await overview.nth(1).getByText("v2 · Queued").waitFor();
   await overview.nth(2).getByText("Not verified").waitFor();
   // A running version's unverified serving says why (finding 2367).
-  await overview
-    .nth(2)
-    .getByText("OpenClaw Enterprise sends no test request.", { exact: true })
-    .waitFor();
+  await overview.nth(2).getByText(NO_TEST_REQUEST, { exact: true }).waitFor();
   const activity = await expectDeploymentOutcome(page, "Queued");
   await activity.getByText("Most recent visible deployment · v2").waitFor();
   await activity.getByText("Waiting for a worker claim.").waitFor();
@@ -1993,11 +1993,10 @@ test("Agent credentials choose existing Secrets for harness authentication", asy
   assert.equal(await unreadableSecret.inputValue(), "Bound Secret");
   await unreadableSecret.click();
   await page.getByRole("option", { name: "Bound Secret", exact: true }).waitFor();
+  // A Secret no list read shows gets no metadata link (finding D757).
   assert.equal(
-    await page
-      .getByRole("link", { name: /View harness authentication Secret metadata/ })
-      .getAttribute("href"),
-    `/namespaces/${namespace.id}/secrets/${replacementSecret.id}`,
+    await page.getByRole("link", { name: /View harness authentication Secret metadata/ }).count(),
+    0,
   );
 });
 
@@ -2708,11 +2707,14 @@ test("Agent credentials settle a member's harness Secret save and say who grants
     const url = detailUrl(fixture, namespace.id, agent.id, "draft", "credentials");
     const { page } = await newPage(t, fixture);
     const requests = apiRequests(page, fixture.origin);
-    const probe = page.waitForResponse(`${fixture.origin}/observability`);
     await login(page, fixture, url, writer.credentials);
     await page.getByRole("heading", { name: agent.name }).waitFor();
-    // The session's Installation read already found this account is no administrator.
-    assert.equal((await probe).status(), 403);
+    // The Namespace permission answer already said this account is no administrator, so the
+    // session sends no probe.
+    assert.deepEqual(
+      requests.filter(({ path }) => path === "/observability"),
+      [],
+    );
     await selectSecret(page, "API key Secret", replacementSecret);
     const save = page.getByRole("button", { name: "Save authentication source" });
     await save.click();
@@ -4052,6 +4054,7 @@ test("a version editor without Agent update can recover a failed deployment from
     configurationSecretsOperateDeniedBindings: [],
     agentSourcesOperate: false,
     sandboxPolicyRead: false,
+    readLogs: false,
   });
 
   // The header label confirms the page applied the permission answer before recovery is used.
@@ -4146,10 +4149,6 @@ const SOCKET_SLACK = {
   allowFrom: ["U123"],
   channels: { C123: { requireMention: true } },
 };
-const READ_ONLY_DRAFT_NOTICE =
-  "Version draft · read-only with your access. The next deployment uses it as saved.";
-const PLUGINS_READ_ONLY =
-  "These are the version draft's plugin selections, read-only with your access. The next deployment uses them as saved.";
 
 // A member who can only read the Agent views its draft: the saved JSON with no editor whose
 // Save answers 403, and no editor's copy or checklist (finding 2421).
@@ -4182,6 +4181,7 @@ test("a reader without update views the version draft read-only", async (t) => {
     configurationSecretsOperateDeniedBindings: [],
     agentSourcesOperate: false,
     sandboxPolicyRead: false,
+    readLogs: false,
   });
   await page.getByText(CONFIGURATION_READ_ONLY, { exact: true }).waitFor();
   await page.getByText("View native Configuration", { exact: true }).waitFor();
@@ -4325,6 +4325,7 @@ test("an Agent editor without Configuration update sees the Configuration read-o
     configurationSecretsOperateDeniedBindings: [],
     agentSourcesOperate: true,
     sandboxPolicyRead: false,
+    readLogs: false,
   });
   await page.getByText(CONFIGURATION_READ_ONLY, { exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: "Edit Configuration" }).count(), 0);
@@ -4396,6 +4397,7 @@ test("an editor without operate on a bound Secret views the version draft read-o
     configurationSecretsOperateDeniedBindings: ["EXTERNAL_API_TOKEN"],
     agentSourcesOperate: false,
     sandboxPolicyRead: false,
+    readLogs: false,
   });
   await page.getByText(READ_ONLY_DRAFT_NOTICE, { exact: true }).waitFor();
   assert.equal(await page.getByText(/New version\. Changes affect/).count(), 0);
@@ -4433,9 +4435,13 @@ test("a deployer without update keeps the draft checklist", async (t) => {
     nativeValues("slack", { harnessId: "codex", channels: { slack: SOCKET_SLACK } }),
     { executionMode: "dedicated" },
   );
+  // Read and operate on the model credential Secret, so Deploy waits on the draft, not on a
+  // Secret this member cannot read (finding D756).
   const deployer = await fixture.createNamespaceMember("draft-deployer", namespace.id, [
     ...AGENT_READ,
     ["deploy", "agent"],
+    ["read", "secret"],
+    ["operate", "secret"],
   ]);
   const path = "/namespaces/" + namespace.id + "/agents/" + agent.id;
   const { page } = await newPage(t, fixture);
@@ -4794,7 +4800,10 @@ test("Secret fields refuse a readable Secret the editor cannot operate", async (
   const save = page.getByRole("button", { name: "Save channel Secrets" });
   await waitForEnabled(page.getByLabel("Slack bot token", { exact: true }));
   const denied = await operateDeniedSecretOption(page, "Slack bot token", spare);
-  assert.deepEqual((await (await answer).json()).data, { operateDenied: [spare.id] });
+  assert.deepEqual((await (await answer).json()).data, {
+    operateDenied: [spare.id],
+    unreadableOperateDenied: 0,
+  });
   // A forced click skips the disabled check: choosing it still stages nothing.
   await denied.click({ force: true });
   await page.getByLabel("Slack bot token", { exact: true }).press("Enter");
@@ -5131,6 +5140,7 @@ test("a negative permission answer reaching an open Stop or Delete dialog preven
           configurationSecretsOperateDeniedBindings: [],
           agentSourcesOperate: false,
           sandboxPolicyRead: false,
+          readLogs: false,
         },
       },
     );

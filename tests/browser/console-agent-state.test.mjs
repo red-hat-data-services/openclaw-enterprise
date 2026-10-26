@@ -2,13 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { DEPLOYMENT_POLL_MS } from "../../apps/controller/src/console/agents/deployment-evidence.mts";
+import { InMemoryAuditSink } from "../../packages/audit/src/index.ts";
 import { apiErrorResponse } from "../helpers/api-error.mjs";
 import { createConsoleAppFixture } from "../helpers/console-app.mjs";
 import {
+  AGENT_READ,
   apiRequests,
+  authorizationDenials,
+  denyRevisionRead,
   detailUrl,
   hasFocus,
   holdRequests,
+  grantInstallationAdministration,
   login,
   nativeValues,
   newPage,
@@ -18,6 +23,7 @@ import {
   takeLayoutShifts,
   trackSettledFetches,
   shortId,
+  stopAgentButton,
   waitForEnabled,
   waitForIdleFetches,
 } from "./console-agents-browser-helpers.mjs";
@@ -34,6 +40,8 @@ import {
   AGENT_STOP_AND_DELETE_DENIED,
   AGENT_STOP_DENIED,
   askForGrant,
+  BACKENDS_DENIED,
+  BOUND_SECRET_UNLISTED,
   MALFORMED_REQUEST,
   RESOURCE_CONFLICT,
   requestedVersionUnavailable,
@@ -41,6 +49,7 @@ import {
   NEW_VERSIONS_READ,
   STOP_UNKNOWN_DEPLOYMENT_CONFIRMATION,
   VERSION_UNAVAILABLE,
+  VERSION_READ_DENIED_HEADING,
 } from "../helpers/refusal-text.mjs";
 
 function deploymentBody(
@@ -675,6 +684,388 @@ test("Agent detail hides sharing instead of showing an error to non-administrato
   assert.equal(await focused(), "Policy denials");
 });
 
+// The API audits each refused read as an authorization denial, one nobody attempted. A member's
+// page loads therefore send no Installation-administration probe, and her Agent detail reads no
+// sharing policy; an administrator's session still asks both (finding D45).
+test("Only an administrator's session probes Installation administration and reads sharing policy", async (t) => {
+  const auditSink = new InMemoryAuditSink();
+  const url = "https://metrics.example.test/d/operations";
+  const fixture = await createConsoleAppFixture(t, { auditSink, observabilityUrl: url });
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Audited access", { ready: true });
+  const agent = await fixture.createAgent(namespace.id, "Audited Agent", nativeValues("x"));
+  const reader = await fixture.createNamespaceMember("audited-reader", namespace.id, AGENT_READ);
+  // A link to the Access tab, where sharing policy is read.
+  const access = detailUrl(fixture, namespace.id, agent.id, "draft", "access");
+  const adminReads = (requests) =>
+    requests
+      .filter(({ path }) => path === "/observability" || path.includes("/iam/"))
+      .map(({ method, path }) => `${method} ${path}`);
+  const adminDenials = () => authorizationDenials(auditSink, /^openclaw\.(observability|iam)\./);
+
+  const { page: member } = await newPage(t, fixture);
+  await trackSettledFetches(member);
+  const memberRequests = apiRequests(member, fixture.origin);
+  await login(member, fixture, access, reader.credentials);
+  await member.getByRole("heading", { name: "Audited Agent" }).waitFor();
+  await member.getByRole("tab", { name: "Configuration", selected: true }).waitFor();
+  assert.equal(await member.getByRole("tab", { name: "Access" }).count(), 0);
+  // The Namespace permission answer's refusal is not kept across reloads, so a reload and another
+  // page ask it again; none of them probes.
+  await member.reload();
+  await member.getByRole("tab", { name: "Configuration", selected: true }).waitFor();
+  await member.goto(`${fixture.origin}/console/namespaces`);
+  await member.getByRole("list", { name: "Namespaces" }).getByText("Audited access").waitFor();
+  await waitForIdleFetches(member);
+  assert.equal(await member.getByRole("link", { name: "Observability", exact: true }).count(), 0);
+  assert.deepEqual(adminReads(memberRequests), []);
+  assert.deepEqual(adminDenials(), []);
+
+  const { page: admin } = await newPage(t, fixture);
+  const adminRequests = apiRequests(admin, fixture.origin);
+  await login(admin, fixture, access);
+  await admin
+    .getByRole("region", { name: "Share Agent", exact: true })
+    .getByText("Current policy loaded.", { exact: true })
+    .waitFor();
+  assert.equal(
+    await admin.getByRole("link", { name: "Observability", exact: true }).getAttribute("href"),
+    url,
+  );
+  assert.deepEqual([...new Set(adminReads(adminRequests))].sort(), [
+    `GET /namespaces/${namespace.id}/iam/access-bindings`,
+    `GET /namespaces/${namespace.id}/iam/roles`,
+    "GET /observability",
+  ]);
+  assert.deepEqual(adminDenials(), []);
+});
+
+// Finding 2619. A member's Agent detail shows a bound Secret she may not read from the
+// Namespace's Secret list, which leaves it out and audits nothing, instead of reading the Secret,
+// which the API audits as a denial nobody attempted. An administrator still reads it, without
+// the list read (finding 2623).
+test("A member's Agent detail reads no bound Secret her Secret list leaves out", async (t) => {
+  const auditSink = new InMemoryAuditSink();
+  const fixture = await createConsoleAppFixture(t, { auditSink });
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Bound Secrets", { ready: true });
+  const secret = await fixture.createSecret(namespace.id, "Bound model key", "hidden-model");
+  const agent = await fixture.createAgent(namespace.id, "Bound Agent", nativeValues("x"), {
+    harnessAuth: { method: "api_key", source: secret.ref },
+  });
+  // Agent and Configuration read, no Secret read.
+  const reader = await fixture.createNamespaceMember("bound-reader", namespace.id, AGENT_READ);
+  const url = detailUrl(fixture, namespace.id, agent.id, "draft", "configuration");
+  const secretPath = `/namespaces/${namespace.id}/secrets/${secret.id}`;
+  const secretReads = (requests) => requests.filter(({ path }) => path === secretPath);
+  const listReads = (requests) =>
+    requests.filter(({ path }) => path === `/namespaces/${namespace.id}/secrets`);
+  const secretDenials = () => authorizationDenials(auditSink, /^openclaw\.secrets\./);
+
+  const { page: member } = await newPage(t, fixture);
+  await trackSettledFetches(member);
+  const memberRequests = apiRequests(member, fixture.origin);
+  await login(member, fixture, url, reader.credentials);
+  const unlisted = member.getByText(BOUND_SECRET_UNLISTED, { exact: true });
+  await unlisted.waitFor();
+  // The ID stays in the title for the administrator who grants read on it.
+  assert.equal(await unlisted.getAttribute("title"), secret.id);
+  await waitForIdleFetches(member);
+  assert.deepEqual(secretReads(memberRequests), []);
+  assert.deepEqual(secretDenials(), []);
+
+  const { page: admin } = await newPage(t, fixture);
+  const adminRequests = apiRequests(admin, fixture.origin);
+  await trackSettledFetches(admin);
+  await login(admin, fixture, url);
+  await admin.getByRole("link", { name: "Bound model key", exact: true }).waitFor();
+  await waitForIdleFetches(admin);
+  assert.equal(secretReads(adminRequests).length, 1);
+  assert.deepEqual(listReads(adminRequests), []);
+  assert.deepEqual(secretDenials(), []);
+});
+
+// Finding D757. A bound Secret's links open the console's Secrets page with that Secret's metadata
+// and consumers, not the API path's raw JSON. A member whose Secret list leaves the Secret out
+// gets no link, which would only open a refusal the API audits; the Credentials field says why
+// its name is unavailable, as the Configuration tab does.
+test("Credentials links a readable bound Secret to the Secrets page and explains an unreadable one", async (t) => {
+  const auditSink = new InMemoryAuditSink();
+  const fixture = await createConsoleAppFixture(t, { auditSink });
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Secret links", { ready: true });
+  const secret = await fixture.createSecret(namespace.id, "Linked model key", "hidden-model");
+  const agent = await fixture.createAgent(namespace.id, "Linked Agent", nativeValues("x"), {
+    harnessAuth: { method: "api_key", source: secret.ref },
+  });
+  const reader = await fixture.createNamespaceMember("link-reader", namespace.id, AGENT_READ);
+  const url = detailUrl(fixture, namespace.id, agent.id, "draft", "credentials");
+  const secretPage = `/console/secrets?namespace=${namespace.id}&secret=${secret.id}`;
+  const metadataLink = (page) =>
+    page.getByRole("link", {
+      name: "View harness authentication Secret metadata (opens in new tab)",
+    });
+
+  const { page: member } = await newPage(t, fixture);
+  await trackSettledFetches(member);
+  await login(member, fixture, url, reader.credentials);
+  const hint = member.locator("#harness-auth-secret-status");
+  await hint.getByText(BOUND_SECRET_UNLISTED, { exact: true }).waitFor();
+  await waitForIdleFetches(member);
+  assert.equal(await metadataLink(member).count(), 0);
+  assert.equal(await member.getByText("Secret metadata is bound.").count(), 0);
+  assert.deepEqual(authorizationDenials(auditSink, /^openclaw\.secrets\./), []);
+
+  const { page: admin } = await newPage(t, fixture);
+  await login(admin, fixture, url);
+  await waitForEnabled(admin.getByLabel("API key Secret", { exact: true }));
+  const link = metadataLink(admin);
+  await link.waitFor();
+  assert.equal(await link.getAttribute("href"), secretPage);
+  assert.equal(await link.getAttribute("target"), "_blank");
+  // The Configuration tab's summary names the Secret with a link to the same page.
+  await admin.getByRole("tab", { name: "Configuration", exact: true }).click();
+  const named = admin.getByRole("link", { name: "Linked model key", exact: true });
+  await named.waitFor();
+  assert.equal(await named.getAttribute("href"), secretPage);
+  // The Secrets page opens that Secret's metadata and consumers, Agent included.
+  const [opened] = await Promise.all([admin.waitForEvent("popup"), named.click()]);
+  const dialog = opened.getByRole("dialog", { name: "Linked model key" });
+  await dialog.getByText(secret.id, { exact: true }).waitFor();
+  await dialog.getByRole("link", { name: agent.id, exact: true }).waitFor();
+  assert.equal(await opened.locator("pre").count(), 0);
+});
+
+// Finding 2619. Backends need Installation administration. A member's Backends page shows the
+// refusal without reading Backends, which the API audits as a denial nobody attempted, on each
+// page load; an administrator still reads them.
+test("Only an administrator's Backends page reads Backends", async (t) => {
+  const auditSink = new InMemoryAuditSink();
+  const fixture = await createConsoleAppFixture(t, { auditSink });
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Backends access", { ready: true });
+  const reader = await fixture.createNamespaceMember("backends-reader", namespace.id, AGENT_READ);
+  const backendsPage = `/console/backends?namespace=${namespace.id}`;
+  const backendsReads = (requests) => requests.filter(({ path }) => path === "/backends");
+  const backendsDenials = () => authorizationDenials(auditSink, /^openclaw\.backends\./);
+
+  const { page: member } = await newPage(t, fixture);
+  await trackSettledFetches(member);
+  const memberRequests = apiRequests(member, fixture.origin);
+  await login(member, fixture, backendsPage, reader.credentials);
+  const denial = member.locator(".state-panel");
+  await denial.getByText(BACKENDS_DENIED, { exact: true }).waitFor();
+  // The header's Refresh asks the permission answer again; it still reads no Backends.
+  const oldPanel = await denial.elementHandle();
+  await member.getByRole("button", { name: "Refresh", exact: true }).click();
+  await member.waitForFunction((panel) => !panel.isConnected, oldPanel);
+  await member.locator(".state-panel").getByText(BACKENDS_DENIED, { exact: true }).waitFor();
+  await waitForIdleFetches(member);
+  assert.equal(await member.getByRole("combobox", { name: "Namespace", exact: true }).count(), 0);
+  assert.deepEqual(backendsReads(memberRequests), []);
+  assert.deepEqual(backendsDenials(), []);
+
+  const { page: admin } = await newPage(t, fixture);
+  await trackSettledFetches(admin);
+  const adminRequests = apiRequests(admin, fixture.origin);
+  const adminRead = admin.waitForResponse(
+    (response) => new URL(response.url()).pathname === "/backends" && response.status() === 200,
+  );
+  await login(admin, fixture, backendsPage);
+  await adminRead;
+  await waitForIdleFetches(admin);
+  assert.equal(backendsReads(adminRequests).length, 1);
+  assert.equal(await admin.getByText(BACKENDS_DENIED, { exact: true }).count(), 0);
+  assert.deepEqual(backendsDenials(), []);
+});
+
+// Findings 2620 and 2621. A Restriction that denies an administrator Agent create in a Namespace
+// says nothing about Installation administration. In that Namespace, the only one, so no other
+// Namespace's answer can settle it, the administrator still reads Backends and gets the
+// Observability link, Settings' Installation Driver configuration and an Agent's Access tab, on
+// the first page load and after a reload.
+test("A Restriction on Agent create leaves an administrator's Installation pages", async (t) => {
+  const auditSink = new InMemoryAuditSink();
+  const url = "https://metrics.example.test/d/operations";
+  const fixture = await createConsoleAppFixture(t, { auditSink, observabilityUrl: url });
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Create restricted", { ready: true });
+  const agent = await fixture.createAgent(namespace.id, "Restricted Agent", nativeValues("x"));
+  fixture.policy.restrictions.push({
+    id: "deny-agent-create-here",
+    namespaceId: namespace.id,
+    resourceKind: "agent",
+    action: "create",
+    effect: "deny",
+  });
+  const { page } = await newPage(t, fixture);
+  await trackSettledFetches(page);
+  const backendsRead = () =>
+    page.waitForResponse(
+      (response) => new URL(response.url()).pathname === "/backends" && response.status() === 200,
+    );
+  const observability = page.getByRole("link", { name: "Observability", exact: true });
+
+  let read = backendsRead();
+  await login(page, fixture, `/console/backends?namespace=${namespace.id}`);
+  await read;
+  await waitForIdleFetches(page);
+  assert.equal(await page.getByText(BACKENDS_DENIED, { exact: true }).count(), 0);
+  assert.equal(await observability.getAttribute("href"), url);
+  read = backendsRead();
+  await page.reload();
+  await read;
+  await waitForIdleFetches(page);
+  assert.equal(await page.getByText(BACKENDS_DENIED, { exact: true }).count(), 0);
+  assert.equal(await observability.getAttribute("href"), url);
+
+  await page.goto(`${fixture.origin}/console/settings?namespace=${namespace.id}`);
+  await page.getByRole("heading", { name: "Installation Driver configuration" }).waitFor();
+  await page.goto(String(detailUrl(fixture, namespace.id, agent.id, "draft", "configuration")));
+  await page.getByRole("heading", { name: "Restricted Agent" }).waitFor();
+  await page.getByRole("tab", { name: "Access", exact: true }).waitFor();
+  assert.deepEqual(
+    authorizationDenials(auditSink, /^openclaw\.(observability|backends|iam)\./),
+    [],
+  );
+});
+
+// Finding 2622. Refresh on the Backends refusal, and a reload, check Installation administration
+// again, so an account made administrator while signed in reads Backends. A member's refusal
+// reads no Backends and sends no probe (finding 2619). An account with no readable Namespace has
+// no permission answer to ask, so its one probe is refused and kept for the tab; Refresh probes
+// once more.
+test("Refresh and reload on the Backends refusal check Installation administration again", async (t) => {
+  const auditSink = new InMemoryAuditSink();
+  const fixture = await createConsoleAppFixture(t, { auditSink });
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Administered later", { ready: true });
+  const memberGrants = [
+    ["read", "namespace"],
+    ["create", "agent"],
+  ];
+  const personas = [
+    { label: "refreshed-member", grants: memberGrants, recheck: "refresh", probes: 0 },
+    { label: "reloaded-member", grants: memberGrants, recheck: "reload", probes: 0 },
+    { label: "refreshed-outsider", grants: [], recheck: "refresh", probes: 1 },
+  ];
+  for (const { label, grants, recheck, probes } of personas) {
+    const account =
+      grants.length > 0
+        ? await fixture.createNamespaceMember(label, namespace.id, grants)
+        : await fixture.createAccountWithPolicy(label, () => {});
+    const { page } = await newPage(t, fixture);
+    await trackSettledFetches(page);
+    const requests = apiRequests(page, fixture.origin);
+    const reads = (path) => requests.filter((request) => request.path === path).length;
+    const path =
+      grants.length > 0 ? `/console/backends?namespace=${namespace.id}` : "/console/backends";
+    await login(page, fixture, path, account.credentials);
+    await page.locator(".state-panel").getByText(BACKENDS_DENIED, { exact: true }).waitFor();
+    await waitForIdleFetches(page);
+    assert.equal(reads("/backends"), 0, label);
+    assert.equal(reads("/observability"), probes, label);
+
+    grantInstallationAdministration(fixture, account.principal);
+    const read = page.waitForResponse(
+      (response) => new URL(response.url()).pathname === "/backends" && response.status() === 200,
+    );
+    if (recheck === "refresh") {
+      await page.getByRole("button", { name: "Refresh", exact: true }).click();
+    } else {
+      await page.reload();
+    }
+    await read;
+    await waitForIdleFetches(page);
+    assert.equal(await page.getByText(BACKENDS_DENIED, { exact: true }).count(), 0, label);
+  }
+  // Only the outsider's first probe was refused; no Backends read was.
+  assert.deepEqual(
+    authorizationDenials(auditSink, /^openclaw\.(observability|backends)\./).map(
+      (event) => event.action,
+    ),
+    ["openclaw.observability.read"],
+  );
+});
+
+// Finding 2627. An administrator whose administration is revoked while signed in reads Backends
+// once more, and the API audits that one refusal. The refusal settles the console's answer, so the
+// Observability link goes away, and the next reload or Refresh asks the permission answer, which
+// audits nothing, instead of reading Backends again. Each recheck runs right after a refusal: a
+// reload depends on the tab's stored answer, a Refresh on the in-memory one. A grant in between
+// reaches the console at Refresh, as before.
+test("A Backends refusal after administration is revoked is read and audited once", async (t) => {
+  const auditSink = new InMemoryAuditSink();
+  const url = "https://metrics.example.test/d/operations";
+  const fixture = await createConsoleAppFixture(t, { auditSink, observabilityUrl: url });
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Revoked later", { ready: true });
+  const account = await fixture.createNamespaceMember("revoked-administrator", namespace.id, [
+    ["read", "namespace"],
+  ]);
+  let revoke = grantInstallationAdministration(fixture, account.principal);
+  const { page } = await newPage(t, fixture);
+  await trackSettledFetches(page);
+  const requests = apiRequests(page, fixture.origin);
+  const reads = (path) => requests.filter((request) => request.path === path).length;
+  const permissionsPath = `/namespaces/${namespace.id}/permissions`;
+  const observability = page.getByRole("link", { name: "Observability", exact: true });
+  const refresh = () => page.getByRole("button", { name: "Refresh", exact: true }).click();
+  const backendsAnswer = (status) =>
+    page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/backends" && response.status() === status,
+    );
+
+  let read = backendsAnswer(200);
+  await login(page, fixture, `/console/backends?namespace=${namespace.id}`, account.credentials);
+  await read;
+  for (const [index, recheck] of ["reload", "refresh"].entries()) {
+    if (index > 0) {
+      revoke = grantInstallationAdministration(fixture, account.principal);
+      read = backendsAnswer(200);
+      await refresh();
+      await read;
+    }
+    await waitForIdleFetches(page);
+    assert.equal(await observability.getAttribute("href"), url, recheck);
+
+    revoke();
+    // The first Refresh after the revoke cannot know it: it reads Backends, which the API refuses.
+    read = backendsAnswer(403);
+    await refresh();
+    await read;
+    await page.locator(".state-panel").getByText(BACKENDS_DENIED, { exact: true }).waitFor();
+    await waitForIdleFetches(page);
+    assert.equal(await observability.count(), 0, recheck);
+    const refused = reads("/backends");
+
+    const asked = reads(permissionsPath);
+    // The settled refusal asks the permission answer; a stale one would read Backends.
+    const answered = page.waitForResponse((response) =>
+      [permissionsPath, "/backends"].includes(new URL(response.url()).pathname),
+    );
+    if (recheck === "refresh") {
+      await refresh();
+    } else {
+      await page.reload();
+    }
+    await answered;
+    await page.locator(".state-panel").getByText(BACKENDS_DENIED, { exact: true }).waitFor();
+    await waitForIdleFetches(page);
+    assert.ok(reads(permissionsPath) > asked, `${recheck} asks the permission answer`);
+    assert.equal(reads("/backends"), refused, recheck);
+    assert.equal(await observability.count(), 0, recheck);
+  }
+  // One audited refusal per revocation.
+  assert.deepEqual(
+    authorizationDenials(auditSink, /^openclaw\.(observability|backends)\./).map(
+      (event) => event.action,
+    ),
+    ["openclaw.backends.list", "openclaw.backends.list"],
+  );
+});
+
 const FORBIDDEN = {
   status: 403,
   contentType: "application/json",
@@ -783,17 +1174,6 @@ function routeDeploymentStatus(page, fixture, namespace, agent, revision, status
   );
 }
 
-function denyRevisionRead(fixture, namespace, revision) {
-  fixture.policy.restrictions.push({
-    id: `deny-read-${revision.id}`,
-    namespaceId: namespace.id,
-    resourceKind: "agent_revision",
-    resourceId: revision.id,
-    action: "read",
-    effect: "deny",
-  });
-}
-
 test("Agent detail says when the current or requested version cannot be read", async (t) => {
   const fixture = await createConsoleAppFixture(t);
   await fixture.bootstrap();
@@ -836,7 +1216,7 @@ test("Agent detail says when the current or requested version cannot be read", a
       ),
     )
     .waitFor();
-  await page.getByRole("heading", { name: "You cannot read this version" }).waitFor();
+  await page.getByRole("heading", { name: VERSION_READ_DENIED_HEADING, exact: true }).waitFor();
   assert.equal(await page.getByText("Configuration unavailable").count(), 0);
 
   // After a deploy the console opens the requested version; its outcome stays hidden too.
@@ -884,9 +1264,7 @@ test("Agent detail says an Agent's versions are hidden, not missing, when none i
   // cannot read the deploying version, so Stop stays on the page and the Agents list: the API
   // answers if nothing runs. Its dialog cannot say which, so it names both outcomes instead of
   // describing a gateway that may not exist (finding D691).
-  const stop = page
-    .getByRole("region", { name: "Stop Agent", exact: true })
-    .getByRole("button", { name: "Stop Agent", exact: true });
+  const stop = stopAgentButton(page);
   await waitForEnabled(stop);
   await stop.click();
   let dialog = page.getByRole("dialog", { name: "Stop this Agent?" });

@@ -6,6 +6,7 @@ import test from "node:test";
 import { UNTRUSTED_ORIGIN_MESSAGE } from "../../apps/controller/src/admission/admission-verifier.ts";
 import { loadConsoleTheme } from "../../apps/controller/src/composition/console-theme.ts";
 
+import { apiErrorResponse } from "../helpers/api-error.mjs";
 import {
   describePendingBrowserRequests,
   noteBrowserEvent,
@@ -33,7 +34,11 @@ import {
   writeRequests,
 } from "./console-agents-browser-helpers.mjs";
 import { temporaryDirectory } from "../helpers/temporary-directory.mjs";
-import { WORKSPACE_FILES_UNAVAILABLE, SIGN_IN_UNAVAILABLE } from "../helpers/refusal-text.mjs";
+import {
+  NO_READABLE_NAMESPACES,
+  WORKSPACE_FILES_UNAVAILABLE,
+  SIGN_IN_UNAVAILABLE,
+} from "../helpers/refusal-text.mjs";
 
 const defaultCodexPreset = JSON.parse(
   await readFile(new URL("../../deploy/presets/default-codex.json", import.meta.url), "utf8"),
@@ -520,21 +525,19 @@ test("console shows the external observability link only to Installation adminis
   // then opens the Console again instead of the login form.
   await page.waitForURL(/\/console\/login$/);
   // Restore the administrator's answer as an expiry would leave it: it belongs to another
-  // session owner, so the next sign-in must probe (a reused answer sends no probe below).
+  // session owner, so the next sign-in must not reuse it (a reused answer shows the link below).
   await page.evaluate((answer) => {
     globalThis.sessionStorage.setItem("occ.console.installationAccess", answer);
   }, adminAnswer);
-  // The shell renders before the probe is answered, so wait for the denial itself.
-  const limitedProbe = page.waitForResponse(
-    (response) => new URL(response.url()).pathname === "/observability",
-  );
   await login(page, fixture, "/console/", limited.credentials);
-  assert.equal((await limitedProbe).status(), 403);
   // The limited user reads no Agents. The empty list renders only after the page applied the
-  // denied probe, so the link checks below see the settled shell, not the loading one.
+  // Installation-access answer, so the link checks below see the settled shell, not the loading
+  // one. The Namespace permission answer says she does not administer the Installation, so she is
+  // not probed: the API would audit the probe's 403 as a denial (finding D45).
   await page.getByRole("heading", { name: "No Agents are shared with you", exact: true }).waitFor();
   assert.equal(await page.getByRole("link", { name: "Observability" }).count(), 0);
-  // A denied read is audited, so navigation must not repeat it.
+  assert.equal(probes, 1);
+  // Navigation does not probe either.
   await page.getByRole("link", { name: "Namespaces" }).click();
   await page.getByRole("list", { name: "Namespaces" }).getByText("Observability access").waitFor();
   const namespacesRead = page.waitForResponse(
@@ -544,16 +547,18 @@ test("console shows the external observability link only to Installation adminis
   await namespacesRead;
   await page.getByRole("heading", { name: "No Agents are shared with you", exact: true }).waitFor();
   assert.equal(await page.getByRole("link", { name: "Observability" }).count(), 0);
-  assert.equal(probes, 2);
-  // A reload in the same tab reuses the settled answer for this session owner.
+  assert.equal(probes, 1);
+  // Nor does a reload in the same tab.
   await page.reload();
   await page.getByRole("heading", { name: "No Agents are shared with you", exact: true }).waitFor();
   assert.equal(await page.getByRole("link", { name: "Observability" }).count(), 0);
-  assert.equal(probes, 2);
+  assert.equal(probes, 1);
 });
 
-test("a navigation while the Installation-access probe is answered does not ask again", async (t) => {
-  // The API audits every denied probe, so the Console must not repeat one it already sent.
+// The API audits every denied probe, so the Console must not repeat one it already sent. A
+// navigation's page load first asks the permission answer, then probes: the earlier probe can
+// still be pending at that point, or settle while the permission answer is read.
+async function navigateDuringInstallationAccessProbe(t, { settleFirst }) {
   let answered = 0;
   const fixture = await createConsoleAppFixture(t, {
     observabilityUrl: "https://metrics.example.test/d/operations",
@@ -581,6 +586,19 @@ test("a navigation while the Installation-access probe is answered does not ask 
     });
   });
   const { page } = await newPage(t, fixture);
+  // The permission answer that would rule out administration fails, so the Console probes. With
+  // settleFirst, the navigation's answer is held until the first probe has settled.
+  let permissionReads = 0;
+  const navigationAsked = deferred();
+  const probeSettled = deferred();
+  await page.route(`${fixture.origin}/namespaces/${namespace.id}/permissions`, async (route) => {
+    permissionReads += 1;
+    if (settleFirst && permissionReads === 2) {
+      navigationAsked.resolve();
+      await probeSettled.promise;
+    }
+    await route.fulfill(apiErrorResponse(503, "DEPENDENCY_UNAVAILABLE", "Try again."));
+  });
   // The API has answered (and audited) the probe; its response reaches the page only later.
   const probe = await holdRoute(t, page, "**/observability", (route, response) =>
     route.fulfill({ response }),
@@ -589,11 +607,25 @@ test("a navigation while the Installation-access probe is answered does not ask 
   await probe.waitForRelease();
   await page.getByRole("link", { name: "Namespaces" }).click();
   await page.waitForURL(/\/console\/namespaces/);
-  probe.release();
+  if (settleFirst) {
+    await navigationAsked.promise;
+    probe.release();
+    // The Console keeps a settled answer for the tab in session storage.
+    await page.waitForFunction(() => sessionStorage.getItem("occ.console.installationAccess"));
+    probeSettled.resolve();
+  } else {
+    probe.release();
+  }
   await page.getByRole("list", { name: "Namespaces" }).getByText("Probe access").waitFor();
   assert.equal(await page.getByRole("link", { name: "Observability" }).count(), 0);
   assert.equal(answered, 1);
-});
+}
+
+test("a navigation while the Installation-access probe is answered does not ask again", (t) =>
+  navigateDuringInstallationAccessProbe(t, { settleFirst: false }));
+
+test("a probe that settles while the next page reads its permission answer is not sent again", (t) =>
+  navigateDuringInstallationAccessProbe(t, { settleFirst: true }));
 
 test("console ignores stale collection successes and errors while switching Namespaces", async (t) => {
   const fixture = await createConsoleAppFixture(t);
@@ -671,7 +703,7 @@ test("Agents with no readable Namespace names it once and keeps one Refresh", as
   for (const [path, title, text, selected] of [
     [
       "/console/agents",
-      "No readable Namespaces",
+      NO_READABLE_NAMESPACES,
       "Ask an Installation administrator to create a Namespace or to give you access to one, then Refresh.",
       "None",
     ],
@@ -2367,7 +2399,7 @@ test("Namespaces recovers stale selection inline and handles losing all readable
     effect: "deny",
   });
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
-  await page.getByRole("heading", { name: "No accessible namespaces", exact: true }).waitFor();
+  await page.getByRole("heading", { name: NO_READABLE_NAMESPACES, exact: true }).waitFor();
   await page.getByText("Create a Namespace to get started.", { exact: true }).waitFor();
   await waitForEnabled(page.getByRole("button", { name: "Create Namespace", exact: true }));
   assert.equal(await page.getByRole("combobox").count(), 0);

@@ -43,6 +43,7 @@ import {
   waitForEnabled,
   waitForIdleFetches,
   waitForInputValue,
+  waitForShownInputValue,
   secretOptionLabel,
 } from "./console-agents-browser-helpers.mjs";
 import { createRuntimeAuthFixture } from "./console-agents-runtime-auth-fixture.mjs";
@@ -61,6 +62,7 @@ import {
   unreadableSlackTokenRefusal,
   RELOAD_DRAFT_BEFORE_SAVING,
   REPOSITORY_ACCESS_CHANGED,
+  REPOSITORY_ACCESS_NOT_CONFIGURED,
   RESOURCE_CONFLICT,
   SAVED_CONFIGURATION_CHANGED,
   unboundReferenceRefusal,
@@ -673,7 +675,7 @@ test("the Credentials and Repositories tabs are one card each with a heading gap
   );
   const page = await openTab(t, fixture, namespace, agent, "credentials");
   const secretField = page.getByLabel("API key Secret");
-  await waitForInputValue(secretField, secretOptionLabel(first));
+  await waitForShownInputValue(secretField, secretOptionLabel(first));
   const gap = await page
     .locator("fieldset.harness-auth-fields")
     .evaluate(
@@ -687,11 +689,7 @@ test("the Credentials and Repositories tabs are one card each with a heading gap
   // own border and background inside it, and no empty band below its last block.
   await page.getByRole("tab", { name: "Repositories", exact: true }).click();
   const card = page.locator(".agent-card:has(> .repository-selection)");
-  await card
-    .getByText("Repository access is not available in this Installation's configuration.", {
-      exact: false,
-    })
-    .waitFor();
+  await card.getByText(REPOSITORY_ACCESS_NOT_CONFIGURED, { exact: false }).waitFor();
   assert.deepEqual(
     await card.evaluate((node) => {
       const picker = node.querySelector<HTMLElement>(":scope > .repository-selection")!;

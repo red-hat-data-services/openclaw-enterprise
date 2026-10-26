@@ -11,6 +11,7 @@ import { InMemoryAuditSink } from "../../packages/audit/src/index.ts";
 import { assertApiError } from "../helpers/api-error.mjs";
 import { createConsoleAppFixture, backendFixtures } from "../helpers/console-app.mjs";
 import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs";
+import { createRuntimeLogComputeDriver } from "../helpers/runtime-logs.mjs";
 import {
   authenticatedHeaders,
   cookieHeaderFromSetCookie,
@@ -205,7 +206,11 @@ test("the Namespace Secret create answer matches what Secret creation checks", a
   const create = (name) =>
     fixture.request("POST", secretsPath, { session, body: { name, value: "synthetic-value" } });
 
-  assert.deepEqual(await answer(), { agents: { create: true }, secrets: { create: false } });
+  assert.deepEqual(await answer(), {
+    agents: { create: true },
+    secrets: { create: false },
+    installation: { administer: false },
+  });
   // A false answer is not an attempted operation: only the real POST is audited as denied.
   const denials = () => auditSink.list().filter((event) => event.kind === "authorization_denial");
   assert.equal(denials().length, 0);
@@ -220,6 +225,144 @@ test("the Namespace Secret create answer matches what Secret creation checks", a
     .permissions.push({ action: "create", resourceKind: "secret" });
   assert.deepEqual((await answer()).secrets, { create: true });
   assert.equal((await create("Created token")).status, 201);
+});
+
+// The console reads this answer instead of probing GET /observability, whose refusal the API
+// audits, and gates Backends, Settings and the Access tab on it (findings 2620-2622). So it must
+// be the decision Installation-wide operations make, and not one inferred from a Namespace grant:
+// each step proves it against the real GET /backends.
+test("the Namespace Installation administer answer matches what Installation-wide reads check", async (t) => {
+  const auditSink = new InMemoryAuditSink();
+  const fixture = await createConsoleAppFixture(t, { auditSink });
+  const installation = await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Administer answer", { ready: true });
+  const permissionsPath = `/namespaces/${namespace.id}/permissions`;
+  const answer = async (session) => {
+    const summary = await fixture.request("GET", permissionsPath, { session });
+    assert.equal(summary.status, 200);
+    return summary.data;
+  };
+  const backends = (session) => fixture.request("GET", "/backends", { session });
+  const denials = () => auditSink.list().filter((event) => event.kind === "authorization_denial");
+
+  // A member with Namespace-wide Agent create does not administer the Installation.
+  const member = await fixture.createNamespaceMember("administer-answer", namespace.id, [
+    ["read", "namespace"],
+    ["create", "agent"],
+  ]);
+  const session = await fixture.signIn(member.credentials);
+  const memberAnswer = await answer(session);
+  assert.deepEqual(memberAnswer.agents, { create: true });
+  assert.deepEqual(memberAnswer.installation, { administer: false });
+  // A false answer is not an attempted operation: only the real read is audited as denied.
+  assert.deepEqual(denials(), []);
+  assertApiError(await backends(session), 403, "FORBIDDEN");
+  assert.deepEqual(
+    denials().map((event) => event.action),
+    ["openclaw.backends.list"],
+  );
+
+  // An administrator whose Restriction denies Agent create in this Namespace still administers
+  // the Installation: Agent create says nothing about it. The Restriction is Namespace-wide, so
+  // it applies to the member too; her answer was read above.
+  fixture.policy.restrictions.push({
+    id: "deny-agent-create-here",
+    namespaceId: namespace.id,
+    resourceKind: "agent",
+    action: "create",
+    effect: "deny",
+  });
+  const restricted = await answer();
+  assert.deepEqual(restricted.agents, { create: false });
+  assert.deepEqual(restricted.installation, { administer: true });
+  assert.equal((await backends()).status, 200);
+
+  // A Restriction on Installation administer changes the answer as it changes the read.
+  fixture.policy.restrictions.push({
+    id: "deny-installation-administer",
+    resourceKind: "installation",
+    resourceId: installation.id,
+    action: "administer",
+    effect: "deny",
+  });
+  assert.deepEqual((await answer()).installation, { administer: false });
+  assertApiError(await backends(), 403, "FORBIDDEN");
+});
+
+// The console's Logs view skips the log text read for a caller whose Agent answer says readLogs
+// is false, because the API audits each refused read as a denial (finding D758). So readLogs must
+// be the decision the log read makes: read_logs, or administer in its place unless a Restriction
+// denies read_logs. Each step proves it against the real read, and the answer audits nothing.
+test("the Agent readLogs answer matches what the runtime log read checks", async (t) => {
+  const auditSink = new InMemoryAuditSink();
+  const fixture = await createConsoleAppFixture(t, {
+    auditSink,
+    computeDriver: createRuntimeLogComputeDriver(),
+    agentRuntimeLogs: { enabled: true, cursorSecret: `console-api-logs-${randomUUID()}` },
+  });
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Log text answer", { ready: true });
+  const agent = await fixture.createAgent(namespace.id, "Log text agent");
+  const active = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
+  const agentPath = `/namespaces/${namespace.id}/agents/${agent.id}`;
+  const readLogs = async (session) => {
+    const summary = await fixture.request("GET", `${agentPath}/permissions`, { session });
+    assert.equal(summary.status, 200);
+    return summary.data.readLogs;
+  };
+  const logRead = (session) =>
+    fixture.request(
+      "GET",
+      `${agentPath}/deployments/${active.revision.id}/runtime/logs?source=gateway`,
+      { session },
+    );
+  const denials = () =>
+    auditSink
+      .list()
+      .filter(
+        (event) =>
+          event.kind === "authorization_denial" &&
+          event.action === "openclaw.agents.runtime_logs.view",
+      );
+
+  // A reader without read_logs: the answer is false, and only the real read is audited.
+  const reader = await fixture.createNamespaceMember("log-text-reader", namespace.id, [
+    ["read", "namespace"],
+    ["read", "agent"],
+  ]);
+  const readerSession = await fixture.signIn(reader.credentials);
+  assert.equal(await readLogs(readerSession), false);
+  assert.deepEqual(denials(), []);
+  assertApiError(await logRead(readerSession), 403, "FORBIDDEN");
+  assert.equal(denials().length, 1);
+
+  // read_logs, as the Agent logs guide delegates it.
+  fixture.policy.roles
+    .find((role) => role.id === "role-log-text-reader")
+    .permissions.push({ action: "read_logs", resourceKind: "agent" });
+  assert.equal(await readLogs(readerSession), true);
+  assert.equal((await logRead(readerSession)).status, 200);
+
+  // An Installation administrator holds administer, which stands in for read_logs.
+  assert.equal(await readLogs(), true);
+  assert.equal((await logRead()).status, 200);
+
+  // A Restriction on read_logs denies log text even to an administrator: administer cannot
+  // bypass it.
+  fixture.policy.restrictions.push({
+    id: "deny-log-text",
+    namespaceId: namespace.id,
+    resourceKind: "agent",
+    resourceId: agent.id,
+    action: "read_logs",
+    effect: "deny",
+  });
+  assert.equal(await readLogs(), false);
+  assert.equal(await readLogs(readerSession), false);
+  assert.equal(denials().length, 1);
+  assertApiError(await logRead(), 403, "FORBIDDEN");
+  assertApiError(await logRead(readerSession), 403, "FORBIDDEN");
+  assert.equal(denials().length, 3);
 });
 
 test("caller permission summaries report primary IAM decisions without authorizing a later operation", async (t) => {
@@ -247,10 +390,15 @@ test("caller permission summaries report primary IAM decisions without authorizi
     configurationSecretsOperateDeniedBindings: [],
     agentSourcesOperate: true,
     sandboxPolicyRead: true,
+    readLogs: true,
   });
   const adminNamespace = await fixture.request("GET", namespacePath);
   assert.equal(adminNamespace.status, 200);
-  assert.deepEqual(adminNamespace.data, { agents: { create: true }, secrets: { create: true } });
+  assert.deepEqual(adminNamespace.data, {
+    agents: { create: true },
+    secrets: { create: true },
+    installation: { administer: true },
+  });
 
   // Namespace read plus exact read and deploy on one Agent: only deploy is reported.
   const limited = await fixture.createAccountWithPolicy("permission-summary", (principal) => {
@@ -303,6 +451,7 @@ test("caller permission summaries report primary IAM decisions without authorizi
     configurationSecretsOperateDeniedBindings: [],
     agentSourcesOperate: false,
     sandboxPolicyRead: false,
+    readLogs: false,
   });
   // Reading the Agent's network policy and suggestions needs read on its SandboxPolicy, a grant
   // no other answer covers (finding 2454). The grant names only this Agent's policy, the
@@ -361,6 +510,7 @@ test("caller permission summaries report primary IAM decisions without authorizi
   assert.deepEqual(namespaceSummary.data, {
     agents: { create: false },
     secrets: { create: false },
+    installation: { administer: false },
   });
   // A false flag is an answer, not an attempted operation, so nothing is audited as denied.
   const denials = () => auditSink.list().filter((event) => event.kind === "authorization_denial");
@@ -664,12 +814,13 @@ async function secretAnswerFixture(t, options = {}) {
       grant(`read-${secret.id}`, "read", "secret", secret.id);
     }
     const session = await fixture.signIn(created.credentials);
-    const answer = async () => {
+    const data = async () => {
       const response = await fixture.request("GET", answerPath, { session });
       assert.equal(response.status, 200);
-      return response.data.operateDenied;
+      return response.data;
     };
-    return { session, grant, answer, principal: created.principal };
+    const answer = async () => (await data()).operateDenied;
+    return { session, grant, answer, data, principal: created.principal };
   };
   const denials = () => auditSink.list().filter((event) => event.kind === "authorization_denial");
   return { fixture, namespace, agent, app, bot, binding, answerPath, member, denials };
@@ -707,7 +858,7 @@ test("the Agent Secret answer names the readable Secrets a binding save would be
   // An administrator may operate every Secret, so nothing is listed.
   const admin = await fixture.request("GET", answerPath);
   assert.equal(admin.status, 200);
-  assert.deepEqual(admin.data, { operateDenied: [] });
+  assert.deepEqual(admin.data, { operateDenied: [], unreadableOperateDenied: 0 });
 
   // The D710 persona: Configuration update without Agent update.
   const editor = await member("secret-answer-editor", reads, readable);
@@ -778,6 +929,38 @@ test("the Agent Secret answer names the readable Secrets a binding save would be
   assert.deepEqual(await deployer.answer(), [app.id, spares[0].id].sort());
   // The narrowed answer still makes no refused, audited read.
   assert.equal(denials().length, deniedBeforeDeployer);
+  // A bound Secret the caller may not read is never named, only counted, and only while she may
+  // not operate it either: deploying checks operate alone (finding D756). This deployer reads
+  // only app of the three Secrets the draft binds.
+  const blind = await member("secret-answer-blind-deployer", reads, [app]);
+  blind.grant("deploy", "deploy", "agent", agent.id);
+  assert.deepEqual(await blind.data(), { operateDenied: [app.id], unreadableOperateDenied: 2 });
+  blind.grant("operate-spare", "operate", "secret", spares[0].id);
+  blind.grant("operate-app", "operate", "secret", app.id);
+  assert.deepEqual(await blind.data(), { operateDenied: [], unreadableOperateDenied: 1 });
+  assert.equal(denials().length, deniedBeforeDeployer);
+  // The count matches the real deployment: refused while one is counted, authorized at 0.
+  const deployPath = `/namespaces/${namespace.id}/agents/${agent.id}/deploy`;
+  const refused = await fixture.request("POST", deployPath, { session: blind.session });
+  assertApiError(refused, 403, "FORBIDDEN");
+  assert.equal(denials().at(-1).action, "openclaw.agents.deploy");
+  blind.grant("operate-harness", "operate", "secret", harnessSecret.id);
+  assert.deepEqual(await blind.data(), { operateDenied: [], unreadableOperateDenied: 0 });
+  // The deployment also checks the Agent's own access to the Secrets the editor rebound.
+  for (const secret of [app, spares[0]]) {
+    await fixture.grantAgentSecretOperate(agent, secret.ref);
+  }
+  // Every authorization check passes: this fixture's Compute Driver then refuses the topology,
+  // which is no authorization denial.
+  const deniedBeforeDeploy = denials().length;
+  const admitted = await fixture.request("POST", deployPath, { session: blind.session });
+  assertApiError(admitted, 409, "RESOURCE_CONFLICT");
+  assert.equal(denials().length, deniedBeforeDeploy);
+  const deniedAfterDeploy = denials().length;
+  // A reader who may not deploy or update gets no count.
+  const blindReader = await member("secret-answer-blind-reader", reads, []);
+  assert.deepEqual(await blindReader.data(), { operateDenied: [], unreadableOperateDenied: 0 });
+  assert.equal(denials().length, deniedAfterDeploy);
   // Both updates without Configuration read: no save can bind a Secret, so it is not reported.
   const unreadConfiguration = await member(
     "secret-answer-no-configuration-read",

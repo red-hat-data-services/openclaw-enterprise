@@ -1,6 +1,7 @@
 import { renderInstallationConfigurations } from "./driver-configurations.mjs";
 import { element, button, statusBlock, trackVisualViewport } from "./dom.mjs";
 import {
+  agentPageReadRefusal,
   clearResolvedSecretNames,
   noteConsoleLoad,
   renderAgentList,
@@ -22,7 +23,7 @@ import {
 } from "./shell.mjs";
 import { createDraftStore } from "./drafts.mjs";
 import { renderRuntimeImages } from "./runtime-images.mjs";
-import { renderNamespaces } from "./namespaces.mjs";
+import { NO_READABLE_NAMESPACES, renderNamespaces } from "./namespaces.mjs";
 import { renderSecrets } from "./secrets.mjs";
 
 const app = document.querySelector("#app");
@@ -43,7 +44,7 @@ let observabilityUrl = null;
 // Set while the last Backends read was denied, so Retry and Refresh do not show the Namespace
 // selector again before the same answer hides it (finding 1491).
 let backendsDenied = false;
-// Session owner whose Installation-admin observability read has settled.
+// Session owner whose Installation-admin answer has settled in this tab.
 let observabilityOwner = null;
 // The Installation-access probe still being answered, for the session owner that sent it.
 let installationAccessProbe = null;
@@ -362,6 +363,11 @@ function probeInstallationAccess(owner) {
   if (owner && installationAccessProbe?.owner === owner) {
     return installationAccessProbe.answer;
   }
+  // A page load asks the permission answer first, so an earlier view's probe can settle while
+  // that read runs: reuse its answer instead of sending (and auditing) the probe again.
+  if (owner && observabilityOwner === owner) {
+    return Promise.resolve({ url: observabilityUrl, admin: installationAdmin, settled: true });
+  }
   const probe = { owner };
   probe.answer = request("/observability", { outlivesView: true })
     .then(
@@ -394,6 +400,37 @@ function probeInstallationAccess(owner) {
     });
   installationAccessProbe = owner ? probe : null;
   return probe.answer;
+}
+
+// Whether the caller administers the Installation, for this page load. The observability read
+// is the probe, and the API audits its 403 as an authorization denial, so the console first asks
+// a readable Namespace's permission answer, whose `installation.administer` is the same IAM
+// decision and audits nothing. Any readable Namespace gives that answer: it checks the
+// Installation, not the Namespace. A caller it refuses is not probed (findings D45, 2620). That
+// refusal is settled for this tab but not kept across reloads: a reload, or Refresh on the
+// Backends refusal, asks again at no audited cost, so a grant reaches the console (finding
+// 2622). An administrator is probed for the destination URL, which the API allows. Gating
+// only: the API still authorizes every request. With no readable Namespace, or no answer, the
+// console probes.
+function installationAccess(owner, selectedRead, selectedPath) {
+  const readableId = namespaces.some((item) => item.id === namespaceId)
+    ? namespaceId
+    : (namespaces[0]?.id ?? null);
+  const permissions =
+    readableId === null
+      ? Promise.resolve(null)
+      : selectedRead && readableId === namespaceId
+        ? selectedRead
+        : request(
+            readableId === namespaceId
+              ? selectedPath
+              : `/namespaces/${encodeURIComponent(readableId)}/permissions`,
+          ).catch(() => null);
+  return permissions.then((answer) =>
+    answer?.installation?.administer === false
+      ? { url: null, admin: false, settled: true }
+      : probeInstallationAccess(owner),
+  );
 }
 
 function forgetInstallationAccess() {
@@ -1305,6 +1342,13 @@ async function loadPage({
     reuseView = false;
   }
   namespaceId = current.namespace;
+  if (fromRefresh && current.feature === "backends" && installationAdmin === false) {
+    // Refresh on the Backends refusal checks Installation administration again instead of
+    // reusing the settled answer (finding 2622): a permission answer, or one probe without one.
+    forgetInstallationAccess();
+    observabilityOwner = null;
+    installationAdmin = null;
+  }
   if (fromRefresh && current.agentId && current.namespace) {
     // Refresh checks access again: an Agent's Logs view asks again instead of reusing a denial
     // remembered earlier in this sign-in (finding 2566).
@@ -1628,19 +1672,11 @@ async function loadPage({
         loadingShownAt = performance.now();
       }
     }
-    // Read the admin-only destination once per session owner. Non-administrators
-    // get 403, which the API audits as a denial, so do not repeat it per navigation
-    // or, within this tab, per page load.
+    // A settled Installation-access answer is kept once per session owner (see
+    // installationAccess below for how it is asked).
     const recalled =
       owner && observabilityOwner !== owner ? recalledInstallationAccess(owner) : null;
-    const [readable, observability] = await Promise.all([
-      request("/namespaces"),
-      owner && observabilityOwner === owner
-        ? null
-        : recalled
-          ? { ...recalled, settled: true }
-          : probeInstallationAccess(owner),
-    ]);
+    const readable = await request("/namespaces");
     if (!lifetime.isCurrent(active)) {
       return;
     }
@@ -1650,10 +1686,10 @@ async function loadPage({
     clearRetainedViewsOutsideNamespaces(readable);
     setNamespaces(readable);
     accessResolved = true;
-    if (observability) {
-      observabilityUrl = observability.url;
-      installationAdmin = observability.admin;
-      observabilityOwner = observability.settled ? owner : null;
+    if (recalled) {
+      observabilityUrl = recalled.url;
+      installationAdmin = recalled.admin;
+      observabilityOwner = owner;
     }
     // The default pick prefers a ready Namespace and never a deleting one while another remains
     // (finding 1895); with only deleting Namespaces it shows the first, whose status the Agents
@@ -1693,6 +1729,12 @@ async function loadPage({
       !current.agentId
         ? request(permissionsPath).catch(() => null)
         : null;
+    const accessRead =
+      owner && observabilityOwner === owner
+        ? null
+        : installationAccess(owner, permissionsRead, permissionsPath);
+    // Awaited after the first reads; a first read that fails first leaves it unawaited.
+    accessRead?.catch(() => {});
     let firstPermissions = null;
     if (!scopedNamespaceUnavailable && current.feature !== "settings" && !current.creating) {
       if (current.agentId) {
@@ -1700,6 +1742,23 @@ async function loadPage({
           `/namespaces/${encodeURIComponent(namespaceId)}/agents/${encodeURIComponent(current.agentId)}`,
         );
       } else {
+        if (current.feature === "backends") {
+          // Backends need Installation administration, like the probe. A caller this load knows
+          // is no administrator gets the refusal without the read, which the API would audit as
+          // a denial nobody attempted (finding 2619). Gating only: an unknown answer reads.
+          if (accessRead) {
+            const access = await accessRead;
+            if (!lifetime.isCurrent(active)) {
+              return;
+            }
+            observabilityUrl = access.url;
+            installationAdmin = access.admin;
+            observabilityOwner = access.settled ? owner : null;
+          }
+          if (installationAdmin === false) {
+            throw Object.assign(new Error("Access denied."), { status: 403, code: "FORBIDDEN" });
+          }
+        }
         firstItems =
           current.feature === "namespaces"
             ? namespaces
@@ -1714,6 +1773,15 @@ async function loadPage({
       if (!lifetime.isCurrent(active)) {
         return;
       }
+    }
+    if (accessRead) {
+      const access = await accessRead;
+      if (!lifetime.isCurrent(active)) {
+        return;
+      }
+      observabilityUrl = access.url;
+      installationAdmin = access.admin;
+      observabilityOwner = access.settled ? owner : null;
     }
     const retainedState = retainedView?.state;
     let unchanged = false;
@@ -1950,7 +2018,7 @@ async function loadPage({
         // panel adds no second Refresh (finding 2371).
         namespaceAccessPanel(
           shell.view,
-          "No readable Namespaces",
+          NO_READABLE_NAMESPACES,
           "Ask an Installation administrator to create a Namespace or to give you access to one, then Refresh.",
         );
       } else {
@@ -2227,7 +2295,13 @@ async function loadPage({
         renderRows,
       );
     } else if (current.feature === "secrets") {
-      renderSecrets({ ...agentContext, items, sorted, permissions: firstPermissions });
+      renderSecrets({
+        ...agentContext,
+        items,
+        sorted,
+        permissions: firstPermissions,
+        openSecretId: current.url.searchParams.get("secret"),
+      });
     } else {
       if (current.feature === "backends" && backendsDenied) {
         backendsDenied = false;
@@ -2272,6 +2346,18 @@ async function loadPage({
     focusAgentResult =
       document.activeElement === pendingAgentHeading ||
       (focusAgentResult && document.activeElement === app.querySelector(".content h1"));
+    if (current.feature === "backends" && error.status === 403) {
+      // Backends need Installation administration, so their 403 settles that answer as false,
+      // as a denied probe would. An administrator revoked mid-session kept a settled true: every
+      // Refresh or reload read /backends again and the API audited a denial each time, and the
+      // Observability link stayed (finding 2627). Now the shell below drops the link, the
+      // refusal's Refresh asks the permission answer again, and a reload, without the tab's
+      // stored answer, asks it too. Neither is audited.
+      forgetInstallationAccess();
+      observabilityUrl = null;
+      installationAdmin = false;
+      observabilityOwner = sessionOwnerKey(session);
+    }
     shell = renderShell(current.feature);
     if (current.agentId && error.status === 404 && current.namespace === null) {
       // A typed or shared link has no Namespace, so the console read the Agent in
@@ -2564,7 +2650,7 @@ async function revalidateMountedAgent(current) {
           ? "Resource unavailable"
           : "Request unavailable",
       error.status === 403
-        ? `You do not have permission to read this Agent, its versions, or its Configuration. ${askForGrant("read access to them")}`
+        ? agentPageReadRefusal(error)
         : "The read could not be completed. Retry to check current access and saved state.",
       // A permission refusal offers the header's Refresh, not a Retry that repeats it.
       error.status === 403 ? undefined : "Retry",

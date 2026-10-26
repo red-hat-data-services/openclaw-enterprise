@@ -206,6 +206,8 @@ export const requestedVersionUnavailable = (version) =>
 // A version the reader's own Deploy created exists, so the page says it was accepted (finding D751).
 export const deployAcceptedVersionUnreadable = (version) =>
   `Deployment accepted. You cannot read version ${version}, so its progress and outcome are not shown here; ask an Installation administrator for AgentRevision read on it.`;
+// The summary card for that version, after a first deployment or a redeploy alike (finding D755).
+export const DEPLOYED_VERSION_UNREADABLE = "You cannot read the version you deployed.";
 export const VERSION_READ_DENIED =
   "Your access does not include this version, so its configuration and deployment outcome are hidden. Ask an Installation administrator for AgentRevision read on it.";
 // A rejected model credential for a caller known to lack Agent update names the grants that fix
@@ -269,11 +271,11 @@ export const POD_QUOTA_FULL =
 export const IMAGE_PULL_FAILING =
   "Kubernetes cannot pull a container image for this Agent and keeps retrying. Ask an administrator to check the runtime image reference and that the cluster's nodes can pull from its registry.";
 
-// Console refusals for a save the caller may not make.
+// Console refusals for a save the caller may not make, when the API names no grant.
 export const AGENT_SAVE_DENIED =
-  "You do not have permission to save this Agent. Ask an Installation administrator for Agent update and Configuration read on it, plus access to the Secrets, credential sources and Service Account it binds.";
+  "Save was refused: your access does not include saving this Agent. Ask an Installation administrator for Agent update and Configuration read on it, plus access to the Secrets, credential sources and Service Account it binds.";
 export const CONFIGURATION_SAVE_DENIED =
-  "You do not have permission to save this Configuration. Ask an Installation administrator for Configuration update on it, plus Secret operate on each Secret it binds.";
+  "Save was refused: your access does not include saving this Configuration. Ask an Installation administrator for Configuration update on it, plus Secret operate on each Secret it binds.";
 // A Secret field lists a Secret the caller may read but not operate disabled, with this reason,
 // and a save refused on one a fresh answer names says so (finding 2453).
 export const SECRET_OPERATE_DENIED =
@@ -291,12 +293,11 @@ export const NEW_SECRET_OPERATE_REMEDY =
 export const namespaceListDenied = (items) =>
   notIncluded(`listing ${items} in this Namespace`, "Namespace read");
 // What an Installation administrator's own refused request says: asking one would not help.
-export const ADMINISTRATOR_ACCESS_DENIED =
-  "Access denied. You do not have permission for this operation.";
+export const ADMINISTRATOR_ACCESS_DENIED = "Your access does not include this action.";
 export const CONSOLE_ACCESS_DENIED =
-  "Access denied. You do not have permission for this operation. Ask an Installation administrator to check your access.";
+  "Your access does not include this action. Ask an Installation administrator to check your access.";
 export const secretOperateRefused = (name) =>
-  `You do not have permission to bind ${name}. Each save needs Secret operate on every Secret it binds, which your access does not include for it. Choose another Secret, or ask an Installation administrator for Secret operate on it.`;
+  `Save was refused: your access does not include Secret operate on ${name}, which each save needs on every Secret it binds. Choose another Secret, or ask an Installation administrator for Secret operate on it.`;
 
 // The console's text for a read that failed with a 5xx.
 export const READ_UNAVAILABLE = "Service unavailable. The read could not be completed. Try again.";
@@ -398,6 +399,10 @@ export const CHANNEL_BINDING_CONSOLE_REMEDY =
 // The Slack card of an Embedded Agent, on Create Agent and the Agent page's Channels tab.
 export const CHANNELS_NEED_DEDICATED =
   "Channels require Dedicated execution. Embedded Agents can only keep channels disabled.";
+// The Slack card's setup step, shown until both token Secrets are bound (finding 2438), and never
+// on an Embedded Agent, which cannot have channels (finding D708).
+export const SLACK_SETUP_HINT =
+  "Provide SLACK_APP_TOKEN and SLACK_BOT_TOKEN through Secret bindings before deployment.";
 export const CHANNEL_BINDING_FORM_REMEDY =
   "On this form, the Slack channel settings bind SLACK_APP_TOKEN and SLACK_BOT_TOKEN to the Secrets you select there; bind other names through the Configuration API after the Agent exists.";
 // A Codex network proxy setting that blocks the repository credential broker for an Agent with
@@ -447,3 +452,96 @@ export const BROKER_HOST_DENIED = brokerProxyRefusal(
 export const COMPUTE_TOPOLOGY_REPOSITORY_UNSUPPORTED =
   "The selected Compute Driver cannot deliver repository credentials to this Harness topology.";
 export const PROVISIONING_NOT_COMPLETED = "Agent provisioning could not complete.";
+// The heading wherever a caller reads no Namespace, on every page alike (finding D755).
+export const NO_READABLE_NAMESPACES = "No readable Namespaces";
+// An Installation without repository access. Only an Installation administrator can set it up,
+// so only one gets the setup guide link; anyone else is told whom to ask (finding D754).
+export const REPOSITORY_ACCESS_NOT_CONFIGURED =
+  "This Installation has no repository access, so this Agent cannot use repositories.";
+export const REPOSITORY_SETUP_ASK = "Ask an Installation administrator to set it up.";
+
+// Finding 2536, slice 4. The bundled OpenShell Credential Proxy refuses installation-wide
+// repository access without its preview opt-in (409), and names the gateway states an operator
+// fixes (503); a stored source that breaks a later OpenShell Credential Gateway rule (409); a
+// ChatGPT service account whose credential does not belong to the Agent's Backend (409).
+export const CREDENTIAL_PROXY_GIT_ALONE =
+  "The selected Credential Proxy cannot add other credential sources beside this Agent's repository Git. Remove those sources or the repository binding, or ask an Installation administrator to select a Proxy with policy reduction.";
+export const CREDENTIAL_PROXY_INSTALLATION_PREVIEW =
+  "Installation-wide repository access (profile github-installation) needs the OpenShell Credential Proxy's observed-hook preview, which this Installation does not enable. Choose another profile, or ask an Installation administrator to enable the preview.";
+export const PROXY_REGISTRATION_UNAVAILABLE =
+  "The OpenShell gateway does not offer the protected egress middleware the Credential Proxy is configured to use. Ask an operator to check the gateway's middleware registration and version, then retry.";
+export const PREVIEW_GATEWAY_VERSION =
+  "Installation-wide repository access uses the observed-hook preview, which needs OpenShell gateway 0.1.5, and the gateway reports another version. Ask an operator to run 0.1.5 or turn the preview off, then retry.";
+export const storedCredentialSourceConfig = (field) =>
+  `This credential source's saved ${field} no longer meets the OpenShell Credential Gateway's rules, so it cannot be used. Create a new source with a valid ${field}, bind it in place of this one, then delete this one.`;
+export const SERVICE_ACCOUNT_NO_BACKEND_BINDING =
+  "ChatGPT service-account authentication needs the Agent's Backend set to the Installation's ChatGPT Backend and an account credential issued there. Set the Agent's backendId, or bind a service account with an issued credential.";
+export const SERVICE_ACCOUNT_BACKEND_MISMATCH =
+  "This service account's credential was not issued by the Agent's ChatGPT Backend, Driver and workspace, or was never issued. Bind a service account with a credential issued there, or ask an Installation administrator to restore that Backend.";
+// The Agent page's heading for a version that exists but the reader's access does not include
+// (agents/detail.mts); VERSION_READ_DENIED is its reason.
+export const VERSION_READ_DENIED_HEADING = "You cannot read this version";
+// The version draft a reader without Agent update views (finding 2421), and its plugin list.
+export const READ_ONLY_DRAFT_NOTICE =
+  "Version draft · read-only with your access. The next deployment uses it as saved.";
+export const PLUGINS_READ_ONLY =
+  "These are the version draft's plugin selections, read-only with your access. The next deployment uses them as saved.";
+// Why a running version reads "Not verified" (finding 2367).
+export const NO_TEST_REQUEST = "OpenClaw Enterprise sends no test request.";
+// The API's refusal of a sandbox policy rule outside the Installation delegation ceiling.
+export const GRANT_EXCEEDS_CEILING = "The grant exceeds the Installation delegation ceiling.";
+// Plugin discovery with a credential the plugin service rejected (agents/plugin-discovery.mts).
+export const PLUGIN_CREDENTIALS_REJECTED =
+  "The credential was rejected or cannot access plugins. Check its permissions.";
+
+// Finding 2619. A bound Secret the caller's readable Secret list leaves out, shown without the
+// audited metadata read; and the Backends refusal a non-administrator gets without the read.
+export const BOUND_SECRET_UNLISTED = `A Secret is bound. Its name is unavailable: your access does not include reading it, or it was deleted. ${askForGrant("Secret read on it")}`;
+// Finding D756. Deploy beside a bound Secret the deployer may neither read nor operate: it names
+// no Secret, and the grant to ask for includes read.
+export const deployUnreadableSecrets = (count) =>
+  count === 1
+    ? `Deploying needs Secret operate on a bound Secret your access does not include reading. ${askForGrant("Secret read and operate on it")}`
+    : `Deploying needs Secret operate on ${count} bound Secrets your access does not include reading. ${askForGrant("Secret read and operate on them")}`;
+export const BACKENDS_DENIED = `Your account does not have access to Backends. Backends apply to the whole Installation, so choosing another Namespace would not change this. ${askForGrant("access")}`;
+// A write the console names after the API refused it, where it was tried (errcopy-console-1026b).
+export const actionRefused = (action, task, grant) =>
+  `${action} was refused: your access does not include ${task}. ${askForGrant(grant)}`;
+// A request that checks several grants shows the API's named one after "<Action> was refused:".
+export const refusedNamed = (action, grant, target) =>
+  `${action} was refused: this needs ${grant} on ${target}. Ask an Installation administrator to grant it.`;
+// A save's reread of the Agent and its Configuration was refused before the write.
+export const SAVE_READ_REFUSED = actionRefused(
+  "Save",
+  "reading this Agent's saved settings, which each save reads first",
+  "Agent read and Configuration read on it",
+);
+export const WORKSPACE_SAVE_REFUSED = actionRefused(
+  "Save",
+  "saving this Agent's workspace files",
+  "Agent operate on it",
+);
+// Configuration create, which only an Installation administrator holds.
+export const CONFIGURATION_CREATE_REFUSED =
+  "Create was refused: your access does not include creating this Agent's Configuration. That needs Configuration create in this Namespace, which only an Installation administrator holds, plus Secret operate on each Secret it binds. Ask an Installation administrator to create this Agent.";
+// Repository choices for an Agent (Agent update) and for a new Agent (Agent create).
+export const REPOSITORY_CHOICES_AGENT_DENIED = notIncluded(
+  "loading repository choices for this Agent",
+  "Agent update on it",
+);
+export const REPOSITORY_CHOICES_CREATE_DENIED =
+  "Repository choices are not shown. Your access does not include creating Agents in this Namespace. Only an Installation administrator can create Agents: ask one to create it and to give you access to edit and deploy it.";
+// The sandbox policy editing setting, which only an Installation administrator who also
+// administers the Agent can change.
+export const POLICY_EDITING_SETTING_REFUSED =
+  "Your access does not include changing the editing setting. Only an Installation administrator who also administers this Agent can change it.";
+// A Slack people or channel lookup the API refused without naming a grant.
+export const SLACK_LOOKUP_DENIED = notIncluded(
+  "looking up Slack people and channels with the selected Slack bot Secret",
+  "Secret operate on it",
+);
+// Rechecking an open Agent page when the API names no grant.
+export const AGENT_PAGE_READ_DENIED = notIncluded(
+  "reading this Agent, its versions or its Configuration",
+  "Agent read, AgentRevision read and Configuration read on them",
+);
