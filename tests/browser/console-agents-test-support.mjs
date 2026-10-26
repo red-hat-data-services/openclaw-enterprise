@@ -7,7 +7,12 @@ import { validateGitHubRepositoryRegistry } from "../../apps/controller/src/driv
 import { UnixRepositoryCredentialControlClient } from "../../apps/controller/src/backends/repository-credentials/control-client.ts";
 import { createConsoleAppFixture, backendFixtures } from "../helpers/console-app.mjs";
 import { createTestKubernetesComputeDriver } from "../helpers/kubernetes-compute.mjs";
-import { nativeValues, pathRequests } from "./console-agents-browser-helpers.mjs";
+import {
+  nativeValues,
+  pathRequests,
+  settledFetches,
+  waitForIdleFetches,
+} from "./console-agents-browser-helpers.mjs";
 
 /** @import { GitHubRepositoryRegistration } from "../../apps/controller/src/drivers/repo/github/credentials/registry.ts" */
 
@@ -112,6 +117,59 @@ export function assertRevisionUrl(page, revisionId) {
   assert.equal(url.searchParams.get("revision"), revisionId);
 }
 
+// A failed provisioning job's reason is the form's one error line; the status line under it
+// does not repeat that provisioning failed (finding 2423).
+export async function waitForProvisioningFailure(page) {
+  await page.locator("#create-agent-form ~ p[role=alert]").filter({ hasText: /\S/ }).waitFor();
+  assert.equal(await page.getByText("Provisioning failed.", { exact: true }).count(), 0);
+  // The error line is as wide as the form above it, not the page.
+  const [form, error] = await page.evaluate(() =>
+    ["#create-agent-form", "#create-agent-form ~ p[role=alert]"].map(
+      (selector) => globalThis.document.querySelector(selector).getBoundingClientRect().width,
+    ),
+  );
+  assert.ok(error <= form + 0.5, `error line ${error}px, form ${form}px`);
+}
+
+// Create Agent rereads an accepted provisioning job once a second (waitForProvisioning in
+// create.mts). This runs `submit` (the click that sends or retries the job) with the page clock
+// paused, then runs that clock one second at a time, each step only once no fetch is in flight,
+// until the page has read `jobPath` `reads` times in all. The clock then runs in real time again.
+// So the test skips each one-second wait, and the page still handles each answer, and the
+// optional deployment read between polls, before the next poll. Call trackSettledFetches before
+// the page loads.
+const pollClocks = new WeakSet();
+
+export async function runProvisioningPolls(page, submit, jobPath, reads) {
+  if (!pollClocks.has(page)) {
+    await page.clock.install();
+    pollClocks.add(page);
+  }
+  // The clock runs between calls, so pause it a little ahead of the page's time. On a loaded host
+  // it can pass that time before pauseAt arrives, which pauseAt refuses: read the time again.
+  for (let attempt = 1; ; attempt += 1) {
+    const now = await page.evaluate(() => Date.now());
+    try {
+      await page.clock.pauseAt(now + 100);
+      break;
+    } catch (error) {
+      if (attempt === 5 || !String(error).includes("Cannot fast-forward to the past")) {
+        throw error;
+      }
+    }
+  }
+  await submit();
+  for (let polls = 0; ; polls += 1) {
+    await waitForIdleFetches(page);
+    if ((await settledFetches(page, jobPath)) >= reads) {
+      break;
+    }
+    assert.ok(polls < 10, `the page read ${jobPath} ${reads} times`);
+    await page.clock.runFor(1_000);
+  }
+  await page.clock.resume();
+}
+
 export function configurationPostRequests(requests, namespaceId) {
   return pathRequests(requests, "POST", `/namespaces/${namespaceId}/configurations`);
 }
@@ -169,6 +227,51 @@ export async function routeInstallationWithoutProvisioning(page, fixture, capabi
       }),
     });
   });
+}
+
+/**
+ * Another create takes `name` after Create Agent's preflight found it free: the form's next
+ * Agent create first creates that Agent, then reaches the real API, which refuses the name with
+ * 409. The preflight refuses a name that is already taken (finding 2420), so only this race
+ * reaches a refusal after the form saved its Secret or Configuration.
+ */
+export async function raceAgentName(page, fixture, namespaceId, name) {
+  const url = `${fixture.origin}/namespaces/${namespaceId}/agents`;
+  const handler = async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    await page.unroute(url, handler);
+    await fixture.createAgent(namespaceId, name);
+    await route.continue();
+  };
+  await page.route(url, handler);
+}
+
+/**
+ * Asserts that the Agent name field shows the API's duplicate-name refusal under it and holds
+ * focus (finding 2420).
+ */
+export async function assertAgentNameTaken(page) {
+  const name = page.getByLabel("Agent name", { exact: true });
+  await page.waitForFunction(() => {
+    const input = globalThis.document.querySelector("#agent-name");
+    return (
+      input?.getAttribute("aria-invalid") === "true" && globalThis.document.activeElement === input
+    );
+  });
+  const describedBy = (await name.getAttribute("aria-describedby")) ?? "";
+  const errors = await Promise.all(
+    describedBy
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((id) => page.locator(`[id="${id}"]`).textContent()),
+  );
+  assert.ok(
+    errors.includes("Another Agent in this Namespace has this name."),
+    `expected the duplicate-name error under the field, got ${JSON.stringify(errors)}`,
+  );
 }
 
 export function agentPostRequests(requests, namespaceId) {

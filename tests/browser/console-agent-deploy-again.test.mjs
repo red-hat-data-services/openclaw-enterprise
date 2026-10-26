@@ -4,6 +4,7 @@ import test from "node:test";
 
 import { InMemoryAuditSink } from "../../packages/audit/src/index.ts";
 import { DEPLOYMENT_POLL_MS } from "../../apps/controller/src/console/agents/deployment-evidence.mts";
+import { apiErrorResponse, proxyErrorResponse } from "../helpers/api-error.mjs";
 import { grantRole } from "../helpers/iam-grants.mjs";
 import { createRuntimeLogComputeDriver } from "../helpers/runtime-logs.mjs";
 import {
@@ -15,6 +16,7 @@ import {
   nativeValues,
   newPage,
   nextFrames,
+  pathRequests,
   persistedDeploymentError,
   routeFailedDeployment,
 } from "./console-agents-browser-helpers.mjs";
@@ -24,6 +26,11 @@ import {
 } from "./console-deployment-activity-helpers.mjs";
 import { replyWithDifferentAgentId } from "./console-agents-test-support.mjs";
 import { createReadyConsoleNamespace } from "./console-ready-namespace.mjs";
+import {
+  GENERIC_DENIAL,
+  OVERVIEW_REFRESH_FAILED,
+  READ_OUTAGE_REASON,
+} from "../helpers/refusal-text.mjs";
 
 // Failed-version recovery's Deploy again: the API's DEPENDENCY_UNAVAILABLE message says to deploy
 // again, and the link opens the draft at its Deploy new version. That button is built only from a
@@ -82,14 +89,7 @@ function watchDeployAgain() {
 }
 
 // The failed deployment's own message says to deploy again; the page's 503 answer for a read.
-const unavailable = {
-  status: 503,
-  contentType: "application/json",
-  body: JSON.stringify({
-    error: { code: "DEPENDENCY_UNAVAILABLE", message: "Try again later." },
-    meta: { requestId: "req_test_deploy_again_unavailable" },
-  }),
-};
+const unavailable = apiErrorResponse(503, "DEPENDENCY_UNAVAILABLE", "Try again later.");
 
 // A Namespace member whose role grants Agent deploy and log reading but no Configuration read.
 function deployerWithoutConfiguration(fixture, namespace) {
@@ -192,11 +192,7 @@ test("A failed Configuration read leaves Deploy again hidden and is not repeated
   await nextFrames(page);
   await nextFrames(page);
   const configurationPath = new URL(configurationUrl).pathname;
-  assert.equal(
-    requests.filter((request) => request.method === "GET" && request.path === configurationPath)
-      .length,
-    1,
-  );
+  assert.equal(pathRequests(requests, "GET", configurationPath).length, 1);
   assert.equal(await logs.getAttribute("class"), "button button--primary");
   assert.equal(await page.evaluate(() => globalThis.deployAgainSeen), false);
 });
@@ -328,15 +324,7 @@ test("Recovery offers no Deploy again when the caller's permission answer fails"
   );
   await page.route(
     `${fixture.origin}/namespaces/${namespace.id}/agents/${agent.id}/permissions`,
-    (route) =>
-      route.fulfill({
-        status: 503,
-        contentType: "application/json",
-        body: JSON.stringify({
-          error: { code: "DEPENDENCY_UNAVAILABLE", message: "Try again later." },
-          meta: { requestId: "req_test_deploy_again_permissions_failed" },
-        }),
-      }),
+    (route) => route.fulfill(unavailable),
   );
   await page.addInitScript(watchDeployAgain);
 
@@ -457,20 +445,16 @@ test("Open version draft waits for the Configuration read to succeed", async (t)
 // selected v2 and called it "Historical" beside "Selected version v1" until the deployment
 // finished (finding 2065). Its notice says it is deploying until it becomes current. `record`
 // drives the newest deployment's answer: its status, or an error while `fail` holds an HTTP
-// status (503, 403); `agentFail` answers the Agent read with a 503. `recordReads` counts the
-// newest deployment's reads. With `older`, a version admitted before the deploying one is
-// neither current nor deploying.
-const failure = (status) => ({
-  status,
-  contentType: "application/json",
-  body: JSON.stringify({
-    error:
-      status === 403
-        ? { code: "FORBIDDEN", message: "The exact platform operation was not authorized." }
-        : { code: "UNAVAILABLE", message: "Try again." },
-    meta: { requestId: "req_test_failure" },
-  }),
-});
+// status (503, 403, 429); `agentFail` answers the Agent read with a 503. `recordReads` counts the
+// newest deployment's reads, and `warnings` are its startup warnings. With `older`, a version
+// admitted before the deploying one is neither current nor deploying.
+// The record route sends no 429: that one comes from a rate limit in front of the API.
+const failure = (status) =>
+  status === 429
+    ? proxyErrorResponse(429)
+    : status === 403
+      ? apiErrorResponse(403, "FORBIDDEN", GENERIC_DENIAL)
+      : apiErrorResponse(503, "DEPENDENCY_UNAVAILABLE", "Try again.");
 const UNAVAILABLE = failure(503);
 
 async function deployingVersion(t, name, { status = "running", older = false } = {}) {
@@ -480,7 +464,7 @@ async function deployingVersion(t, name, { status = "running", older = false } =
   const previous = older ? await fixture.deployAgent(namespace.id, agent.id) : null;
   const next = await fixture.deployAgent(namespace.id, agent.id);
   const { page } = await newPage(t, fixture, { browser });
-  const record = { status, fail: false, agentFail: false, recordReads: 0 };
+  const record = { status, fail: false, agentFail: false, recordReads: 0, warnings: [] };
   await page.route(
     (url) => url.pathname === `/namespaces/${namespace.id}/agents/${agent.id}`,
     (route) =>
@@ -505,7 +489,7 @@ async function deployingVersion(t, name, { status = "running", older = false } =
                 record.status === "failed"
                   ? persistedDeploymentError("DEPENDENCY_UNAVAILABLE")
                   : null,
-              warnings: [],
+              warnings: record.warnings,
               progress: null,
             },
             meta: { requestId: "req_test_deploying_label" },
@@ -575,8 +559,9 @@ test("A version that is deploying is labelled Deploying, not Historical, until i
   assert.equal(labels.includes("Historical version"), false, labels.join(" → "));
 });
 
-// A Configuration tab parked while the deployment fails shows Historical when it comes back.
-test("A deploying version's parked Configuration tab says Historical once the deployment fails", async (t) => {
+// A Configuration tab parked while the deployment fails shows Failed when it comes back: a failed
+// version that never became current is not history (finding 2403).
+test("A deploying version's parked Configuration tab says Failed once the deployment fails", async (t) => {
   const { page, record } = await deployingVersion(t, "Deploying parked");
   await page.getByRole("tab", { name: "Plugins", exact: true }).click();
   await page.getByRole("tab", { name: "Plugins", exact: true, selected: true }).waitFor();
@@ -584,8 +569,9 @@ test("A deploying version's parked Configuration tab says Historical once the de
   await page.clock.runFor(DEPLOYMENT_POLL_MS);
   await page.getByText("v2 · Failed", { exact: true }).waitFor();
   await page.getByRole("tab", { name: "Configuration", exact: true }).click();
-  await page.getByText(/^Historical version · read-only admitted snapshot/).waitFor();
+  await page.getByText(/^Failed version · read-only admitted snapshot/).waitFor();
   assert.equal(await page.getByText(/^Deploying version/).count(), 0);
+  assert.equal(await page.getByText(/^Historical version/).count(), 0);
 });
 
 // A queued deployment is deploying too, and only the deploying version is: an older version
@@ -612,11 +598,7 @@ test("A completed deployment whose Agent reread fails is labelled Deployed, not 
   record.status = "succeeded";
   record.agentFail = true;
   await page.clock.runFor(DEPLOYMENT_POLL_MS);
-  await page
-    .getByText(
-      "Current version and version history could not be refreshed. Use the page Refresh control to retry.",
-    )
-    .waitFor();
+  await page.getByText(`${OVERVIEW_REFRESH_FAILED} ${READ_OUTAGE_REASON}`).waitFor();
   await summary.getByText("v2 · Completed", { exact: true }).waitFor();
   await page
     .getByText(
@@ -681,6 +663,19 @@ test("One failed status read keeps a deploying version Deploying and polling", a
     (text) => text.split(" ·")[0],
   );
   assert.equal(labels.includes("Historical version"), false, labels.join(" → "));
+});
+
+// A rate limit is not an answer either: a 429 status read leaves the version Deploying and
+// polling goes on, as after a 503.
+test("A rate-limited status read keeps a deploying version polling", async (t) => {
+  const { page, record, summary } = await deployingVersion(t, "Status rate limit");
+  record.fail = 429;
+  await page.clock.runFor(DEPLOYMENT_POLL_MS);
+  await summary.getByText("v2 · Unavailable", { exact: true }).waitFor();
+  assert.equal(await page.getByText(/^Deploying version · /).count(), 1);
+  record.fail = false;
+  await page.clock.runFor(DEPLOYMENT_POLL_MS);
+  await summary.getByText("v2 · In progress", { exact: true }).waitFor();
 });
 
 // A completed record is not by itself a failed reread: the newest version whose record reads
@@ -748,11 +743,7 @@ test("A failed reread leaves the newest readable version Historical under a hidd
   await page.getByText(/^Historical version · read-only admitted snapshot/).waitFor();
   agentFail = true;
   await page.getByRole("button", { name: "Refresh deployment" }).click();
-  await page
-    .getByText(
-      "Current version and version history could not be refreshed. Use the page Refresh control to retry.",
-    )
-    .waitFor();
+  await page.getByText(`${OVERVIEW_REFRESH_FAILED} ${READ_OUTAGE_REASON}`).waitFor();
   await page.getByText(/^Historical version · read-only admitted snapshot/).waitFor();
   assert.equal(await page.getByText(/^Deployed version/).count(), 0);
 });
@@ -767,11 +758,25 @@ test("A failure read by a refresh that cannot reread the Agent keeps its warning
   await page.getByRole("button", { name: "Refresh deployment" }).click();
   const recovery = page.getByRole("region", { name: "Deployment needs attention" });
   await recovery.waitFor();
-  const warning = page.getByText(
-    "Current version and version history could not be refreshed. Use the page Refresh control to retry.",
-  );
+  const warning = page.getByText(`${OVERVIEW_REFRESH_FAILED} ${READ_OUTAGE_REASON}`);
   // The panel renders the warning and the card folds the details in one task, so once the
   // warning is in the page the details' state is settled.
+  await warning.waitFor({ state: "attached" });
+  assert.equal(await deploymentDetailsOpen(page), true);
+  assert.equal(await warning.evaluate((node) => node.checkVisibility()), true);
+});
+
+// Nor does the card carry a failure's startup warnings: a failure read with warnings keeps the
+// details open on them.
+test("A failure read with startup warnings keeps them in view", async (t) => {
+  const { page, record } = await deployingVersion(t, "Failed warnings");
+  record.status = "failed";
+  record.warnings = [{ code: "PLUGIN_INSTALL_FAILED", pluginId: "remote-calendar" }];
+  await page.getByRole("button", { name: "Refresh deployment" }).click();
+  await page.getByRole("region", { name: "Deployment needs attention" }).waitFor();
+  const warning = page
+    .locator(".deployment-status")
+    .getByText("remote-calendar was disabled for this startup", { exact: false });
   await warning.waitFor({ state: "attached" });
   assert.equal(await deploymentDetailsOpen(page), true);
   assert.equal(await warning.evaluate((node) => node.checkVisibility()), true);

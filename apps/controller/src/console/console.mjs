@@ -7,11 +7,19 @@ import {
   renderCreateAgent,
   renderAgentDetail,
 } from "./agents.mjs";
-import { clearRuntimeDenials } from "./agents/logs.mjs";
+import { clearRuntimeDenials, forgetRuntimeDenials } from "./agents/logs.mjs";
+import { ASK_INSTALLATION_ADMINISTRATOR, askForGrant } from "./agents/access-reasons.mjs";
 import { createApiClient } from "./api-client.mjs";
 import { createViewLifetime } from "./view-lifetime.mjs";
 import { createNavigation, pages } from "./navigation.mjs";
-import { brandContents, createShell, initials, panel, sorted } from "./shell.mjs";
+import {
+  brandContents,
+  createShell,
+  initials,
+  NAMESPACE_ACCESS_REASON_ID,
+  panel,
+  sorted,
+} from "./shell.mjs";
 import { createDraftStore } from "./drafts.mjs";
 import { renderRuntimeImages } from "./runtime-images.mjs";
 import { renderNamespaces } from "./namespaces.mjs";
@@ -21,6 +29,15 @@ const app = document.querySelector("#app");
 const lifetime = createViewLifetime();
 let session = null;
 let namespaces = [];
+// Namespaces a list read in this sign-in returned: only those can be ones the reader "no
+// longer" has access to (finding 2550).
+const listedNamespaceIds = new Set();
+function setNamespaces(readable) {
+  namespaces = sorted(readable);
+  for (const item of namespaces) {
+    listedNamespaceIds.add(item.id);
+  }
+}
 let namespaceId = null;
 let observabilityUrl = null;
 // Set while the last Backends read was denied, so Retry and Refresh do not show the Namespace
@@ -216,10 +233,58 @@ function signInUnavailableFailure(label) {
   return `Could not finish signing in with ${label}. Sign-in is unavailable right now; try again later.`;
 }
 
+// The API refused a sign-in request because the browser did not send the console's
+// configured Origin: the page was opened at another address, or a proxy changed the
+// request. It says nothing about the account, so it never reads as a wrong password.
+function untrustedOrigin(error) {
+  return (
+    error?.status === 403 &&
+    error.code === "FORBIDDEN" &&
+    typeof error.serverMessage === "string" &&
+    error.serverMessage.startsWith("A trusted browser origin is required")
+  );
+}
+const untrustedOriginFailure =
+  "Sign-in was refused because this page was not opened from the console's configured address. Open the console from its configured URL and sign in there. If you did, ask an operator to check the console address setting (OCC_AUTH_BASE_URL) and any proxy in front of it.";
+
+// A sign-in limit is not a refusal: an Installation administrator's correct password still
+// signs in while the limit applies, so the form stays usable and only says how long to wait.
+function rateLimitedFailure(error) {
+  const seconds = error.retryAfterSeconds;
+  return seconds === undefined
+    ? "Too many sign-in attempts. Wait a minute, then try again."
+    : `Too many sign-in attempts. Wait ${seconds} ${seconds === 1 ? "second" : "seconds"}, then try again.`;
+}
+
+const signInOutage =
+  "Sign-in is temporarily unavailable because a service it depends on did not answer. Try again shortly. If it continues, ask an operator.";
+
+// The confirmation after the provider's callback failed. The callback already settled the
+// identity (a refused one returns with authError and never reaches this exchange), so a
+// failure here says why this tab could not adopt the session, never that the identity failed.
+function providerExchangeFailure(error, label) {
+  if (error?.status === 429) {
+    return rateLimitedFailure(error);
+  }
+  if (untrustedOrigin(error)) {
+    return untrustedOriginFailure;
+  }
+  if (error?.status === undefined || error.status >= 500) {
+    return signInUnavailableFailure(label);
+  }
+  // Other than the origin check, the exchange answers 403 only when this API no longer
+  // configures the provider (it was removed after the start), which the provider list shows
+  // anyway. Starting again would fail the same way (finding 2555).
+  if (error.status === 403) {
+    return `Could not finish signing in with ${label}. ${label} sign-in is no longer available on this Installation. Use another sign-in method, or ask an administrator.`;
+  }
+  return `Could not finish signing in with ${label}. The sign-in in this tab did not complete in time, or another sign-in replaced it. Select Continue with ${label} to start again.`;
+}
+
 // The provider authenticated an identity attached to a disabled account. Retrying, a
 // password or an attach cannot help, so only an administrator is named.
 function accountDisabledFailure(label) {
-  return `Your account is disabled, so you cannot sign in with ${label}. Ask an administrator to enable it.`;
+  return `Your account is disabled, so you cannot sign in with ${label}. Ask an Installation administrator to enable it.`;
 }
 
 // Only a tab that had a session says it expired; a first visit to a deep link, or one after
@@ -396,6 +461,20 @@ function deniedReadsFor(owner) {
   };
 }
 
+// Refresh checks an Agent's version reads again: a version panel offers no Retry for a refusal
+// (finding D753), so Refresh is how a reader granted read since then sees the version.
+function forgetAgentRevisionDenials(owner, namespaceId, agentId) {
+  if (!owner) {
+    return;
+  }
+  const prefix = `/namespaces/${encodeURIComponent(namespaceId)}/agents/${encodeURIComponent(agentId)}/revisions/`;
+  const paths = storedDeniedReads(owner);
+  const kept = paths.filter((path) => !path.startsWith(prefix));
+  if (kept.length !== paths.length) {
+    storeDeniedReads(owner, kept);
+  }
+}
+
 function forgetDeniedReads() {
   try {
     sessionStorage.removeItem(deniedReadsStorageKey);
@@ -485,6 +564,39 @@ function takeNativeFragment(current) {
 const shellUI = createShell({ app, pages, route, pageUrl, navigate, loadPage, logout });
 shellUI.setLeaveGuard((options) => Boolean(leaveGuard?.(options)));
 const { publicPanel, renderRows, switchNamespace } = shellUI;
+
+// The page names a Namespace the reader cannot read. Switch Namespace focuses the header's
+// selector, which is disabled when no Namespace is readable (a member whose only grant was
+// revoked, on a bookmarked link), so the panel then points at the header's Refresh, as the
+// no-readable-Namespace panel does (findings 2371, 2393).
+function namespaceUnavailablePanel(view, unavailableId) {
+  const why = listedNamespaceIds.has(unavailableId)
+    ? "This Namespace is missing or you no longer have access"
+    : "This Namespace is missing or not shared with you";
+  if (namespaces.length) {
+    panel(
+      view,
+      "Namespace unavailable",
+      `${why}. Choose another Namespace.`,
+      "Switch Namespace",
+      () => switchNamespace(),
+    );
+    return;
+  }
+  namespaceAccessPanel(
+    view,
+    "Namespace unavailable",
+    `${why}, and you cannot read any other Namespace. Ask an Installation administrator to give you access to one, then Refresh.`,
+  );
+}
+
+// A panel for a reader with no Namespace to select: its sentence describes the header's disabled
+// selector (finding D749).
+function namespaceAccessPanel(view, title, description) {
+  panel(view, title, description);
+  view.querySelector(".state-panel > p")?.setAttribute("id", NAMESPACE_ACCESS_REASON_ID);
+  shellUI.describeNamespaceSelector();
+}
 const request = createApiClient({
   lifetime,
   hasSession: () => session !== null,
@@ -849,6 +961,7 @@ function clearPrivate() {
   session = null;
   backendsDenied = false;
   namespaces = [];
+  listedNamespaceIds.clear();
   namespaceId = null;
   observabilityUrl = null;
   observabilityOwner = null;
@@ -958,10 +1071,12 @@ function showLogin(message = "", destination = null) {
         }
         feedback.textContent =
           error.status === 429
-            ? "Too many attempts. Try again later."
-            : recoveryOnly
-              ? `${label} sign-in is unavailable. Try again later.`
-              : `${label} sign-in is unavailable. Try again or use your password.`;
+            ? rateLimitedFailure(error)
+            : untrustedOrigin(error)
+              ? untrustedOriginFailure
+              : recoveryOnly
+                ? `${label} sign-in is unavailable. Try again later.`
+                : `${label} sign-in is unavailable. Try again or use your password.`;
         pending = false;
         setDisabled(false);
       }
@@ -1025,14 +1140,22 @@ function showLogin(message = "", destination = null) {
       if (!lifetime.isCurrent(active)) {
         return;
       }
+      // Every credential refusal keeps one text, so it never says whether the account exists,
+      // is disabled, or which factor failed.
       feedback.textContent =
         error.status === 429
-          ? "Too many attempts. Try again later."
-          : error.status === 400 || error.status === 401 || error.status === 403
-            ? recoveryOnly
-              ? "Could not sign in. Only the recovery account can use a password; other accounts continue with their external sign-in."
-              : "Could not sign in. Check your email and password."
-            : "Sign-in is unavailable. Try again.";
+          ? rateLimitedFailure(error)
+          : untrustedOrigin(error)
+            ? untrustedOriginFailure
+            : error.status === 400 || error.status === 401 || error.status === 403
+              ? recoveryOnly
+                ? "Could not sign in. Only the recovery account can use a password; other accounts continue with their external sign-in."
+                : "Could not sign in. Check your email and password."
+              : error.status === undefined
+                ? "Could not reach the sign-in service. Check your connection, then try again."
+                : error.status >= 500
+                  ? signInOutage
+                  : "Sign-in is unavailable. Try again.";
     } finally {
       if (lifetime.isCurrent(active)) {
         pending = false;
@@ -1182,6 +1305,12 @@ async function loadPage({
     reuseView = false;
   }
   namespaceId = current.namespace;
+  if (fromRefresh && current.agentId && current.namespace) {
+    // Refresh checks access again: an Agent's Logs view asks again instead of reusing a denial
+    // remembered earlier in this sign-in (finding 2566).
+    forgetRuntimeDenials(current.namespace, current.agentId);
+    forgetAgentRevisionDenials(sessionOwnerKey(session), current.namespace, current.agentId);
+  }
   const active = resetReads({
     retainView: knownPrivateState,
     // A Namespaces row link marks itself too, so Back returns focus to that row.
@@ -1388,9 +1517,11 @@ async function loadPage({
       }
       pinSessionKey(confirmed.sessionKey);
       pendingIntent = externalIntent;
-    } catch {
+    } catch (error) {
       if (lifetime.isCurrent(active)) {
-        showLogin(providerFailure(externalProviders[externalAttempt.provider].label));
+        showLogin(
+          providerExchangeFailure(error, externalProviders[externalAttempt.provider].label),
+        );
       }
       return;
     }
@@ -1517,7 +1648,7 @@ async function loadPage({
       throw new Error("Invalid collection response");
     }
     clearRetainedViewsOutsideNamespaces(readable);
-    namespaces = sorted(readable);
+    setNamespaces(readable);
     accessResolved = true;
     if (observability) {
       observabilityUrl = observability.url;
@@ -1552,12 +1683,14 @@ async function loadPage({
     // loading) is replaced once, by the page itself (finding 1407).
     let firstItems = null;
     let firstAgent = null;
-    // The Agents list and Create Agent paint with the caller's permission answer, never enabled
-    // and then refused (findings 1517, 1521). Gating only: the API still authorizes creation, so
-    // an unknown answer (a failed read) keeps the controls.
+    // The Agents and Secrets lists, and Create Agent, paint with the caller's permission answer,
+    // never enabled and then refused (findings 1517, 1521, 2365). Gating only: the API still
+    // authorizes creation, so an unknown answer (a failed read) keeps the controls.
     const permissionsPath = `/namespaces/${encodeURIComponent(namespaceId)}/permissions`;
     const permissionsRead =
-      !scopedNamespaceUnavailable && current.feature === "agents" && !current.agentId
+      !scopedNamespaceUnavailable &&
+      ["agents", "secrets"].includes(current.feature) &&
+      !current.agentId
         ? request(permissionsPath).catch(() => null)
         : null;
     let firstPermissions = null;
@@ -1715,7 +1848,13 @@ async function loadPage({
       // Diagnostics attach to the Agent's own shell when it reveals.
       shell = { ...standIn, view: detailView, diagnostics: null };
     } else {
-      shell = renderShell(current.feature, false);
+      // A Namespace the reader cannot read hides its Agent too: the panel takes the Agents list's
+      // header, not the Agent page's ID, copy button and ← Agents link (finding 2400).
+      shell = renderShell(
+        current.feature,
+        false,
+        scopedNamespaceUnavailable ? { page: null } : undefined,
+      );
     }
     const viewState = {
       active,
@@ -1806,18 +1945,32 @@ async function loadPage({
     }
     if (scopedNamespaceUnavailable) {
       clearRetainedViewsForNamespace(namespaceId);
-      // With nothing to switch to, the header's Refresh is the one way to look again, so the
-      // panel adds no second Refresh (finding 2371).
-      panel(
-        shell.view,
-        namespaceId === null ? "No readable Namespaces" : "Namespace unavailable",
-        namespaceId === null
-          ? "Ask an administrator to create a Namespace or grant you access to one, then Refresh."
-          : "This Namespace is missing or you no longer have access. Choose another Namespace.",
-        ...(namespaces.length ? ["Switch Namespace", () => switchNamespace()] : []),
-      );
+      if (namespaceId === null) {
+        // With nothing to switch to, the header's Refresh is the one way to look again, so the
+        // panel adds no second Refresh (finding 2371).
+        namespaceAccessPanel(
+          shell.view,
+          "No readable Namespaces",
+          "Ask an Installation administrator to create a Namespace or to give you access to one, then Refresh.",
+        );
+      } else {
+        namespaceUnavailablePanel(shell.view, namespaceId);
+      }
       return;
     }
+    // Inline Create Secret dialogs follow the Namespace's secrets.create answer (finding 2442).
+    // A page that read the answer up front reuses it; the Agent page reads it once, when a Secret
+    // field first needs it, and only for a Namespace this session can read. A failed read is
+    // unknown and keeps the action.
+    let secretsCreateRead = null;
+    const secretsCreateAllowed = () =>
+      (secretsCreateRead ??= (
+        firstPermissions !== null
+          ? Promise.resolve(firstPermissions)
+          : namespaces.some((item) => item.id === namespaceId)
+            ? request(permissionsPath).catch(() => null)
+            : Promise.resolve(null)
+      ).then((permissions) => permissions?.secrets?.create));
     const agentContext = {
       operatorId: session.user.id,
       installationAdmin,
@@ -1829,6 +1982,7 @@ async function loadPage({
       // The selected Namespace: the Agents list and Create Agent name its status when it is not
       // ready (finding 1895).
       namespace: namespaces.find((item) => item.id === namespaceId),
+      secretsCreateAllowed,
       request: viewRequest,
       mutationVersion: () => viewState.mutations,
       navigate,
@@ -1931,23 +2085,23 @@ async function loadPage({
       });
     }
     if (current.creating) {
-      renderCreateAgent(
-        {
-          ...agentContext,
-          permissions: firstPermissions,
-          setDiscardOnExit(discard) {
-            discardCreationOnExit = discard ? { namespaceId } : null;
-          },
-          setDraftCapture(capture, unsaved) {
-            agentContext.drafts.forget("create");
-            if (capture) {
-              agentContext.drafts.track("create", capture);
-              agentContext.drafts.unsavedWhen("create", unsaved);
-            }
-          },
+      const createContext = {
+        ...agentContext,
+        permissions: firstPermissions,
+        // Create Agent rereads the answer in place, so its Secret fields follow the latest one.
+        secretsCreateAllowed: async () => createContext.permissions?.secrets?.create,
+        setDiscardOnExit(discard) {
+          discardCreationOnExit = discard ? { namespaceId } : null;
         },
-        agentContext.drafts.get("create"),
-      );
+        setDraftCapture(capture, unsaved) {
+          agentContext.drafts.forget("create");
+          if (capture) {
+            agentContext.drafts.track("create", capture);
+            agentContext.drafts.unsavedWhen("create", unsaved);
+          }
+        },
+      };
+      renderCreateAgent(createContext, agentContext.drafts.get("create"));
       markMountedRoute(current);
       return;
     }
@@ -2073,7 +2227,7 @@ async function loadPage({
         renderRows,
       );
     } else if (current.feature === "secrets") {
-      renderSecrets({ ...agentContext, items, sorted });
+      renderSecrets({ ...agentContext, items, sorted, permissions: firstPermissions });
     } else {
       if (current.feature === "backends" && backendsDenied) {
         backendsDenied = false;
@@ -2193,14 +2347,16 @@ async function loadPage({
       shell.view,
       title,
       agentDenied
-        ? "You do not have access to this Agent or its settings, or it was deleted. Ask its owner to share it with you."
+        ? `You do not have access to this Agent or its settings, or it was deleted. ${askForGrant("Agent read on it")}`
         : installationDenied
-          ? "Your account does not have access to Backends. Backends apply to the whole Installation, so choosing another Namespace would not change this. Ask an Installation administrator for access."
+          ? `Your account does not have access to Backends. Backends apply to the whole Installation, so choosing another Namespace would not change this. ${askForGrant("access")}`
           : error.status === 403
-            ? "Your account does not have access to this page in this Namespace. Ask an administrator for access, or choose another Namespace."
+            ? `Your account does not have access to this page in this Namespace. Choose another Namespace, or ${ASK_INSTALLATION_ADMINISTRATOR} for access.`
             : "The read could not be completed. Retry to check current access and saved state.",
-      "Retry",
-      () => void loadPage(),
+      // Retrying a permission refusal gives the same answer; the header's Refresh checks access
+      // again after a grant (finding 2549). The Request ID stays for whoever traces the denial.
+      error.status === 403 ? undefined : "Retry",
+      error.status === 403 ? undefined : () => void loadPage(),
       error.requestId,
     );
   } finally {
@@ -2353,17 +2509,13 @@ async function revalidateMountedAgent(current) {
     }
     clearRetainedViewsOutsideNamespaces(readable);
     session = resolvedSession;
-    namespaces = sorted(readable);
+    setNamespaces(readable);
     if (!namespaces.some((item) => item.id === selectedNamespace)) {
       clearRetainedViewsForNamespace(selectedNamespace);
       resetReads();
-      const shell = renderShell(current.feature);
-      panel(
-        shell.view,
-        "Namespace unavailable",
-        "This Namespace is missing or you no longer have access. Choose another Namespace.",
-        "Switch Namespace",
-        () => switchNamespace(),
+      namespaceUnavailablePanel(
+        renderShell(current.feature, false, { page: null }).view,
+        selectedNamespace,
       );
       return;
     }
@@ -2412,12 +2564,16 @@ async function revalidateMountedAgent(current) {
           ? "Resource unavailable"
           : "Request unavailable",
       error.status === 403
-        ? "You do not have permission to read this Agent, its versions, or its Configuration."
+        ? `You do not have permission to read this Agent, its versions, or its Configuration. ${askForGrant("read access to them")}`
         : "The read could not be completed. Retry to check current access and saved state.",
-      "Retry",
-      () => void loadPage(),
+      // A permission refusal offers the header's Refresh, not a Retry that repeats it.
+      error.status === 403 ? undefined : "Retry",
+      error.status === 403 ? undefined : () => void loadPage(),
       error.requestId,
     );
+    if (error.status === 403) {
+      shell.refresh.disabled = false;
+    }
   } finally {
     clearTimeout(stillChecking);
     clearStillChecking?.();

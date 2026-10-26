@@ -11,15 +11,63 @@ import { namespacePath } from "./list.mjs";
 export type AgentAccessContext = Pick<
   NamespacePageContext,
   "request" | "isCurrent" | "onExpired"
-> & { namespaceId: string };
+> & {
+  namespaceId: string;
+  // The IDs of readable Secrets the caller may not operate, which binding one to the Agent needs
+  // (finding 2453); undefined when the answer is unknown. Secret fields mark and refuse them.
+  secretsOperateDenied?: SecretsOperateDenied | undefined;
+};
+
+// Reads the Secret operate answer, which pages cache. `fresh` drops the cached answer first: a
+// Secret created since it was read is not in it (finding 2486).
+export type SecretsOperateDenied = (options?: {
+  fresh?: boolean;
+}) => Promise<ReadonlySet<string> | undefined>;
+
+/**
+ * A page's cached Secret operate answer, which `read` fetches (the Agent's or the Namespace's
+ * `permissions/secrets`). `reset` drops the cached answer, as `fresh` does, so the next read asks
+ * again. A failed read answers the last answer read, or undefined before any read succeeded, and
+ * is not cached: the next read asks again. Forgetting a known answer on one failed reread made
+ * every Secret it denied choosable until a reload (finding 2501).
+ */
+export function secretOperateAnswer(read: () => Promise<unknown>) {
+  let answer: Promise<ReadonlySet<string> | undefined> | null = null;
+  let known: ReadonlySet<string> | undefined;
+  const denied: SecretsOperateDenied = ({ fresh = false } = {}) => {
+    if (fresh) {
+      answer = null;
+    }
+    if (answer) {
+      return answer;
+    }
+    const current = read()
+      .then((value) => {
+        const { operateDenied } = responseFields(value);
+        if (!Array.isArray(operateDenied)) {
+          throw new Error("Invalid Secret permission answer");
+        }
+        known = new Set(operateDenied);
+        return known;
+      })
+      .catch(() => {
+        if (answer === current) {
+          answer = null;
+        }
+        return known;
+      });
+    answer = current;
+    return current;
+  };
+  return {
+    read: denied,
+    reset: () => {
+      answer = null;
+    },
+  };
+}
 
 type CredentialReference = SecretReference | CredentialSourceReference;
-
-// Granting access writes Namespace IAM policy, which only Installation administration may do (UX
-// plan A2). Every message that sends a reader to have access granted names that role in these
-// words (findings 1920, 2259, 2260).
-export const askInstallationAdministrator = (task: string) =>
-  `needs Installation administration access: ask an Installation administrator to ${task}.`;
 
 // A malformed policy read is not an empty policy: never create a grant on that evidence.
 export function policyList<T>(value: unknown, read: (item: unknown) => T): T[] {

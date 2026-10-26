@@ -3,8 +3,10 @@
 OpenClaw Enterprise (OCE) is pre-alpha and has no stable release, so a newer
 main can refuse or break an Installation that an older build created. Each
 change like that gets an entry here: what breaks, who is affected, how to tell,
-and the steps. Before an upgrade, read every entry dated after the source commit
-you run now, here, in the
+and the steps. Before an upgrade, read every entry dated on or after the date of the
+source commit you run now (an entry from that day can be newer than your
+commit), here, in the
+[earlier notices from 2026-10-24](breaking-changes-earlier-2026-10-24.md), in the
 [notices before 2026-10-24](breaking-changes-before-2026-10-24.md), in the
 [notices before 2026-10-23](breaking-changes-before-2026-10-23.md), in the
 [notices before 2026-10-15](breaking-changes-before-2026-10-15.md), in the
@@ -19,308 +21,316 @@ then follow the [upgrade checklist](upgrade-checklist.md) and
 Entries are newest first. Steps marked _untested_ have not been run against a
 real Installation.
 
-## 2026-10-24: chart container resources are checked at render
+## 2026-10-26: protected source create and credential withdrawal name their refusal
 
-**What breaks.** `helm install` and `helm upgrade` refuse a `resources`,
-`slackProxy.resources` or `logging.collector.resources` entry with a negative
-quantity or a resource name other than `cpu`, `memory`,
-`ephemeral-storage`, `hugepages-<size>` or a domain-prefixed extended resource
-such as `example.com/gpu`. They also refuse a negative
-`logging.collector.state.sizeLimit` or `tmp.sizeLimit`. Earlier builds rendered
-these and Kubernetes refused the Deployment or Pod when Helm applied it, after
-other objects of the release had changed. With `gatewayRouting.enabled`, a
-release name whose first 34 characters end in `.` now renders a valid Envoy
-NetworkPolicy name; earlier builds failed to create it.
+**What breaks.** More refusals name the rule instead of a generic answer:
 
-**Who is affected.** Releases that set one of these values by hand.
+- Credential source create with a Credential Proxy selected: a type the Proxy
+  cannot protect answers `409 RESOURCE_CONFLICT` and lists the types it
+  protects; a Secret reference to another Namespace answers `400
+INVALID_REQUEST`, as without a Proxy (both were `404`).
+- Create of a prepared or credential-free source whose `config.agent_id` names
+  an Agent being deleted: `409 AGENT_DELETING`; an embedded Agent:
+  `409 RESOURCE_CONFLICT` (both were `404`).
+- Withdrawal of a source that the Agent's active version does not use:
+  `409 RESOURCE_CONFLICT` (was `404`), for any source ID.
+- Agent save or deploy that binds a Proxy-owned source after the Installation
+  dropped `drivers.credential_proxy`: `409 RESOURCE_CONFLICT` (was `500`).
 
-**How to tell.** Helm fails before applying anything, naming the value, for
-example `resources.limits.cpu must not be negative`. A request above its limit
-is still left to Kubernetes, which refuses it when Helm applies the release.
+**Who is affected.** Clients that branch on the old status or text. A missing
+resource, or one you cannot read, still answers `403` or `404`.
 
-**Steps.** Remove the negative or unknown entry, and run the upgrade again.
+**How to tell.** The message names the rule, for example `the selected
+Credential Proxy cannot protect codex-pat sources`.
 
-## 2026-10-24: SSH Compute refuses runtime paths under /tmp
+**Steps.** Handle `409` for these requests, show the message and do not retry it.
 
-**What breaks.** Controller startup refuses an SSH Compute `runtime.root` that
-is `/`, has a `.` or `..` segment, or lies under `/tmp` or `/var/tmp`, as the
-[SSH Compute reference](../../reference/drivers/ssh-compute.md) already said,
-and a `nodePath` or `openclawPath` under `/tmp` or `/var/tmp`. Earlier builds
-started, but each Agent unit runs with `PrivateTmp`, so it could not reach paths
-under those and every deployment timed out. A root such as `/var/lib/./oce`
-worked and is now refused too.
+## 2026-10-26: a Codex network proxy that blocks the repository broker is refused at save
 
-**Who is affected.** SSH Installations with such a path.
+**What breaks.** For an Agent with repository bindings on a dedicated Codex
+Harness, or on embedded OpenClaw with the Codex Plugin Driver and plugins,
+Agent create and update, provisioning and deployment answer `400
+INVALID_REQUEST` when `plugins.entries.codex.config.appServer.networkProxy`
+has `enabled: false`, a `mode` other than `limited` or `full`, a non-boolean
+`allowLocalBinding`, `domains` that is not an object mapping each host to
+`allow` or `deny`, or a `domains` entry with an empty host. Earlier builds saved
+and admitted it, and Kubernetes preparation refused it; a dedicated deploy had
+stopped the running version first. A deny of the broker host is still refused
+only in preparation, which alone knows the host. Configuration save still
+accepts these settings, because a Configuration does not know which Agents use
+it. A stored such Agent still reads, but each update or deploy is refused.
 
-**How to tell.** Startup fails with `INVALID_VALUE` at `/runtime/root`,
-`/runtime/nodePath`, `/runtime/openclawPath` or `/hosts`.
+**Who is affected.** Agents with repository bindings whose Configuration has
+such a setting. They could not deploy before either.
 
-**Steps.** Write a root with `.` or `..` segments in its resolved form (the same
-directory, so state is kept). Move a path under `/tmp` or `/var/tmp`, for example
-the state root to `/var/lib/openclaw-enterprise`. Then restart the controller
-and deploy again.
+**How to tell.** The `400` reads `Configuration setting
+plugins.entries.codex.config.appServer.networkProxy.<setting> ..., so Codex
+cannot reach the repository credential broker`.
 
-## 2026-10-24: Kubernetes Compute checks dedicated placement and selector labels
+**Steps.** Fix or delete the named setting in the Configuration, or remove the
+Agent's repository bindings, then save or deploy again.
 
-**What breaks.** Deployment admission refuses a dedicated Agent (Codex or
-OpenClaw) when the Kubernetes Compute configuration sets `runtime` without
-`runtime.gatewayNodeSelector` or `gatewayRouting`. Agent create and update
-refuse it too when the Configuration selects a model and the Agent binds a
-Secret or `runtime` authentication; a stored such Agent still reads, but each
-update is refused until the setting is fixed. Controller startup refuses
-`runtime.nodeSelector` or `runtime.gatewayNodeSelector` label keys or values
-that Kubernetes refuses, and `resources.namespace.quota` entries whose name is
-not a Kubernetes quota resource name or whose value is not a non-negative
-quantity. Earlier builds accepted all of these; each dedicated deployment then
-stopped the running revision and failed in preparation, or the API server
-refused the Deployment or ResourceQuota.
+## 2026-10-26: saved repository selections, protected deploy and protected sources name their refusal
 
-**Who is affected.** Installations with such a setting. Embedded and
-channel-runtime Installations without dedicated Agents are not affected by the
-placement check.
+**What breaks.** More refusals name the rule and the fix instead of a generic
+answer:
 
-**How to tell.** Saving or deploying the Agent fails with 400 and `Dedicated Agents need
-runtime.gatewayNodeSelector` (or `gatewayRouting`) `in this Installation's
-Kubernetes Compute configuration`. Or startup fails at
-`/runtime/nodeSelector`, `/runtime/gatewayNodeSelector` or
-`/resources/namespace/quota`.
+- Deploy, provisioning work and `GET …/repository-approval-scopes`, when the
+  saved repository selections are no longer approved: `409 RESOURCE_CONFLICT`
+  (was `400`, as in the next entry). Selections that the request sends keep `400`.
+- Deploy that the Credential Proxy cannot start (Installation-wide access or
+  Proxy sources without a selected Proxy, several sources without policy
+  reduction, no Sandbox Driver, other sources beside repository Git):
+  `409 RESOURCE_CONFLICT` (was `503` or `404`). Provisioning fails such work
+  instead of retrying.
+- Deploy of a live-adopted source without a `provider/model` in
+  `agents.defaults.model`: `400 INVALID_REQUEST` (was `404`).
+- Update or rotation of a prepared or credential-free credential source:
+  `409 RESOURCE_CONFLICT` (was `404`).
+- Deletion inside the registration fence and a failed device-login poll keep
+  `503`, with text that names the wait or the next step.
+- A failed provisioning status names these repository and Credential Proxy
+  refusals instead of `Agent provisioning could not complete.`
 
-**Steps.** Set `runtime.gatewayNodeSelector` to the trusted node pool's labels
-and configure `gatewayRouting`, as the
+**Who is affected.** Clients that branch on the old status or text. A missing
+resource, or one you cannot read, still answers `403` or `404`.
+
+**How to tell.** The message names the rule, for example
+`The saved repository selections are no longer approved for this Namespace`.
+
+**Steps.** Handle `409` for these requests, show the message and do not retry it.
+
+## 2026-10-26: some refusals name their reason instead of 404, 409 or 503
+
+**What breaks.** These refusals no longer answer the generic `404 NOT_FOUND`,
+`409` "already exists" or `503 DEPENDENCY_UNAVAILABLE` text. They name the
+rule and the fix:
+
+- Credential source create and update with an unknown or missing `config` or
+  `secrets` field: `400 INVALID_REQUEST`, detail `/config/<field>` or
+  `/secrets/<field>` (was 404).
+- Agent create, update, provisioning and deploy with repository selections the
+  Namespace does not approve, or with both `repositoryAccess` and
+  `repositoryBindings`: `400 INVALID_REQUEST` (was 404).
+- Standing repository approval refusals at Agent update and deploy:
+  `409 RESOURCE_CONFLICT` (a policy refusal was 404).
+- A `harnessAuth.source` that names a ServiceAccount in another Namespace:
+  `400 INVALID_REQUEST` (was 404).
+- Deploy and provisioning with repository bindings on a Compute Driver without
+  repository credentials (Docker, SSH): `409 RESOURCE_CONFLICT` (was 503). A
+  queued provisioning job in this state now fails instead of retrying.
+
+**Who is affected.** Clients that branch on the old status or match the
+generic text for these requests. A missing resource, or one you cannot read,
+still answers `403` or `404` as before.
+
+**How to tell.** The message names the field or rule, for example
+`Credential source type openai has no field secrets.extra`.
+
+**Steps.** Handle `400` and `409` for these requests and show the message. Do
+not retry the `409` that replaced the `503`.
+
+## 2026-10-26: A denial of your own permission names the missing grant
+
+**What breaks.** A `403 FORBIDDEN` for a grant the caller lacks no longer says
+`The exact platform operation was not authorized.` It names the grant and who
+grants it, for example `Not authorized: this needs Agent deploy on Agent <id>.
+Ask an Installation administrator to grant it.` A create denial says only an
+Installation administrator can create it. A denial about the caller's own
+account, session or provisioning job now says so in one of six sentences, such
+as `The acting account is disabled.`; the
+[permissions cheat sheet](../../reference/cheatsheets/permissions.md#denial-messages)
+lists them. Statuses and codes do not change. Denials that name no grant keep
+the old sentence.
+
+**Who is affected.** Clients that match the old sentence exactly. The console
+and `occ` from this build accept both.
+
+**How to tell.** The message starts with `Not authorized:`.
+
+**Steps.** Match the `FORBIDDEN` code instead of the message.
+
+## 2026-10-25: Configuration save refuses a Slack token SecretRef the Slack Driver cannot read
+
+**What breaks.** On the bundled Kubernetes Compute, Configuration create and
+update, provisioning, and `POST .../agents/validate` with
+`configuration.secretBindings` answer `400 INVALID_REQUEST` when a Slack
+`appToken` or `botToken` is a `file` or `exec` SecretRef, an env SecretRef
+with a provider other than `default`, or another object. Earlier builds saved it, and the Slack
+credential check then refused provisioning and deployment with
+`binding_required`. A stored Configuration in this state still reads; an update
+that keeps the token is refused, and its deployment can now fail with this
+message instead. App tokens in HTTP mode and disabled accounts are not checked.
+
+**Who is affected.** Agents whose stored Configuration has such a Slack token.
+They could not deploy before either.
+
+**How to tell.** The message names the setting, for example
+`channels.slack.botToken holds a SecretRef the Slack Channel Driver cannot
+read`, or `holds an object` for an object that is not a SecretRef. Before you upgrade, read each Agent's Configuration as the next entry
+describes and check `appToken` and `botToken` under `channels.slack` and under
+each entry of `channels.slack.accounts`.
+
+**Steps.** Write the token as an env SecretRef with provider `default`, or as
+one whole `${NAME}`, and send its `secretBindings` entry for `NAME` in the same
+request.
+
+## 2026-10-25: Configuration save refuses an unbound channel credential reference
+
+**What breaks.** On the bundled Kubernetes Compute, Configuration create and update,
+provisioning, and `POST .../agents/validate` with `configuration.secretBindings`
+answer `400 INVALID_REQUEST` when an enabled channel has a `${NAME}` reference
+or environment SecretRef without a binding of that name. Builds from later that
+day also refuse, at save and at deployment, one inside other text and, in a
+channel secret-input field, one with a `:-fallback`, an unbound `$NAME` and a
+`${` that OpenClaw does not substitute, such as `${slack_bot}`. Earlier builds
+refused only at deployment. An update of a stored
+Configuration in this state is refused until it adds the bindings.
+
+**Who is affected.** Clients that save channel values before their bindings,
+and Agents whose stored Configuration has an unbound channel reference.
+
+**How to tell.** The message names the setting and the binding, for example
+`channels.slack.botToken references SLACK_BOT_TOKEN`, or the text, for example
+`channels.slack.botToken contains ${slack_bot}`. Before you upgrade, list each
+Namespace's Agents (`GET /namespaces/{namespaceId}/agents`), read the Configuration
+each names in `configurationId`
+(`GET /namespaces/{namespaceId}/configurations/{configurationId}`), and look for
+`${` or a whole `$NAME` in its `channels` values. A plain `${NAME}` is affected only
+when the response's `secretBindings` has no `NAME`.
+
+**Steps.** Send the values and their `secretBindings` in one request. For a
+stored Configuration, save both Slack Secrets on the Agent's **Credentials**
+tab; fix named Slack accounts and `msteams` through the API, sending the
+values with every binding they reference. Replace a refused `${` with an
+uppercase `${NAME}` bound to a Secret.
+
+## 2026-10-25: provisioning refuses a taken Agent name with 409
+
+**What breaks.** `POST /namespaces/{namespaceId}/agents/provision` with a name
+that another Agent in the Namespace has answers `409 RESOURCE_CONFLICT` with
+`An Agent with this name already exists in this Namespace. Choose a different
+name.` and stores no job. Earlier builds answered `202` and the job failed
+with `PROVISIONING_REJECTED` and the same message. Two new requests for one
+free name are still both admitted, and the later job fails as before.
+`POST /namespaces/{namespaceId}/agents/validate` accepts an optional `name` and
+refuses a taken one with the same `409`.
+
+**Who is affected.** API clients and alerts that expect `202` for a taken name
+or match the failed job.
+
+**How to tell.** The provisioning request answers `409` with that message.
+
+**Steps.** Choose another name and send the request again.
+
+## 2026-10-25: provisioning refuses an unplaceable dedicated Agent with 400
+
+**What breaks.** `POST /namespaces/{namespaceId}/agents/provision` with a Secret
+binding answers `400 INVALID_REQUEST` and `Dedicated Agents need <setting> in
+this Installation's Kubernetes Compute configuration`, as Agent save does, when
+the Kubernetes Compute configuration sets `runtime` without `gatewayRouting` or
+`runtime.gatewayNodeSelector`. Earlier builds answered `409 RESOURCE_CONFLICT`
+with fixed text. Create Agent now runs its preflight before it saves the model
+Secret or registers a Credential Source for provisioning, so neither is left.
+
+**Who is affected.** API clients and alerts that match that `409`.
+
+**How to tell.** The provisioning request answers `400` with that message.
+
+**Steps.** Configure the named setting as the
 [Kubernetes Compute reference](../../reference/drivers/kubernetes-compute.md)
-describes; fix the selector labels or quota entries; then restart the
-controller.
+describes, or create an Embedded OpenClaw Agent.
 
-## 2026-10-24: Preset saves check literal Agent launch fields
+## 2026-10-25: repository options without repository settings answer 200
 
-**What breaks.** Preset create and update, and seeding a missing `presets.files`
-copy at startup, bootstrap or Namespace creation, refuse a template whose `agent.name`, `agent.executionMode`,
-`agent.backendId` or `agent.pluginApprovers` is written without a variable token
-and breaks the rule Agent create applies (for example `executionMode: turbo`,
-a Backend the Installation does not configure, or a non-Slack approver while a
-Plugin Driver is selected).
-Earlier builds saved it, and every Agent created from it was refused.
+**What breaks.** On an Installation without a `repository` block, both
+`repository-options` routes (`GET /namespaces/{namespaceId}/agents/repository-options`
+and the per-Agent one) answer `200` with an empty `data` array and
+`meta.notConfigured: true` instead of `503 REPOSITORY_OPTIONS_UNAVAILABLE`. An
+unsupported Compute or Sandbox Driver, or an unavailable repository Driver,
+still answers `503`. The console no longer logs an error for it.
 
-**Who is affected.** Installations whose `presets.files` hold such a field, and
-API clients that save one. Existing copies and other stored Presets still read
-and render.
+**Who is affected.** API clients and alerts that match this `503`, or that read
+an empty `data` array as "no approved repositories".
 
-**How to tell.** The write answers `400`, or startup or Namespace creation
-fails, with a message such as
-`Preset agent.executionMode: must be "embedded" or "dedicated".`
+**How to tell.** The answer carries `meta.notConfigured: true`.
 
-**Steps.** Fix the named field, or replace it with a variable token; then
-restart the controller or repeat the write. _Untested_ on a real Installation.
+**Steps.** Treat `meta.notConfigured` as "repository access is not set up";
+Agent save still refuses repository bindings there with `409`.
 
-## 2026-10-24: OpenShell refuses a quoted userNamespaces and endpoints without ports
+## 2026-10-24: repository bindings without repository settings answer 409
 
-**What breaks.** Controller startup refuses an OpenShell Sandbox Driver
-configuration whose `kubernetes.userNamespaces` is not a YAML boolean (for
-example the quoted string `"false"`, or a key left empty, which is null), or whose
-`policy.networkPolicies[].endpoints[].ports` list is empty. Earlier builds
-started: a quoted `"false"` reached the Gateway as user namespaces on, so
-OpenClaw Agents were refused while Codex Sandboxes kept user namespaces, and an
-endpoint without ports failed every Sandbox creation.
+**What breaks.** On an Installation without a `repository` block, Agent create
+and update with `repositoryBindings` answer `409 RESOURCE_CONFLICT` instead of
+`503 DEPENDENCY_UNAVAILABLE`. A selected Driver that is unavailable still
+answers `503`. The `REPOSITORY_GIT_SENDER_UNQUALIFIED` message and the startup refusal
+of the retired `drivers.repo` now name paths that work with a Sandbox; they
+used to point every Installation at native Git, which startup refuses beside a
+Sandbox.
 
-**Who is affected.** OpenShell Installations with either setting. Those with a
-quoted or empty `userNamespaces` could still run Codex Agents; an endpoint
-without ports blocked every Agent.
+**Who is affected.** API clients and alerts that retry or match these `503`
+answers or the old messages.
 
-**How to tell.** Startup fails with `INVALID_TYPE` at
-`/kubernetes/userNamespaces`, or a `minItems` refusal at a path such as
-`/policy/networkPolicies/0/endpoints/0/ports`.
+**How to tell.** The `409` reads `This Installation has no repository
+settings, so no repository credential Driver is selected and an Agent cannot
+bind repositories.`
 
-**Steps.** Write `userNamespaces: false` (or `true`) without quotes, or remove
-an empty key, and give each endpoint at least one port; then restart the
-controller. Unquoting `false`
-turns user namespaces off for Codex Sandboxes too, as the setting says.
+**Steps.** Remove the bindings, or configure `repository`, then save again.
 
-## 2026-10-24: chart NetworkPolicy peers are checked at render
+## 2026-10-24: Credential Proxy with repository.openShell refuses non-Git use with 409
 
-**What breaks.** `helm install` and `helm upgrade` refuse a
-`gatewayRouting.sandbox.ingressPeers` or `openshellGit.clients` entry that the
-Kubernetes API would refuse or that has fields a NetworkPolicy peer lacks: an
-invalid `ipBlock.cidr` or `except` CIDR (including leading-zero octets such as
-`010.0.0.0/8`), `ipBlock` together with selectors, a
-`matchExpressions` entry with an invalid key, an operator other than `In`,
-`NotIn`, `Exists` or `DoesNotExist`, or values that do not fit the operator,
-invalid `openshellGit.clients` label keys or values, and unknown keys such as
-`podSelectors`. Earlier builds rendered these and failed when Helm applied the
-NetworkPolicy, after other objects of the release had changed.
+**What breaks.** With `repository.openShell` and `drivers.credential_proxy`,
+creating a Proxy-owned credential source, or deploying an Agent without a
+repository binding, answers `409 RESOURCE_CONFLICT` instead of `503
+DEPENDENCY_UNAVAILABLE` or `404 NOT_FOUND`. With any Credential Proxy, deploying
+a binding to a source not created or adopted under the Proxy answers `409`
+instead of `404`. What is admitted does not change.
 
-**Who is affected.** Releases that set one of these peers by hand with such a
-value.
+**Who is affected.** Installations with these selections, and clients that
+match the earlier status codes.
 
-**How to tell.** Helm fails before applying anything, naming the entry, for
-example `gatewayRouting.sandbox.ingressPeers[0].ipBlock.cidr requires an IPv4 or
-IPv6 CIDR`.
+**How to tell.** The `409` reads `With repository.openShell the Credential
+Proxy serves only repository Git` or `With drivers.credential_proxy selected, a
+revision can use only credential sources created or adopted under the Proxy`.
 
-**Steps.** Correct or remove the named field, then run the upgrade again.
+**Steps.** Give a Git Agent's model an existing Gateway Harness source, as
+[protected OpenShell Git](../../reference/repository-credentials/protected-openshell-git.md)
+describes, or replace the binding with a Proxy source; then deploy again.
 
-## 2026-10-24: OpenShell refuses OpenClaw Agents without user namespaces off
+## 2026-10-24: installation-wide repository access must be the only binding at save
 
-**What breaks.** With the OpenShell Sandbox Driver, Agent save and deployment
-refuse a dedicated OpenClaw Agent with a 400 unless the Driver sets
-`kubernetes.userNamespaces: false`. Earlier builds saved and admitted it, then
-failed every new revision in workspace preparation, after its predecessors had
-stopped.
+**What breaks.** Agent create, update, provisioning and deployment refuse
+`repositoryBindings` or `repositoryAccess.repositories` that select the
+`github-installation` profile next to another entry, with `400
+INVALID_REQUEST`. Earlier builds saved it and refused the deploy with `404
+NOT_FOUND`. A stored such Agent still reads, but each update is refused.
 
-**Who is affected.** OpenShell Installations that leave
-`kubernetes.userNamespaces` unset or `true` and run OpenClaw Agents; none of
-those Agents could deploy. Codex Agents are unaffected.
+**Who is affected.** Agents that combine installation-wide access with another
+repository selection; none of them could deploy.
 
-**How to tell.** The refusal names `kubernetes.userNamespaces: false`; Create
-Agent and the Installation's `openclaw.settingRefusals` show it too.
-Provisioning status reads still report earlier requests.
+**How to tell.** The `400` reads `Installation-wide repository access (profile
+github-installation) must be the Agent's only repository selection.`
 
-**Steps.** Set `kubernetes.userNamespaces: false` in the OpenShell Sandbox
-Driver configuration and restart the controller, or switch the Agent to Codex.
+**Steps.** Remove the other entries, or select each repository with its own
+profile, then save and deploy again.
 
-## 2026-10-24: OpenShell Sandbox policy settings are checked at startup
+## 2026-10-24: Plugin Drivers are checked against the Agent's Harness at save
 
-**What breaks.** Controller startup refuses OpenShell Sandbox settings that the
-Gateway refuses when it creates a Sandbox: a `policy.process.runAsUser` or
-`runAsGroup` other than `sandbox` or a number from 1 to 4294967294, a
-`policy.filesystem` path that is relative, only slashes or has a `..` segment, a
-read-only `kubernetes.sandboxDataMount` listed in `policy.filesystem.readWrite`,
-an unknown key under `policy.filesystem`, and `kubernetes.agentResources`
-`requests` or `limits` that are not objects. Earlier builds started, then
-failed each dedicated deploy after its predecessors had stopped.
+**What breaks.** Agent create and update, Create Agent's preflight,
+provisioning and deployment refuse an Agent with plugins whose Harness the
+Installation's Plugin Driver cannot run, with `400 INVALID_REQUEST`: the
+OpenClaw Plugin Driver needs an OpenClaw Harness, and the Codex Plugin Driver
+needs dedicated Codex or embedded OpenClaw. Earlier builds saved and admitted
+it, and every preparation failed; a dedicated deploy had stopped the running
+revision first. A stored
+such Agent still reads, but each update or deploy is refused.
 
-**Who is affected.** Only Installations whose OpenShell Sandbox settings use
-one of these values. Apart from a slash-only path such as `//` in
-`policy.filesystem.readOnly` (earlier builds refused only `/` there) and an
-unknown `policy.filesystem` key such as a `readwrite` typo (earlier builds
-ignored it), none of them could deploy an Agent.
+**Who is affected.** Agents with plugins on a Harness that their Plugin Driver
+does not support.
 
-**How to tell.** Startup fails with `STARTUP_FAILED`, and the Installation
-loader names the setting, for example `/policy/process/runAsUser`.
+**How to tell.** The `400` reads `The Installation's Plugin Driver runs plugins
+only in an OpenClaw Harness` (or `a dedicated Codex Harness or embedded
+OpenClaw Harness`).
 
-**Steps.** Correct the named setting, then start the controller again.
-
-## 2026-10-24: OpenShell refuses unknown settings, invalid Agent resources and protocols
-
-**What breaks.** Controller startup refuses an OpenShell Sandbox Driver
-configuration with an unknown key in `kubernetes`, `kubernetes.serviceAccount`,
-`kubernetes.sandboxDataMount`, `kubernetes.agentResources`, `policy`,
-`policy.process` or `gateway.readiness` (for example `policy.filesytem` or
-`kubernetes.userNamespace`), an `agentResources.requests` or `limits` value
-that is not a quoted, non-negative Kubernetes quantity or a request above its
-limit, or a `policy.networkPolicies[].endpoints[].protocol` that OpenShell
-refuses: a name other than `tcp`, `rest`, `websocket`, `graphql` or `sql`, an L7
-protocol without `access`, `access` or `enforcement` on `tcp`, or `enforcement:
-enforce` on `sql`. Earlier builds started: they ignored a misspelled key, so its
-default applied (OpenShell refused one under `agentResources` at Sandbox
-creation), and every Sandbox creation failed on the other values. OCE now sends
-protocol names lowercase.
-
-**Who is affected.** OpenShell Installations with such a setting. Endpoints
-with `json-rpc` or `mcp` never worked, because OpenShell needs rules this
-setting cannot express.
-
-**How to tell.** Startup fails with `UNKNOWN_FIELD` at the object that holds
-the key, `INVALID_VALUE` or `INVALID_RANGE` at
-`/kubernetes/agentResources/requests` (or `limits`), or `INVALID_VALUE` at the
-endpoint's `protocol`.
-
-**Steps.** Fix or remove the key, quote each quantity (`cpu: "500m"`) and keep
-requests within limits, give each L7 endpoint an `access` preset or remove its
-protocol, and use `enforcement: audit` for `sql`; then restart the controller.
-
-## 2026-10-24: OpenShell readiness poll interval is capped at 2147483647 ms
-
-**What breaks.** Controller startup refuses an OpenShell Sandbox
-`gateway.readiness.pollIntervalMs` above `2147483647`. Earlier builds accepted
-values up to `9007199254740991`, but Node.js fires a longer timer after 1 ms,
-so the readiness wait polled Kubernetes back to back until `timeoutMs`.
-
-**Who is affected.** Only Installations that set the poll interval above
-`2147483647` (about 24.8 days).
-
-**How to tell.** Startup fails with `STARTUP_FAILED`, and the Installation
-loader reports `/gateway/readiness/pollIntervalMs` as not satisfying `maximum`.
-
-**Steps.** Set the value to `2147483647` or less (or remove it for the
-1-second default), then start the controller again.
-
-## 2026-10-24: worker timer settings are capped at 2147483647 ms
-
-**What breaks.** `helm install` and `helm upgrade` refuse `worker.pollIntervalMs`
-or `worker.leaseDurationMs` above `2147483647`, and the worker refuses to start
-when `OCC_WORKER_POLL_INTERVAL_MS`, `OCC_WORKER_LEASE_DURATION_MS` or
-`OCC_WORKER_DATABASE_TIMEOUT_MS` is above it. Earlier builds accepted values up
-to `9007199254740991`, but Node.js fires a longer timer after 1 ms: the worker
-aborted every claim and polled without pause.
-
-**Who is affected.** Only Installations that set one of these above
-`2147483647` (about 24.8 days); such a worker could not complete work.
-
-**How to tell.** The render fails with `worker.leaseDurationMs must be at most
-2147483647 milliseconds` (or the poll interval), or the worker exits with
-`WORKER_STARTUP_FAILED`.
-
-**Steps.** Set the value to `2147483647` or less, then run the upgrade again.
-
-## 2026-10-24: chart refuses unquoted numeric or boolean names
-
-**What breaks.** `helm install` and `helm upgrade` refuse a Secret,
-ConfigMap, Secret-key or PersistentVolumeClaim name, a Gateway or
-GatewayClass name, or a `dns.namespace`, `api.clients[].namespace` or
-`gatewayRouting.envoyNamespace` value, that YAML or `--set` reads as a number or
-boolean. The `openclaw-execution` chart refuses the same for its `routing`
-names, `routing.envoyNamespace` and `dns.namespace`. Earlier charts rendered
-`secretName: 2024` as `"2024"` and `secretName: yes` as `"true"`.
-
-**Who is affected.** Values files with an unquoted name that YAML reads as a
-number or boolean, for example `2024`, `1e3`, `yes` or `on`. Most optional
-names that read as `false` or `0`, such as `database.caSecretName: false`, still
-count as unset, as before. The execution chart's `routing.gatewayName`,
-`routing.envoyNamespace` and `dns.namespace` have defaults, so it refuses
-`false` there.
-
-**How to tell.** The render fails with `<field> must be a string: quote a value
-YAML reads as a number or boolean, or pass it with --set-string`. A required
-name set to `false` or `0` fails as missing instead.
-
-**Steps.** Quote the value in the values file, or pass it with
-`--set-string`, then run the upgrade again.
-
-## 2026-10-24: deployment checks a completed workspace setup
-
-**What breaks.** Deploying an Agent whose initial workspace setup already
-completed is refused when its Configuration breaks the workspace rule that
-Agent save applies to a pending setup, for example a roster that no longer
-holds only `main`. On SSH Compute this includes any `workspace` on
-`agents.defaults` or `main`, also a path under the Agent's own directory that
-the host accepted. Each deployment delivers the completed setup, and
-preparation refused it again; that failed after its retries with
-`DEPENDENCY_UNAVAILABLE`.
-
-**Who is affected.** Agents created with initial workspace files whose
-Configuration changed after the first deployment, on any Compute Driver.
-
-**How to tell.** The deploy request answers `400` with the Configuration
-setting's message, as Agent save does (or `409` when the selected Sandbox
-cannot receive the files), and no version is created.
-
-**Steps.** Restore the setting, or select a Configuration that meets the rule,
-then deploy again. _untested_
-
-## 2026-10-24: SSH initial workspace files refuse an explicit workspace at save
-
-**What breaks.** On SSH Compute, Agent create and update refuse initial
-workspace files when `agents.defaults.workspace` or the `main` entry's
-`workspace` is set, and deploying an Agent whose setup is still pending is
-refused the same way. Such a deployment already failed after its retries with
-`DEPENDENCY_UNAVAILABLE`: the host accepts only the workspace it derives.
-
-**Who is affected.** SSH Installations with initial workspace files on a
-Configuration that sets either `workspace`, for example one written for
-Kubernetes.
-
-**How to tell.** The request answers `400` with `Configuration setting
-agents.defaults.workspace must be unset for initial workspace files on SSH
-Compute` (or names the `main` entry's `workspace`).
-
-**Steps.** Remove that `workspace` setting, or use a Configuration without it,
-then save or deploy again. _untested_
+**Steps.** Remove the Agent's plugins, or change its Configuration or execution
+mode to a supported Harness, then save again.

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { DEPLOYMENT_POLL_MS } from "../../apps/controller/src/console/agents/deployment-evidence.mts";
+import { apiErrorResponse } from "../helpers/api-error.mjs";
 import { createConsoleAppFixture } from "../helpers/console-app.mjs";
 import {
   apiRequests,
@@ -16,6 +17,7 @@ import {
   recordLayoutShifts,
   takeLayoutShifts,
   trackSettledFetches,
+  shortId,
   waitForEnabled,
   waitForIdleFetches,
 } from "./console-agents-browser-helpers.mjs";
@@ -27,6 +29,19 @@ import {
 } from "./console-deployment-activity-helpers.mjs";
 import { agentDeleteRequests, agentStopRequests } from "./console-agents-test-support.mjs";
 import { createReadyConsoleNamespace } from "./console-ready-namespace.mjs";
+import {
+  AGENT_DELETE_DENIED,
+  AGENT_STOP_AND_DELETE_DENIED,
+  AGENT_STOP_DENIED,
+  askForGrant,
+  MALFORMED_REQUEST,
+  RESOURCE_CONFLICT,
+  requestedVersionUnavailable,
+  stopRefused,
+  NEW_VERSIONS_READ,
+  STOP_UNKNOWN_DEPLOYMENT_CONFIRMATION,
+  VERSION_UNAVAILABLE,
+} from "../helpers/refusal-text.mjs";
 
 function deploymentBody(
   namespaceId,
@@ -153,7 +168,7 @@ test("Deployment activity names retire cleanup as revision cleanup and follows i
   const agent = await fixture.createAgent(namespace.id, "Cleanup Agent", nativeValues("v1"));
   const revision = await fixture.deployAgent(namespace.id, agent.id);
   const { page } = await newPage(t, fixture);
-  let cleanup = { status: "queued", nextAttemptAt: null };
+  let cleanup = { status: "queued", nextAttemptAt: "2026-09-30T12:00:00.000Z" };
   await page.route(deploymentRecordUrl(fixture, namespace.id, agent.id, revision.id), (route) =>
     route.fulfill({
       status: 200,
@@ -184,8 +199,17 @@ test("Deployment activity names retire cleanup as revision cleanup and follows i
   assert.equal(await status.getAttribute("role"), "status");
   assert.equal(
     await status.innerText(),
-    "Revision cleanup pending. This version's resources have not been confirmed removed; the controller will retry.",
+    "Revision cleanup pending. This version's resources have not been confirmed removed.",
   );
+  // A failed attempt queues the cleanup for a retry; the API keeps reporting it running, with
+  // the time of the next attempt, so the status line says it started (finding 2466).
+  cleanup = { status: "running", nextAttemptAt: "2026-09-30T12:01:00.000Z" };
+  await page.clock.runFor(DEPLOYMENT_POLL_MS);
+  await status
+    .getByText(
+      "Revision cleanup started. This version's resources have not been confirmed removed; the controller will retry.",
+    )
+    .waitFor();
   cleanup = { status: "succeeded", nextAttemptAt: null };
   await page.clock.runFor(DEPLOYMENT_POLL_MS);
   await status.getByText("Revision cleanup completed for this version.").waitFor();
@@ -314,7 +338,9 @@ test("Diagnostics explain UNAVAILABLE checks and point at the recorded failure",
   await fixture.bootstrap();
   const namespace = await fixture.createNamespace("Diagnostics explain", { ready: true });
   const agent = await fixture.createAgent(namespace.id, "Diagnostics Agent", nativeValues("v1"));
-  const revision = await fixture.deployAgent(namespace.id, agent.id);
+  // Diagnostics are offered for the current version: an Embedded version is selected before its
+  // gateway is ready, so a failed record can belong to it (finding 2403).
+  const { revision } = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
   const deploymentPath = `/namespaces/${namespace.id}/agents/${agent.id}/deployments/${revision.id}`;
   const { page } = await newPage(t, fixture);
   await page.route(`${fixture.origin}${deploymentPath}`, (route) =>
@@ -354,6 +380,11 @@ test("Diagnostics explain UNAVAILABLE checks and point at the recorded failure",
   await observations
     .getByText(/recorded deployment failed with RUNTIME_AUTHENTICATION_FAILED/)
     .waitFor();
+  // The failed record does not make the selected version a "Failed version": it is current.
+  assert.equal(
+    await page.locator(".version-selection-notice").textContent(),
+    "Current version · read-only admitted snapshot.",
+  );
 });
 
 // A fast answer painted "Waiting for diagnostic results…" for a frame and moved focus to it and
@@ -503,7 +534,9 @@ test("Diagnostics explain a missing Slack channel and keep the recorded failure 
   await fixture.bootstrap();
   const namespace = await fixture.createNamespace("Diagnostics scope", { ready: true });
   const agent = await fixture.createAgent(namespace.id, "Embedded Agent", nativeValues("v1"));
-  const revision = await fixture.deployAgent(namespace.id, agent.id);
+  // Diagnostics are offered for the current version: an Embedded version is selected before its
+  // gateway is ready, so a failed record can belong to it (finding 2403).
+  const { revision } = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
   const deploymentPath = `/namespaces/${namespace.id}/agents/${agent.id}/deployments/${revision.id}`;
   const { page } = await newPage(t, fixture);
   await page.route(`${fixture.origin}${deploymentPath}`, (route) =>
@@ -555,7 +588,16 @@ test("Diagnostics explain a missing Slack channel and keep the recorded failure 
   await observations.getByText(/gateway checks cover only the Slack channel/).waitFor();
   await observations.getByRole("button", { name: "Run diagnostics for this version" }).click();
   await observations.getByText("gateway / authentication").waitFor();
-  await observations.getByText(/NOT_CONFIGURED means this version has no Slack channel/).waitFor();
+  // A version without Slack has nothing to check: the rows say so in words, not as a failed code.
+  await observations
+    .getByText(/^Slack is not set up for this version, so there is nothing to check\./)
+    .waitFor();
+  const results = await observations.locator(".credential-status-list dd").allTextContents();
+  assert.deepEqual(
+    results.map((text) => text.split(" · ")[0]),
+    ["not set up", "not checked", "not checked"],
+  );
+  assert.equal(await observations.getByText(/NOT_CONFIGURED/).count(), 0);
   await observations
     .getByText(/recorded deployment failed with RUNTIME_AUTHENTICATION_FAILED/)
     .waitFor();
@@ -572,14 +614,7 @@ test("Agent detail returns to the Agents list once background deletion finishes"
   let gone = false;
   await page.route(`${fixture.origin}${agentPath}`, async (route, request) => {
     if (gone && request.method() === "GET") {
-      await route.fulfill({
-        status: 404,
-        contentType: "application/json",
-        body: JSON.stringify({
-          error: { code: "RESOURCE_NOT_FOUND", message: "Agent not found." },
-          meta: { requestId: "req_00000000-0000-4000-8000-000000000404" },
-        }),
-      });
+      await route.fulfill(apiErrorResponse(404, "NOT_FOUND", "Agent not found."));
       return;
     }
     await route.continue();
@@ -660,14 +695,7 @@ test("An unknown Installation access answer keeps the Access tab", async (t) => 
   const { revision } = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
   const { page } = await newPage(t, fixture);
   await page.route(`${fixture.origin}/observability`, (route) =>
-    route.fulfill({
-      status: 503,
-      contentType: "application/json",
-      body: JSON.stringify({
-        error: { code: "SERVICE_UNAVAILABLE", message: "Unavailable." },
-        meta: { requestId: "req_00000000-0000-4000-8000-000000000503" },
-      }),
-    }),
+    route.fulfill(apiErrorResponse(503, "DEPENDENCY_UNAVAILABLE", "Unavailable.")),
   );
   await login(
     page,
@@ -803,7 +831,9 @@ test("Agent detail says when the current or requested version cannot be read", a
   await page
     .locator(".agent-status-line")
     .getByText(
-      /Ask an Agent administrator for read access to new versions\. If this Agent is set up for a channel such as Slack, you can message it there when that channel allows you\.$/,
+      new RegExp(
+        `${RegExp.escape(NEW_VERSIONS_READ)} If this Agent is set up for a channel such as Slack, you can message it there when that channel allows you\\.$`,
+      ),
     )
     .waitFor();
   await page.getByRole("heading", { name: "You cannot read this version" }).waitFor();
@@ -815,13 +845,12 @@ test("Agent detail says when the current or requested version cannot be read", a
   const requestedUrl = detailUrl(fixture, namespace.id, agent.id, requested.id, "configuration");
   await page.goto(requestedUrl.href);
   await page.getByRole("heading", { name: "Hidden Agent" }).waitFor();
-  await page
-    .locator(".agent-status-line")
-    .getByText(
-      /Version rev_.* was requested, but you cannot read it, so its progress and outcome are not shown here\./,
-    )
-    .waitFor();
-  await page.getByRole("heading", { name: "You cannot read this version" }).waitFor();
+  // The page cannot tell a version it may not read from one that does not exist, so it says
+  // either may be true, and does not ask for read "after each deployment" (finding D750).
+  const statusLine = page.locator(".agent-status-line");
+  await statusLine.getByText(requestedVersionUnavailable(shortId(requested.id))).waitFor();
+  await page.getByRole("heading", { name: "Version not found or not shared" }).waitFor();
+  await page.getByText(VERSION_UNAVAILABLE, { exact: true }).waitFor();
 });
 
 test("Agent detail says an Agent's versions are hidden, not missing, when none is readable", async (t) => {
@@ -837,7 +866,7 @@ test("Agent detail says an Agent's versions are hidden, not missing, when none i
   await page.getByRole("heading", { name: "Hidden history" }).waitFor();
   await page
     .getByText(
-      "No readable versions. This Agent has versions your access does not include. Ask an Agent administrator for read access to them.",
+      `No readable versions. This Agent has versions your access does not include. ${askForGrant("AgentRevision read on them")}`,
     )
     .waitFor();
   assert.equal(
@@ -851,6 +880,29 @@ test("Agent detail says an Agent's versions are hidden, not missing, when none i
   await page.goto(detailUrl(fixture, namespace.id, pending.id, "draft", "configuration").href);
   await page.getByRole("heading", { name: "Pending history" }).waitFor();
   await page.getByText(/^No readable versions\. This Agent has versions your access/).waitFor();
+  // Agent operate and AgentRevision read are separate grants. This reader may stop the Agent but
+  // cannot read the deploying version, so Stop stays on the page and the Agents list: the API
+  // answers if nothing runs. Its dialog cannot say which, so it names both outcomes instead of
+  // describing a gateway that may not exist (finding D691).
+  const stop = page
+    .getByRole("region", { name: "Stop Agent", exact: true })
+    .getByRole("button", { name: "Stop Agent", exact: true });
+  await waitForEnabled(stop);
+  await stop.click();
+  let dialog = page.getByRole("dialog", { name: "Stop this Agent?" });
+  await dialog.getByText(STOP_UNKNOWN_DEPLOYMENT_CONFIRMATION, { exact: true }).waitFor();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await dialog.waitFor({ state: "hidden" });
+  await page.goto(new URL(`/console/agents?namespace=${namespace.id}`, page.url()).href);
+  const row = page.getByRole("row").filter({ hasText: "Pending history" });
+  await row.getByText("No visible deployments", { exact: true }).waitFor();
+  const rowStop = row.getByRole("button", { name: "Stop Pending history", exact: true });
+  await waitForEnabled(rowStop);
+  await rowStop.click();
+  dialog = page.getByRole("dialog", { name: "Stop Pending history?" });
+  await dialog.getByText(STOP_UNKNOWN_DEPLOYMENT_CONFIRMATION, { exact: true }).waitFor();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await dialog.waitFor({ state: "hidden" });
 
   // A never-deployed Agent keeps the creation hint.
   const fresh = await fixture.createAgent(namespace.id, "No history", nativeValues("v1"));
@@ -928,6 +980,12 @@ test("Agent detail reports a failed selected version as probably not serving", a
       /v2 is still selected, but its runtime replaced the previous version before deployment finished/,
     )
     .waitFor();
+  // The warning is the whole answer: no note says that nothing checked serving (finding 2367).
+  const liveServingNote = summary
+    .locator(".stat")
+    .filter({ hasText: "Live serving" })
+    .locator(".stat-help");
+  assert.equal(await liveServingNote.textContent(), "");
 });
 
 // A startup model check that failed or timed out, or a Gateway that refused its own
@@ -953,7 +1011,7 @@ test("Deployment activity guides a failed model check or an unauthorized gateway
         },
       }),
       nextStep:
-        /^The startup model check failed for a reason other than a rejected credential, .*, or, with Codex, a provider the runtime cannot reach\. .*and that the runtime can reach the provider, then deploy a new version\.$/,
+        /^The startup model check failed, but not for a rejected credential: .*, or, with Codex, an unreachable provider\. Check these and the provider account, then deploy a new version\.$/,
       // The runtime's classified cause names why this check failed.
       cause:
         "The model provider rejected the request: rate or usage limit reached (rate_limit). Wait for the provider's limit to reset or use an account with remaining quota, then deploy a new version.",
@@ -969,8 +1027,23 @@ test("Deployment activity guides a failed model check or an unauthorized gateway
           cause: { kind: "PROBE_STATUS", detail: "error-event" },
         },
       }),
-      nextStep: /^The startup model check failed for a reason other than a rejected credential, /,
+      nextStep: /^The startup model check failed, but not for a rejected credential: /,
       cause: "The model provider check reported a failure (error-event)",
+    },
+    {
+      // A billing refusal has its own provider text, as a rate limit does.
+      error: persistedDeploymentError("RUNTIME_MODEL_PROBE_FAILED", {
+        runtimeFailure: {
+          component: "agent",
+          check: "model-probe",
+          checkedAt: "2026-10-03T08:00:00.000Z",
+          code: "MODEL_PROBE_FAILED",
+          cause: { kind: "PROBE_STATUS", detail: "billing" },
+        },
+      }),
+      nextStep: /^The startup model check failed, but not for a rejected credential: /,
+      cause:
+        "The model provider rejected the request: billing or credit problem (billing). Check the provider account's plan and credits, then deploy a new version.",
     },
     // Finding 1600: a Codex check retried once ends its detail -attempt2. The advice
     // follows the token without the suffix, and the text says the retry also failed.
@@ -993,13 +1066,13 @@ test("Deployment activity guides a failed model check or an unauthorized gateway
           cause: { kind: "PROBE_STATUS", detail },
         },
       }),
-      nextStep: /^The startup model check failed for a reason other than a rejected credential, /,
+      nextStep: /^The startup model check failed, but not for a rejected credential: /,
       cause,
     })),
     {
       error: persistedDeploymentError("RUNTIME_MODEL_PROBE_TIMEOUT"),
       nextStep:
-        /^The startup model check did not get a reply from the model provider in time\. With OpenClaw this includes a provider the runtime cannot reach \(refused connection or unknown host\)\..* then deploy a new version\.$/,
+        /^The startup model check got no reply from the provider in time\. With OpenClaw this includes an unreachable provider \(refused connection or unknown host\)\..* then deploy a new version\.$/,
     },
     {
       // The Configuration holds the fix (Enable gateway password access), not Credentials.
@@ -1022,6 +1095,16 @@ test("Deployment activity guides a failed model check or an unauthorized gateway
     const activity = await openFailureDetails(page);
     await activity.getByText(`${error.code}: ${error.message}`, { exact: true }).waitFor();
     const recovery = page.getByRole("region", { name: "Deployment needs attention" });
+    // A failed or timed-out model check leads as one; a refused gateway CLI does not.
+    const lead = error.code.startsWith("RUNTIME_MODEL_PROBE_")
+      ? "v1 failed its startup model check"
+      : "v1 did not deploy successfully";
+    assert.ok(
+      (await recovery.locator(".status-body").textContent()).startsWith(
+        `${lead} (${error.code}). `,
+      ),
+      error.code,
+    );
     assert.equal(
       await activity.getByText("Cause", { exact: true }).count(),
       cause === undefined ? 0 : 1,
@@ -1111,7 +1194,7 @@ const neutralDeployments = [
     failure: {
       code: "REPOSITORY_REVISION_STOPPED",
       message:
-        "Deployment ended because the Agent was stopped or its Namespace is no longer ready.",
+        "Deployment ended because the Agent was stopped or its Namespace is no longer ready. To run the Agent, deploy again once its Namespace is ready.",
     },
   },
 ];
@@ -1230,6 +1313,12 @@ test("Agent detail and list show superseded and stopped deployments as neutral, 
     await page.goto(urls.get(c.agent).href);
     await page.getByRole("heading", { name: "Version v1" }).waitFor();
     await expectNeutral(c, c.error.code);
+    // A neutral record is not a failure, so the version's notice does not call it failed. The
+    // superseded v1 is not current (the hidden v2 is), so it is history.
+    assert.equal(
+      (await page.locator(".version-selection-notice").textContent()).split(" ·")[0],
+      c.newerHidden ? "Historical version" : "Current version",
+    );
     // Diagnostics do not ask the reader to resolve a neutral record first.
     const observations = page.locator(".version-diagnostics");
     await observations.getByRole("button", { name: "Run diagnostics for this version" }).click();
@@ -1282,11 +1371,7 @@ test("Agent detail reads the selected version's deployment record once on load",
   await page.route(deploymentRecordUrl(fixture, namespace.id, agent.id, revision.id), (route) => {
     recordReads += 1;
     if (failFirst && recordReads === 1) {
-      return route.fulfill({
-        status: 503,
-        contentType: "application/json",
-        body: JSON.stringify({ error: { code: "UNAVAILABLE", message: "Try again." } }),
-      });
+      return route.fulfill(apiErrorResponse(503, "DEPENDENCY_UNAVAILABLE", "Try again."));
     }
     return route.fulfill({
       status: 200,
@@ -1578,6 +1663,71 @@ for (const action of ["Stop", "Delete"]) {
   });
 }
 
+// A row's Stop and Delete have no form: a schema refusal does not ask to check entered values, a
+// typed 409 shows the API's sentence, and a conflict the API does not explain keeps the list's own
+// sentence (findings 2538, 2561).
+test("Agents list row Stop and Delete show the API's 400 and 409 reasons", async (t) => {
+  const fixture = await createConsoleAppFixture(t);
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Row refusals", { ready: true });
+  const agent = await fixture.createAgent(namespace.id, "Refused Row", nativeValues("row"));
+  await fixture.seedActiveAgentRevision(namespace.id, agent.id);
+  const agentPath = `/namespaces/${namespace.id}/agents/${agent.id}`;
+  const { page } = await newPage(t, fixture);
+  let answer;
+  await page.route(`${fixture.origin}${agentPath}/stop`, (route) => route.fulfill(answer));
+  await page.route(`${fixture.origin}${agentPath}`, (route) =>
+    route.request().method() === "DELETE" ? route.fulfill(answer) : route.fallback(),
+  );
+  await login(page, fixture, listUrl(namespace.id));
+  const row = page.getByRole("row").filter({ hasText: "Refused Row" });
+  const refresh = page.getByRole("button", { name: "Refresh", exact: true });
+  for (const [kind, status, serverMessage, reason] of [
+    ["stop", 400, "The request does not match the operation contract.", MALFORMED_REQUEST],
+    [
+      "stop",
+      409,
+      "The Agent lifecycle changed during stop.",
+      "The Agent lifecycle changed during stop. Select Refresh before trying again.",
+    ],
+    [
+      "delete",
+      409,
+      RESOURCE_CONFLICT,
+      "Refused Row changed while the request was sent. Select Refresh before trying again.",
+    ],
+    ["delete", 400, "The request does not match the operation contract.", MALFORMED_REQUEST],
+  ]) {
+    answer = apiErrorResponse(
+      status,
+      status === 400 ? "INVALID_REQUEST" : "RESOURCE_CONFLICT",
+      serverMessage,
+    );
+    const stopping = kind === "stop";
+    await waitForEnabled(
+      row.getByRole("button", { name: `${stopping ? "Stop" : "Delete"} Refused Row`, exact: true }),
+    );
+    await row
+      .getByRole("button", { name: `${stopping ? "Stop" : "Delete"} Refused Row`, exact: true })
+      .click();
+    await page
+      .getByRole("dialog", { name: `${stopping ? "Stop" : "Delete"} Refused Row?` })
+      .getByRole("button", {
+        name: stopping ? "Stop Agent" : "Permanently delete Agent",
+        exact: true,
+      })
+      .click();
+    await page
+      .getByText(`Could not ${kind} Refused Row. ${reason}`, { exact: false })
+      .first()
+      .waitFor();
+    assert.equal(await page.getByText(/entered values/).count(), 0);
+    if (status === 409) {
+      await refresh.click();
+    }
+  }
+});
+
 test("Agents list row actions explain missing access and still report a refused or uncertain write", async (t) => {
   const fixture = await createConsoleAppFixture(t, { provisionedPeople: ["row-reader"] });
   await fixture.bootstrap();
@@ -1615,18 +1765,9 @@ test("Agents list row actions explain missing access and still report a refused 
     );
 
   // Hold the first permission read so the reader can open Stop before the real answer arrives.
-  let releaseAdvice;
-  const adviceHeld = new Promise((resolve) => {
-    releaseAdvice = resolve;
+  const advice = await holdRequests(t, page, `${fixture.origin}${agentPath}/permissions`, {
+    once: true,
   });
-  await page.route(
-    `${fixture.origin}${agentPath}/permissions`,
-    async (route) => {
-      await adviceHeld;
-      await route.continue().catch(() => {});
-    },
-    { times: 1 },
-  );
 
   await login(page, fixture, listUrl(namespace.id), person.credentials);
   const row = page.getByRole("row").filter({ hasText: "Guarded Agent" });
@@ -1639,8 +1780,8 @@ test("Agents list row actions explain missing access and still report a refused 
   await stop.click();
   const dialog = page.getByRole("dialog", { name: "Stop Guarded Agent?" });
   await dialog.waitFor();
-  releaseAdvice();
-  await dialog.getByText("Your access does not include stopping this Agent.").waitFor();
+  advice.release();
+  await dialog.getByText(AGENT_STOP_DENIED).waitFor();
   const confirm = dialog.getByRole("button", { name: "Stop Agent" });
   assert.equal(await confirm.isDisabled(), true);
   const cancel = dialog.getByRole("button", { name: "Cancel" });
@@ -1652,8 +1793,28 @@ test("Agents list row actions explain missing access and still report a refused 
   );
 
   // The Agent's real permission read reports neither action, so both icons are disabled with a
-  // visible reason before any confirmation, and nothing is sent.
-  await row.getByText("No access to stop or delete", { exact: true }).waitFor();
+  // visible reason before any confirmation, and nothing is sent. The row's one line names the
+  // grants; the whole reason, with who gives them, is its tooltip and the icons' description.
+  const bothDenied = AGENT_STOP_AND_DELETE_DENIED;
+  await row.getByText(bothDenied, { exact: true }).waitFor();
+  const note = row.locator(".row-action-note");
+  const line = note.locator("[aria-hidden=true]");
+  assert.equal(await line.textContent(), "Needs operate and delete");
+  // The reserved line fits the grant: it is not cut short with an ellipsis.
+  assert.equal(
+    await note.evaluate((node) => node.scrollWidth <= node.clientWidth),
+    true,
+    "the row's note line fits",
+  );
+  assert.equal(await note.getAttribute("title"), bothDenied);
+  assert.equal(
+    await stop.evaluate(
+      (node) =>
+        globalThis.document.getElementById(node.getAttribute("aria-describedby").split(" ")[0])
+          ?.title,
+    ),
+    bothDenied,
+  );
   assert.equal(await stop.isDisabled(), true);
   assert.equal(await remove.isDisabled(), true);
   assert.deepEqual(nonAuthWriteRequests(requests), []);
@@ -1661,7 +1822,7 @@ test("Agents list row actions explain missing access and still report a refused 
   // An operate grant shows after Refresh: Stop becomes available while Delete stays explained.
   const operate = await bind([{ action: "operate", resourceKind: "agent" }], "agent", agent.id);
   await refresh.click();
-  await row.getByText("No access to delete", { exact: true }).waitFor();
+  await row.getByText(AGENT_DELETE_DENIED, { exact: true }).waitFor();
   await stopEnabled();
   assert.equal(await remove.isDisabled(), true);
 
@@ -1674,12 +1835,7 @@ test("Agents list row actions explain missing access and still report a refused 
     .getByRole("dialog", { name: "Stop Guarded Agent?" })
     .getByRole("button", { name: "Stop Agent" })
     .click();
-  await page
-    .getByRole("alert")
-    .getByText(
-      "You do not have permission to stop Guarded Agent. Ask an administrator for Agent operate access.",
-    )
-    .waitFor();
+  await page.getByRole("alert").getByText(stopRefused("Guarded Agent")).waitFor();
   assert.equal(agentStopRequests(requests, namespace.id, agent.id).length, 1);
   assert.equal((await fixture.request("GET", agentPath)).data.desiredRuntimeState, "running");
 
@@ -1749,21 +1905,15 @@ test("Agents list permission advice updates its own row without moving focus els
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
   // Hold only Guarded Agent's permission read; its real answer is released on cue.
-  const holdGuardedAdvice = async () => {
-    let release;
-    const held = new Promise((resolve) => {
-      release = resolve;
-    });
-    await page.route(
-      `${fixture.origin}/namespaces/${namespace.id}/agents/${guarded.id}/permissions`,
-      async (route) => {
-        await held;
-        await route.continue().catch(() => {});
-      },
-      { times: 1 },
-    );
-    return release;
-  };
+  const holdGuardedAdvice = async () =>
+    (
+      await holdRequests(
+        t,
+        page,
+        `${fixture.origin}/namespaces/${namespace.id}/agents/${guarded.id}/permissions`,
+        { once: true },
+      )
+    ).release;
   const focusedText = () => page.evaluate(() => globalThis.document.activeElement?.textContent);
   const guardedRow = page.getByRole("row").filter({ hasText: "Guarded Agent" });
   const otherRow = page.getByRole("row").filter({ hasText: "Other Agent" });
@@ -1772,11 +1922,11 @@ test("Agents list permission advice updates its own row without moving focus els
   // arrives. Guarded Agent's icons must update, and focus must stay where it was.
   let release = await holdGuardedAdvice();
   await login(page, fixture, listUrl(namespace.id), person.credentials);
-  await otherRow.getByText("No access to stop or delete", { exact: true }).waitFor();
+  await otherRow.getByText(AGENT_STOP_AND_DELETE_DENIED, { exact: true }).waitFor();
   const otherLink = otherRow.getByRole("link", { name: "Other Agent" });
   await otherLink.focus();
   release();
-  await guardedRow.getByText("No access to stop or delete", { exact: true }).waitFor();
+  await guardedRow.getByText(AGENT_STOP_AND_DELETE_DENIED, { exact: true }).waitFor();
   assert.equal(
     await guardedRow.getByRole("button", { name: "Stop Guarded Agent" }).isDisabled(),
     true,
@@ -1793,7 +1943,7 @@ test("Agents list permission advice updates its own row without moving focus els
   );
   await guardedStop.focus();
   release();
-  await guardedRow.getByText("No access to stop or delete", { exact: true }).waitFor();
+  await guardedRow.getByText(AGENT_STOP_AND_DELETE_DENIED, { exact: true }).waitFor();
   await page.waitForFunction(
     () => globalThis.document.activeElement?.textContent === "Guarded Agent",
   );

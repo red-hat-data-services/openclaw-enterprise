@@ -11,6 +11,11 @@ export class AuthorizationDeniedError extends Error {
     readonly action: AuthorizationRequest["action"];
     readonly resource: ResourceRef;
   };
+  /**
+   * The principal whose grant was checked. HTTP names the missing grant only when it is the
+   * caller, since IAM Drivers need not report it in `evidence` (finding 2586).
+   */
+  readonly checkedPrincipalId?: string;
 
   constructor(
     message = "The exact platform operation was not authorized.",
@@ -19,6 +24,7 @@ export class AuthorizationDeniedError extends Error {
       readonly action: AuthorizationRequest["action"];
       readonly resource: ResourceRef;
     },
+    checkedPrincipalId?: string,
   ) {
     super(message);
     this.name = "AuthorizationDeniedError";
@@ -33,16 +39,32 @@ export class AuthorizationDeniedError extends Error {
         resource: Object.freeze({ ...authorization.resource }),
       });
     }
+    if (checkedPrincipalId !== undefined) {
+      this.checkedPrincipalId = checkedPrincipalId;
+    }
   }
 }
 
 /**
- * The Agent's own service principal, not the caller, lacks a grant that deployment needs.
- * The caller is already authorized for the Agent, so naming the principal and the missing
- * grant tells an operator exactly what to bind without disclosing anything new.
+ * A denial about the caller's own account, session or role in a job, not a missing grant: a
+ * disabled account, a session that is no longer current, or another actor's provisioning job.
+ * Its message is fixed text about the caller's own state, so HTTP returns it as written.
+ */
+export class CallerStateDeniedError extends AuthorizationDeniedError {}
+
+/**
+ * The Agent's own service principal, not the caller, lacks a grant that deployment needs. The
+ * message names that principal for audit. HTTP answers with its own text instead, which names
+ * the resource only when the caller sent its ID or may read both it and the Agent
+ * (`callerMayReadResource`), since the resource comes from the Agent's stored bindings
+ * (finding 2592).
  */
 export class AgentPrincipalAuthorizationError extends AuthorizationDeniedError {
   readonly principalId: string;
+  /** The Agent whose principal was denied, when the check knew it. */
+  readonly agentId?: string;
+  /** Whether the caller may read both the denied resource and the Agent, checked on denial. */
+  readonly callerMayReadResource: boolean;
   declare readonly authorization: {
     readonly action: AuthorizationRequest["action"];
     readonly resource: ResourceRef;
@@ -53,6 +75,7 @@ export class AgentPrincipalAuthorizationError extends AuthorizationDeniedError {
     action: AuthorizationRequest["action"],
     resource: ResourceRef,
     evidence?: AuthorizationEvidence,
+    context: { readonly agentId?: string; readonly callerMayReadResource?: boolean } = {},
   ) {
     super(
       `The Agent service principal ${principalId} is not authorized to ${action} ${resource.kind} ${resource.id}. Grant that principal ${action} on the ${resource.kind}, then deploy again.`,
@@ -61,6 +84,10 @@ export class AgentPrincipalAuthorizationError extends AuthorizationDeniedError {
     );
     this.name = "AgentPrincipalAuthorizationError";
     this.principalId = principalId;
+    if (context.agentId !== undefined) {
+      this.agentId = context.agentId;
+    }
+    this.callerMayReadResource = context.callerMayReadResource === true;
   }
 }
 
@@ -308,16 +335,25 @@ export class AgentCredentialSourceBindingError extends ScopeViolationError {
 }
 
 /**
- * An Agent's repository bindings combine Installation-wide access with another binding.
- * Raised only after the Repository Driver approved every requested binding, and the rule
- * depends only on the request, so HTTP reports it as an invalid request instead of hiding
- * it as a scope miss. Agent save and deploy admission share it (finding 2316).
+ * An Agent's repository selections break a rule that depends only on them and on the
+ * Installation's repository policy for the Namespace: Installation-wide access combined with
+ * another binding (finding 2316), both selection forms or an invalid `repositoryAccess`, or a
+ * selection the Repository Driver does not approve. Agent save, provisioning and deploy
+ * admission raise it after the caller's grant on the Agent or Namespace, and each text is
+ * fixed: it names no repository, Driver reason or other resource, so HTTP reports it as an
+ * invalid request instead of hiding it as a scope miss (finding 2536).
  */
 export class RepositoryBindingSelectionError extends ScopeViolationError {
-  constructor() {
-    super(
-      "Installation-wide repository access (profile github-installation) must be the Agent's only repository selection. Remove the other entries from repositoryBindings or repositoryAccess.repositories, or select each repository with its own profile instead.",
-    );
+  static readonly installationAccessAlone =
+    "Installation-wide repository access (profile github-installation) must be the Agent's only repository selection. Remove the other entries from repositoryBindings or repositoryAccess.repositories, or select each repository with its own profile instead.";
+  static readonly accessOrBindings =
+    "Send repositoryAccess or repositoryBindings, not both. In repositoryAccess, list each repository once, at most 16, with a defaultProfile other than github-installation.";
+  // The Driver refuses a whole selection without saying which entry; this text lists its rules.
+  static readonly notApproved =
+    "These repository selections are not approved for this Namespace: each repository must be approved here for its profile and listed once, at most 16. Choose from the repository options, or ask an Installation administrator to approve it.";
+
+  constructor(message: string = RepositoryBindingSelectionError.installationAccessAlone) {
+    super(message);
     this.name = "RepositoryBindingSelectionError";
   }
 }
@@ -328,7 +364,8 @@ export class RepositoryBindingSelectionError extends ScopeViolationError {
  * (including missing, runtime or credential-source Harness authentication in Agent
  * provisioning), or
  * any of those, an Agent's Harness authentication, a credential source, or plugin discovery
- * naming a Secret in another Namespace. Messages are static, so HTTP reports them as an
+ * naming a Secret in another Namespace, or Harness authentication naming a ServiceAccount in
+ * another Namespace (checked before any lookup). Messages are static, so HTTP reports them as an
  * invalid request instead of hiding them as a scope miss; Secret existence is still checked
  * later and stays a scope miss.
  */
@@ -1252,14 +1289,22 @@ export class CredentialGatewayNotConfiguredError extends Error {
   }
 }
 
-/** A Driver rejected nonsecret source configuration before registration. */
+/**
+ * A Driver rejected nonsecret source configuration before registration, or OCC rejected a
+ * `config` or `secrets` field the type's catalog does not list or a required one that is
+ * missing. Raised after the caller's grant; the message names only the type, the catalog and
+ * the submitted field (finding 2536).
+ */
 export class CredentialSourceConfigError extends Error {
   readonly field: string;
+  /** The request member that holds `field`. */
+  readonly group: "config" | "secrets";
 
-  constructor(field: string, message: string) {
+  constructor(field: string, message: string, group: "config" | "secrets" = "config") {
     super(message);
     this.name = "CredentialSourceConfigError";
     this.field = field;
+    this.group = group;
   }
 }
 
@@ -1293,6 +1338,99 @@ export class RepositoryDriverNotConfiguredError extends ResourceStateConflictErr
   constructor() {
     super(RepositoryDriverNotConfiguredError.description);
     this.name = "RepositoryDriverNotConfiguredError";
+  }
+}
+
+/**
+ * The selected Compute Driver cannot deliver repository credentials, so an Agent with repository
+ * bindings cannot deploy or be provisioned. An Installation property every attempt meets the same
+ * way (finding 2536), raised only after the caller's Agent or Namespace grant.
+ */
+export class ComputeRepositoryCredentialsUnsupportedError extends ResourceStateConflictError {
+  static readonly description =
+    "This Installation's Compute Driver cannot deliver repository credentials, so this Agent cannot use repository access. Remove its repository bindings, or ask an Installation administrator to select Kubernetes Compute.";
+
+  constructor() {
+    super(ComputeRepositoryCredentialsUnsupportedError.description);
+    this.name = "ComputeRepositoryCredentialsUnsupportedError";
+  }
+}
+
+/**
+ * Repository selections saved on an Agent, or in queued provisioning work, that the Repository
+ * Driver no longer approves: the Installation's repository policy changed after the save. The
+ * request sent no selections, so this is a 409 about saved state, not a 400 (finding 2536).
+ * Raised after the caller's grant on the Agent or Namespace; the fixed text names no repository.
+ */
+export class SavedRepositorySelectionError extends ResourceStateConflictError {
+  static readonly description =
+    "The saved repository selections are no longer approved for this Namespace: repository policy changed after they were saved. Choose approved ones from the repository options, or ask an Installation administrator to approve them again.";
+
+  constructor() {
+    super(SavedRepositorySelectionError.description);
+    this.name = "SavedRepositorySelectionError";
+  }
+}
+
+const CREDENTIAL_PROXY_ADMISSION_MESSAGES = Object.freeze({
+  installationAccess:
+    "Installation-wide repository access (profile github-installation) needs a Credential Proxy, and this Installation selects none. Choose another repository profile, or ask an Installation administrator to select drivers.credential_proxy.",
+  sourcesWithoutProxy:
+    "This Agent binds credential sources admitted under a Credential Proxy, and this Installation no longer selects one. Bind Credential Gateway sources instead, or ask an Installation administrator to select drivers.credential_proxy again.",
+  oneSource:
+    "The selected Credential Proxy cannot verify a reduced policy, so a protected revision can use only one credential source. Remove the others, or ask an Installation administrator to select a Proxy release with policy reduction.",
+  dedicatedSandbox:
+    "With a Credential Proxy, an Agent deploys only as a dedicated Agent under a Sandbox, and this Installation selects no Sandbox Driver. Ask an Installation administrator to select one, or to drop drivers.credential_proxy.",
+  gitAlone:
+    "The selected Credential Proxy cannot add other credential sources beside this Agent's repository Git. Remove those sources or the repository binding, or ask an Installation administrator to select a Proxy with policy reduction.",
+});
+
+/**
+ * Protected deploy admission (OCC `admitProxyPlan`) refuses an Agent the selected, or missing,
+ * Credential Proxy can never start (finding 2536). Each is an Installation property or the
+ * Agent's own saved bindings, raised after the caller's deploy grant and the authorization of
+ * every bound credential source; the fixed texts name no source, repository or ID. A retry
+ * never helps, so HTTP answers 409 and provisioning fails the job at once.
+ */
+export class CredentialProxyAdmissionError extends ResourceStateConflictError {
+  static readonly messages = CREDENTIAL_PROXY_ADMISSION_MESSAGES;
+  readonly reason: keyof typeof CREDENTIAL_PROXY_ADMISSION_MESSAGES;
+
+  constructor(reason: keyof typeof CREDENTIAL_PROXY_ADMISSION_MESSAGES) {
+    super(CREDENTIAL_PROXY_ADMISSION_MESSAGES[reason]);
+    this.name = "CredentialProxyAdmissionError";
+    this.reason = reason;
+  }
+}
+
+const RETRY_LATER_MESSAGES = Object.freeze({
+  registrationFence: (seconds: number) =>
+    `This credential source was registered moments ago, and its registration may still be completing. Retry the deletion in ${seconds === 1 ? "1 second" : `${seconds} seconds`}; nothing else needs to change.`,
+  deviceLoginFailed: () =>
+    "The sign-in service did not complete this device login, so it was cancelled. Start a new device login. If it keeps failing, ask an operator to check the API logs.",
+});
+
+/**
+ * A 503 whose fixed text tells the caller when to retry or what to start again (finding 2536).
+ * Each is raised only after the caller's grant and lookup, and names no resource, so HTTP
+ * returns the text instead of the generic one. It stays a DependencyUnavailableError, so
+ * workers still retry it. A failed device login keeps the Refresh Driver's error as `cause`, so
+ * the API's 503 log record, which the text points the caller to, names that error's class and
+ * code (never its message).
+ */
+export class RetryLaterError extends DependencyUnavailableError {
+  constructor(reason: "deviceLoginFailed", cause: unknown);
+  constructor(reason: "registrationFence", seconds: number);
+  constructor(reason: keyof typeof RETRY_LATER_MESSAGES, detail: unknown) {
+    super(
+      RETRY_LATER_MESSAGES[reason](
+        Math.max(1, Math.ceil(reason === "registrationFence" ? Number(detail) : 0)),
+      ),
+    );
+    this.name = "RetryLaterError";
+    if (reason === "deviceLoginFailed") {
+      this.cause = detail;
+    }
   }
 }
 
