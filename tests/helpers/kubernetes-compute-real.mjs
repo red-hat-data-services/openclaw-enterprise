@@ -494,17 +494,11 @@ export async function assertReadyGateway(namespaceName, agentId, namespaceId, sn
             auth: {
               ...snapshot.configuration.gateway?.auth,
               mode: "trusted-proxy",
-              // Compute keeps explicit identities and grants; omission is machine-only.
               trustedProxy: {
-                ...snapshot.configuration.gateway?.auth?.trustedProxy,
                 userHeader: "x-occ-identity",
-                allowUsers: snapshot.configuration.gateway?.auth?.trustedProxy?.allowUsers ?? [
-                  "occ-workspace-files",
-                ],
+                allowUsers: ["occ-workspace-files"],
               },
-              identityScopes: snapshot.configuration.gateway?.auth?.identityScopes ?? {
-                "occ-workspace-files": ["operator.admin"],
-              },
+              identityScopes: { "occ-workspace-files": ["operator.admin"] },
             },
           },
         };
