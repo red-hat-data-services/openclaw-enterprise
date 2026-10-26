@@ -17,6 +17,14 @@ import type {
   SecretDetailResponse,
   SecretListResponse,
 } from "../../packages/contracts/src/api/resources.ts";
+import { apiErrorResponse, proxyErrorResponse } from "../helpers/api-error.mjs";
+import {
+  CONSOLE_NAMESPACE_NOT_READY,
+  RESOURCE_NOT_FOUND,
+  SECRET_CREATE_DENIED,
+  SECRET_NAME_CONFLICT,
+  tooManyRequestsIn,
+} from "../helpers/refusal-text.mjs";
 import { createConsoleAppFixture } from "../helpers/console-app.mjs";
 import { consoleStorage } from "../helpers/console-storage.mjs";
 import { createTestSecretDriver } from "../helpers/secret-driver.mjs";
@@ -28,6 +36,7 @@ import {
   holdRequests,
   login,
   newPage,
+  pathRequests,
   settledView,
 } from "./console-agents-browser-helpers.mjs";
 
@@ -168,10 +177,7 @@ test("unknown console Secret writes erase entered material and never replay muta
   await create.locator("form").evaluate((form: HTMLFormElement) => {
     form.requestSubmit();
   });
-  assert.equal(
-    requests.filter((item) => item.method === "POST" && item.path === secretPath(namespace)).length,
-    1,
-  );
+  assert.equal(pathRequests(requests, "POST", secretPath(namespace)).length, 1);
   await create.getByRole("button", { name: "Close" }).click();
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await page.getByRole("button", { name: "Uncertain Secret", exact: true }).click();
@@ -263,7 +269,7 @@ test("checking an uncertain deletion cannot mistake another Secret for the delet
   assert.match(await outcome.innerText(), /Could not confirm deletion/);
   assert.equal(await remove.getByText(other.id, { exact: false }).count(), 0);
   assert.equal(await confirm.count(), 0);
-  assert.equal(requests.filter((item) => item.method === "DELETE" && item.path === path).length, 1);
+  assert.equal(pathRequests(requests, "DELETE", path).length, 1);
 });
 
 test("console Secret writes honor read-only access, revocation and a new Agent reference", async (t) => {
@@ -322,6 +328,16 @@ test("console Secret writes honor read-only access, revocation and a new Agent r
   await grant("read", "secret", secret.id);
   const { page } = await newPage(t, fixture, { browser });
   await login(page, fixture, secretsUrl(namespace), member.credentials);
+  // Without Secret create the page never offers creation that the API would refuse after the
+  // dialog is filled in (finding 2365): Create Secret is disabled and the note names why.
+  const createSecret = page.getByRole("button", { name: "Create Secret", exact: true });
+  const createReason = page.getByRole("status").filter({ hasText: SECRET_CREATE_DENIED });
+  await createReason.waitFor();
+  assert.equal(await createSecret.isDisabled(), true);
+  assert.equal(
+    await createSecret.getAttribute("aria-describedby"),
+    await createReason.getAttribute("id"),
+  );
   await page.getByRole("button", { name: privateSecret.name, exact: true }).click();
   const privateDetail = dialog(page, privateSecret.name);
   await privateDetail.getByText(/1 additional consumer/).waitFor();
@@ -390,7 +406,18 @@ test("console Secret writes honor read-only access, revocation and a new Agent r
     }
     await close.click();
   }
-  await page.getByRole("button", { name: "Create Secret", exact: true }).click();
+  // A page that read the permission answer before a revocation still offers creation, as the
+  // API's answer to a creator does; the API refuses the POST.
+  await page.route(`**/namespaces/${namespace.id}/permissions`, async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    await route.fulfill({
+      response,
+      json: { ...body, data: { ...body.data, secrets: { create: true } } },
+    });
+  });
+  await page.reload();
+  await createSecret.click();
   await form.getByLabel("Secret name").fill("Reader cannot create this");
   await value.fill("synthetic-denied-create");
   await expectDenied("Create Secret", "POST", "create");
@@ -438,8 +465,11 @@ test("console Secret writes honor read-only access, revocation and a new Agent r
   await dialog(page, "Delete Secret")
     .getByRole("button", { name: "Permanently delete Secret", exact: true })
     .click();
+  // The API's 409 names the reference the recheck found (finding 2538).
   await dialog(page, "Delete Secret")
-    .getByText(/Deletion is blocked/)
+    .getByText(
+      /^Could not delete this Secret\. The Secret is still referenced by Agent agt_\S+\. Remove those references first\. Close and reopen the Secret to inspect its current consumers\.$/,
+    )
     .waitFor();
   assert.equal((await fixture.request("GET", `${secretPath(namespace)}/${secret.id}`)).status, 200);
 });
@@ -467,10 +497,12 @@ test("a Secret name conflict allows correction, but a Namespace that stops being
   assert.equal(conflict.status(), 409);
   const { error }: ErrorResponse = await conflict.json();
   assert.equal(error.code, "RESOURCE_CONFLICT");
+  // The API's sentence names the rule, so the page shows it instead of guessing (finding 2559).
   await create
     .getByRole("alert")
-    .filter({ hasText: /name may already be in use/ })
+    .filter({ hasText: `The value was not saved. ${SECRET_NAME_CONFLICT} Enter the value again.` })
     .waitFor();
+  assert.equal(await create.getByText(/name may already be in use/).count(), 0);
   assert.equal(await createValue.inputValue(), "");
   assert.equal(await hasFocus(createName), true, "the duplicate name can be corrected here");
   await createName.fill("Another Secret");
@@ -502,10 +534,7 @@ test("a Secret name conflict allows correction, but a Namespace that stops being
     const { error }: ErrorResponse = await response.json();
     assert.equal(error.code, "NAMESPACE_NOT_READY");
     // Both writes were refused because the Namespace changed, not because the name is taken.
-    await form
-      .getByRole("alert")
-      .filter({ hasText: /Namespace.*not ready.*Close and Refresh/ })
-      .waitFor();
+    await form.getByRole("alert").filter({ hasText: CONSOLE_NAMESPACE_NOT_READY }).waitFor();
     const value = form.getByLabel("Value", { exact: true });
     assert.equal(await value.inputValue(), "");
     assert.equal(await value.isDisabled(), true, "a Namespace conflict needs a fresh read");
@@ -524,19 +553,16 @@ test("Secret refusals keep their meaning, and incomplete consumers or a not-read
   const secret = await fixture.createSecret(namespace.id, "Listed Secret", "synthetic-listed");
   const { page } = await newPage(t, fixture, { browser });
   const requests = apiRequests(page, fixture.origin);
-  const refusals: { status: number; code: string }[] = [
-    { status: 429, code: "RATE_LIMITED" },
-    { status: 404, code: "NOT_FOUND" },
+  // The Secret API never answers 429: that refusal comes from a rate limit in front of it (an
+  // ingress or proxy), so it is the proxy's page with no API envelope. The 404 is the API's own.
+  const refusals = [
+    { ...proxyErrorResponse(429), headers: { "retry-after": "30" } },
+    { ...proxyErrorResponse(429), headers: { "retry-after": "600" } },
+    apiErrorResponse(404, "NOT_FOUND", RESOURCE_NOT_FOUND),
   ];
   await page.route(`${fixture.origin}${secretPath(namespace)}`, (route) => {
     const refusal = route.request().method() === "POST" ? refusals.shift() : undefined;
-    return refusal
-      ? route.fulfill({
-          status: refusal.status,
-          contentType: "application/json",
-          body: JSON.stringify({ error: { code: refusal.code, message: "refused" } }),
-        })
-      : route.fallback();
+    return refusal ? route.fulfill(refusal) : route.fallback();
   });
   await login(page, fixture, secretsUrl(namespace));
   await page.getByRole("button", { name: "Create Secret", exact: true }).click();
@@ -548,11 +574,23 @@ test("Secret refusals keep their meaning, and incomplete consumers or a not-read
   await submit.click();
   await create
     .getByRole("alert")
-    .filter({ hasText: "The value was not saved. Check the input and enter it again." })
+    // A rate limit is not an input problem: it says how long the proxy asked to wait.
+    .filter({ hasText: `The value was not saved. ${tooManyRequestsIn(30)} Enter the value again.` })
     .waitFor();
   assert.equal(await value.inputValue(), "");
   assert.equal(await value.isDisabled(), false, "a 429 allows another try");
   assert.equal(await submit.isDisabled(), false);
+  // A long wait reads in minutes.
+  await value.fill("synthetic-rate-limited-longer");
+  await submit.click();
+  await create
+    .getByRole("alert")
+    .filter({
+      hasText:
+        "The value was not saved. Too many requests. Try again in about 10 minutes. Enter the value again.",
+    })
+    .waitFor();
+  assert.equal(tooManyRequestsIn(600), "Too many requests. Try again in about 10 minutes.");
   await value.fill("synthetic-not-found");
   await submit.click();
   await create
@@ -563,10 +601,7 @@ test("Secret refusals keep their meaning, and incomplete consumers or a not-read
     .waitFor();
   assert.equal(await create.getByText(/Outcome unknown/).count(), 0);
   assert.equal(await submit.isDisabled(), true, "a 404 needs a fresh read");
-  assert.equal(
-    requests.filter((item) => item.method === "POST" && item.path === secretPath(namespace)).length,
-    2,
-  );
+  assert.equal(pathRequests(requests, "POST", secretPath(namespace)).length, 3);
   await create.getByRole("button", { name: "Close" }).click();
 
   // A truncated consumer list names no consumer, yet more references exist than it shows.
@@ -644,10 +679,7 @@ test("pending Secret creation blocks navigation and replay, then session loss cl
   await page.goBack();
   await page.waitForURL(new RegExp(`/console/secrets\\?namespace=${namespace.id}`));
   await create.getByText(/Wait for the current request/).waitFor();
-  assert.equal(
-    requests.filter((item) => item.method === "POST" && item.path === secretPath(namespace)).length,
-    1,
-  );
+  assert.equal(pathRequests(requests, "POST", secretPath(namespace)).length, 1);
   held.release();
   await dialog(page, "Secret created").getByRole("button", { name: "Close" }).click();
   await page.getByRole("button", { name: "Create Secret", exact: true }).click();
@@ -684,7 +716,7 @@ test("a reload asks first only while a Secret write is in flight", async (t) => 
   await expectWriteAsksBeforeUnload(t, page, url, {
     method: "POST",
     start: submit,
-    settled: () => create.getByText(/choose a unique name/).waitFor(),
+    settled: () => create.getByText(SECRET_NAME_CONFLICT, { exact: false }).waitFor(),
   });
   await create.getByLabel("Secret name").fill("Reload credential");
   await create.getByLabel("Value", { exact: true }).fill("synthetic-saved-value");

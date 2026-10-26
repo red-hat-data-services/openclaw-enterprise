@@ -1,6 +1,6 @@
 ---
 created: "2026-09-18"
-updated: "2026-10-24"
+updated: "2026-10-25"
 last_updated_session: authoring-run/3ab680f7-bea5-4377-bb8c-14e6b81c49b4
 ---
 
@@ -99,8 +99,9 @@ graph TD
 `OpenClawController.listRepositoryOptions` authorizes Namespace Agent creation or
 exact-Agent update, checks Compute-owned availability, then projects opaque references, names and
 profiles through `GitHubRepositoryPolicy.listOptions`. Exact Harness validation remains at
-deployment. No approvals yields `[]`; closed Namespaces conflict. Classified optional
-discovery failures map to `503 REPOSITORY_OPTIONS_UNAVAILABLE`.
+deployment. No approvals yields `[]`, and no `repository` settings `[]` with `meta.notConfigured`;
+closed Namespaces conflict. Classified optional discovery failures map to
+`503 REPOSITORY_OPTIONS_UNAVAILABLE`.
 
 `createRepositoryFields` searches up to 1,000 choices with 16 attachments.
 `repositorySettings` resolves inheritance through RepositoryPolicyDriver; the database
@@ -136,6 +137,8 @@ preserves them and an empty array clears them.
 `packages/occ/src/index.ts:OpenClawController.admitRepositoryCredentials`
 re-resolves the draft, validates Compute topology and freezes Driver identity,
 grants and an absolute deadline unaffected by renewal or recovery.
+`validateRepositoryBrokerNetworkProxy` then refuses a Codex proxy setting that
+blocks the broker, as Agent save does.
 
 `apps/controller/src/composition/repository-credentials/platform.ts:composeRepositoryAccess`
 constructs `GitHubRepositoryPolicy`, with its ID pinned by the GitHub Backend's `repo`
@@ -241,7 +244,8 @@ bearers. System Git includes
 `/run/oce/repository-credentials/gitconfig`, preserving HOME/global configuration.
 Embedded `repositoryNativeConfiguration` keeps the `gh` router first in
 `tools.exec.pathPrepend`. `AGENT_RUNTIME_ENTRYPOINT` sets Codex's
-`allow_login_shell=false` and `shell_environment_policy.set.PATH`. Model authentication remains intact.
+`allow_login_shell=false` and `shell_environment_policy.set.PATH`, and keeps the Pod's
+`NODE_EXTRA_CA_CERTS` for sandboxed commands. Model authentication remains intact.
 App keys, JWTs, installation tokens and the control socket never enter consumer material.
 The [networking contract](../reference/drivers/kubernetes-compute/networking-and-isolation.md#networking)
 defines Codex plugin and repository-bound filesystem and proxy access, explicit denies,
@@ -366,6 +370,8 @@ denied before reaching the provider, and chat continues.
 
 ## Changelog
 
+- 2026-10-25 00:30: Answer repository options without a repository Driver with no options and `meta.notConfigured`. (finding 2387)
+
 - 2026-10-24 22:30: Name the missing repository Driver. (fix-2361-2362 - 476c1b350)
 
 - 2026-10-22 06:30: Preserve independent authority facts and source recovery. (authoring-run/3ab680f7-bea5-4377-bb8c-14e6b81c49b4 - 221dff2ff7985a19cd34dad392d68cf5549e1136)
@@ -394,12 +400,3 @@ denied before reaching the provider, and chat continues.
 - 2026-10-12 07:39: Recovery fences a reserved receipt whose fence did not commit. (authoring-run/aee1dd2c-5ac0-4499-aaf6-a4c36928423e - b195e54e9b0ce98ead2b2306015a5209325e837b)
 
 - 2026-10-03 16:30: Log a stuck repository cleanup's cause once and slow its rechecks with age. (fix-repo-cleanup-backoff)
-- 2026-10-01 17:20: Point the safe version response projection at its Agent HTTP owner. (authoring-run/bef09bf6-deaa-4189-9568-5f13beb451e7 - 7a6cc931d)
-
-- 2026-09-30 05:21: Deliver broker CA settings to both repository consumers. (01a0ed9e-6c22-7671-9ee1-a58e1df39acd - ab0a1838)
-
-- 2026-09-30 03:57: Recheck material deadlines. (authoring-run/00e5c01e-b8c9-46df-a8ac-45aa0e6932da - 5334a55faf3ced4bf9e0971daad6fd34ad2fe982)
-
-- 2026-09-29 20:00: Trace repository descriptions, inheritance and overrides. (public-pr/374)
-
-[Agent repository credential documentation history](agent-repository-credentials/history.md) preserves the older dated entries.

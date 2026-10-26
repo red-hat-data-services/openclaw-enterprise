@@ -12,16 +12,26 @@ import {
 } from "../../apps/controller/src/drivers/configuration/kubernetes/index.ts";
 import {
   isStaleGeneration,
+  message,
+  namespaceListNeed,
   PROVISIONING_REFUSAL_CODES,
   preAdmissionRefusal,
 } from "../../apps/controller/src/console/agents/list.mts";
-import { ERROR_CODES, PresetValidationError } from "../../packages/contracts/src/index.ts";
+import { requestedValues } from "../../apps/controller/src/http/caller-denial.ts";
+import { NativeIAMDriver } from "../../packages/iam/src/index.ts";
+import {
+  ERROR_CODES,
+  PresetValidationError,
+  RESOURCE_KINDS,
+  SUPPORTED_PERMISSION_ACTIONS,
+} from "../../packages/contracts/src/index.ts";
 import { normalizeRequestSecretBindings } from "../../packages/occ/src/agent-provisioning.ts";
 import {
   AgentCredentialSourceBindingError,
   AgentDeletingError,
   AgentPrincipalAuthorizationError,
   AuthorizationDeniedError,
+  CallerStateDeniedError,
   ChannelCredentialError,
   ChannelDirectoryError,
   ConfigurationGenerationConflictError,
@@ -64,12 +74,22 @@ import {
   ServiceAccountCredentialSecretExistsError,
   ServiceAccountDriverNotConfiguredError,
 } from "../../packages/occ/src/index.ts";
+import {
+  AGENT_NAME_CONFLICT,
+  agentPrincipalDenied,
+  callerDenied,
+  CONSOLE_ACCESS_DENIED,
+  DEPENDENCY_UNAVAILABLE,
+  GENERIC_DENIAL,
+  NAMESPACE_NOT_READY,
+  namespaceListDenied,
+  RESOURCE_CONFLICT,
+  RESOURCE_NOT_FOUND,
+} from "../helpers/refusal-text.mjs";
 
 // Text that must never reach a client: the mappings below that answer with fixed text are
 // checked with an error carrying this message.
 const INTERNAL = "internal detail: postgres row agent_abc in ns_secret";
-const AGENT_NAME_CONFLICT =
-  "An Agent with this name already exists in this Namespace. Choose a different name.";
 const agentResource = { kind: "agent", id: "agt_1", namespaceId: "ns_1" };
 
 function apiError(statusCode) {
@@ -104,7 +124,7 @@ const cases = [
     {
       status: 409,
       code: "RESOURCE_CONFLICT",
-      message: "The requested platform resource already exists.",
+      message: RESOURCE_CONFLICT,
     },
   ],
   [
@@ -138,7 +158,7 @@ const cases = [
     {
       status: 409,
       code: "NAMESPACE_NOT_READY",
-      message: "The requested Namespace is not ready.",
+      message: NAMESPACE_NOT_READY,
     },
   ],
   [
@@ -305,7 +325,7 @@ const cases = [
     {
       status: 409,
       code: "RESOURCE_CONFLICT",
-      message: "The requested platform resource already exists.",
+      message: RESOURCE_CONFLICT,
     },
   ],
 
@@ -767,20 +787,42 @@ const cases = [
     {
       status: 404,
       code: "NOT_FOUND",
-      message: "The requested platform resource was not found.",
+      message: RESOURCE_NOT_FOUND,
     },
   ],
 
   // 401/403: authorization.
   [
-    "a caller denial stays generic",
+    "a caller denial without a checked grant stays generic",
     new AuthorizationDeniedError(INTERNAL),
     {
       status: 403,
       code: "FORBIDDEN",
-      message: "The exact platform operation was not authorized.",
+      message: GENERIC_DENIAL,
     },
   ],
+  [
+    "a checked grant stays generic when no acting caller is known",
+    new AuthorizationDeniedError(
+      INTERNAL,
+      undefined,
+      { action: "update", resource: agentResource },
+      "prn_caller",
+    ),
+    { status: 403, code: "FORBIDDEN", message: GENERIC_DENIAL },
+  ],
+  ...[
+    "The acting account is disabled.",
+    "Only the initiating actor can retry provisioning.",
+    "Only the initiating actor can read provisioning status.",
+    "The human administrator session is no longer current.",
+    "The assigning session is no longer current.",
+    "The acting identity is unavailable.",
+  ].map((reason) => [
+    `a denial about the caller's own state says so: ${reason}`,
+    new CallerStateDeniedError(reason),
+    { status: 403, code: "FORBIDDEN", message: reason },
+  ]),
   [
     "a deletion retry owned by another actor names the condition",
     new DeletionRetryOwnedError("prn_initiator", agentResource),
@@ -791,7 +833,7 @@ const cases = [
     },
   ],
   [
-    "an Agent principal denial names the missing grant",
+    "an Agent principal denial names the Agent's missing grant and who gives it",
     new AgentPrincipalAuthorizationError("prn_agent", "operate", {
       kind: "secret",
       id: "sec_1",
@@ -800,8 +842,7 @@ const cases = [
     {
       status: 403,
       code: "FORBIDDEN",
-      message:
-        "The Agent service principal prn_agent is not authorized to operate secret sec_1. Grant that principal operate on the secret, then deploy again.",
+      message: agentPrincipalDenied("This Agent", "one of its bound Secrets"),
     },
   ],
   [
@@ -810,7 +851,7 @@ const cases = [
     {
       status: 403,
       code: "FORBIDDEN",
-      message: "The exact platform operation was not authorized.",
+      message: GENERIC_DENIAL,
     },
   ],
   [
@@ -828,7 +869,7 @@ const cases = [
     {
       status: 403,
       code: "FORBIDDEN",
-      message: "The exact platform operation was not authorized.",
+      message: GENERIC_DENIAL,
     },
   ],
   [
@@ -887,7 +928,7 @@ const cases = [
     {
       status: 503,
       code: "DEPENDENCY_UNAVAILABLE",
-      message: "A required platform dependency is unavailable.",
+      message: DEPENDENCY_UNAVAILABLE,
     },
   ],
   [
@@ -897,7 +938,7 @@ const cases = [
     {
       status: 503,
       code: "DEPENDENCY_UNAVAILABLE",
-      message: "A required platform dependency is unavailable.",
+      message: DEPENDENCY_UNAVAILABLE,
     },
   ],
   [
@@ -972,7 +1013,7 @@ const cases = [
     {
       status: 503,
       code: "DEPENDENCY_UNAVAILABLE",
-      message: "A required platform dependency is unavailable.",
+      message: DEPENDENCY_UNAVAILABLE,
     },
   ],
   [
@@ -981,7 +1022,7 @@ const cases = [
     {
       status: 503,
       code: "DEPENDENCY_UNAVAILABLE",
-      message: "A required platform dependency is unavailable.",
+      message: DEPENDENCY_UNAVAILABLE,
     },
   ],
   [
@@ -1009,7 +1050,7 @@ const cases = [
     {
       status: 503,
       code: "DEPENDENCY_UNAVAILABLE",
-      message: "A required platform dependency is unavailable.",
+      message: DEPENDENCY_UNAVAILABLE,
     },
   ],
   [
@@ -1391,4 +1432,249 @@ test("a contract message shows fewer problems rather than cut a path below 32 ch
     `The request does not match the operation contract: body /${"0".repeat(40)} has the wrong type (expected string); body /${"1".repeat(40)} has the wrong type (expected string); and 2 more.`,
   );
   assert.equal(failure.details.length, 4);
+});
+
+// Finding 2534: for every grant a platform operation checks, the caller's own denial names it with
+// one prefix, fits the wire cap, names an ID only when the request carried it, and reads the same
+// for a Restriction as for a missing grant.
+test("a caller denial names each checked grant without disclosing a Restriction or an unsent ID", () => {
+  const id = `id_${"a".repeat(125)}`;
+  const evidence = (identityId, restrictionIds = []) => ({
+    ...(identityId === undefined ? {} : { identityId }),
+    groupIds: [],
+    bindingIds: restrictionIds.length > 0 ? ["binding-1"] : [],
+    roleIds: restrictionIds.length > 0 ? ["role-1"] : [],
+    restrictionIds,
+  });
+  for (const kind of RESOURCE_KINDS) {
+    for (const action of SUPPORTED_PERMISSION_ACTIONS[kind]) {
+      const resource = { kind, id, namespaceId: "ns_1" };
+      const label = `${kind}:${action}`;
+      const denied = (reason, decided, requested, checked = "prn_caller") =>
+        requestFailure(
+          new AuthorizationDeniedError(reason, decided, { action, resource }, checked),
+          { requested, actorId: "prn_caller" },
+        ).message;
+      const sent = requestedValues({ params: { namespaceId: "ns_1", resourceId: id } });
+      const restricted = denied(
+        "A matching Restriction denied the operation.",
+        evidence("prn_caller", ["restriction-1"]),
+        sent,
+      );
+      const ungranted = denied(
+        "No explicit scoped binding grants the exact action and resource.",
+        evidence("prn_caller"),
+        sent,
+      );
+      assert.equal(restricted, ungranted, label);
+      assert.match(restricted, /^Not authorized: /, label);
+      assert.ok(restricted.length <= 256, label);
+      assert.doesNotMatch(
+        restricted,
+        /restriction-1|binding-1|role-1|prn_caller|matching|binding grants/,
+        label,
+      );
+      // No Role can hold create, so a create denial never asks for a grant (finding 2581).
+      if (action === "create" && kind !== "installation") {
+        assert.match(
+          restricted,
+          /Only an Installation administrator can create .+: ask one to create it\.$/,
+          label,
+        );
+        assert.doesNotMatch(restricted, /grant/, label);
+      }
+      // An exact resource is named only when the request carried its ID; a create names the
+      // Namespace it targets, and an Installation names nothing.
+      const named = kind !== "installation" && action !== "create";
+      assert.equal(restricted.includes(id), named, label);
+      // Free text and non-reference fields never count as sending an ID (finding 2585).
+      const unsent = denied(
+        "",
+        undefined,
+        requestedValues({ query: { q: id }, body: { name: id, note: "ns_1", tags: [id] } }),
+      );
+      assert.equal(unsent.includes(id), false, label);
+      assert.equal(unsent.includes("ns_1"), false, label);
+      // A decision for another principal, such as an Agent's own, names no grant at all, whether
+      // or not the IAM Driver reported the identity it checked (finding 2586).
+      assert.equal(denied("", evidence("prn_agent"), sent, "prn_agent"), GENERIC_DENIAL, label);
+      assert.equal(denied("", evidence(undefined), sent, "prn_agent"), GENERIC_DENIAL, label);
+      assert.equal(denied("", evidence("prn_caller"), sent, "prn_agent"), GENERIC_DENIAL, label);
+      assert.equal(
+        requestFailure(
+          new AuthorizationDeniedError("", evidence("prn_caller"), { action, resource }),
+          {
+            requested: sent,
+            actorId: "prn_caller",
+          },
+        ).message,
+        GENERIC_DENIAL,
+        label,
+      );
+    }
+  }
+  // An ID outside the plain shape is never echoed, even when the request carried it.
+  const odd = "agt_1\u001b[2J";
+  assert.equal(
+    requestFailure(
+      new AuthorizationDeniedError(
+        "",
+        undefined,
+        { action: "read", resource: { kind: "agent", id: odd, namespaceId: "ns_1" } },
+        "prn_caller",
+      ),
+      { requested: requestedValues({ params: { agentId: odd } }), actorId: "prn_caller" },
+    ).message,
+    callerDenied("Agent read", "an Agent this request uses"),
+  );
+});
+
+// Finding 2592: the resource an Agent's own principal lacks comes from the Agent's stored bindings.
+// The text names it only when the request carried its ID or the caller may read it, names the
+// Agent only when the request carried its ID, and never names the principal.
+test("an Agent principal denial names a bound resource only when the caller sent or may read it", () => {
+  const agentId = "agt_1";
+  const secret = { kind: "secret", id: "sec_1", namespaceId: "ns_1" };
+  const deploy = requestedValues({ params: { namespaceId: "ns_1", agentId } });
+  const answer = (resource, callerMayReadResource, requested = deploy) =>
+    requestFailure(
+      new AgentPrincipalAuthorizationError("prn_agent", "operate", resource, undefined, {
+        agentId,
+        callerMayReadResource,
+      }),
+      { requested, actorId: "prn_caller" },
+    );
+  const hidden = answer(secret, false);
+  assert.equal(hidden.status, 403);
+  assert.equal(hidden.code, "FORBIDDEN");
+  assert.equal(
+    hidden.message,
+    agentPrincipalDenied(`Agent ${agentId}`, "one of its bound Secrets"),
+  );
+  assert.doesNotMatch(hidden.message, /sec_1|prn_agent/);
+  assert.equal(
+    answer(secret, true).message,
+    agentPrincipalDenied(`Agent ${agentId}`, "Secret sec_1"),
+  );
+  // An ID the request itself sent is named even without read, as in the caller's own denials.
+  assert.equal(
+    answer(secret, false, requestedValues({ params: { agentId }, body: { secretId: "sec_1" } }))
+      .message,
+    agentPrincipalDenied(`Agent ${agentId}`, "Secret sec_1"),
+  );
+  // A request that did not carry the Agent's ID, such as a provisioning retry, names no Agent.
+  assert.equal(
+    answer(secret, true, requestedValues({ params: { workId: "work_1" } })).message,
+    agentPrincipalDenied("This Agent", "Secret sec_1"),
+  );
+  const source = { kind: "credential_source", id: "crs_1", namespaceId: "ns_1" };
+  assert.equal(
+    answer(source, false).message,
+    agentPrincipalDenied(
+      `Agent ${agentId}`,
+      "one of its bound credential sources",
+      "credential source operate",
+    ),
+  );
+  // An ID outside the plain shape is never echoed, even when the caller may read it.
+  assert.equal(
+    answer({ ...secret, id: "sec_1\u001b[2J" }, true).message,
+    agentPrincipalDenied(`Agent ${agentId}`, "one of its bound Secrets"),
+  );
+});
+
+// Finding 2586: Native IAM reports no identity for a principal it has not provisioned, so only the
+// principal the error records as checked tells the caller's own denial from another's.
+test("a denial for an unprovisioned principal other than the caller names no grant", async () => {
+  const driver = new NativeIAMDriver({
+    loadNativeIAMState: async () => ({
+      identities: [],
+      groups: [],
+      memberships: [],
+      restrictions: [],
+      roles: [],
+      bindings: [],
+    }),
+  });
+  const resource = { kind: "secret", namespaceId: "ns_1", id: "sec_1" };
+  const checked = (principalId) =>
+    driver.authorize({ principalId, action: "operate", resource }).then((decision) => {
+      assert.equal(decision.allowed, false);
+      assert.equal(decision.evidence?.identityId, undefined);
+      return new AuthorizationDeniedError(
+        decision.reason,
+        decision.evidence,
+        { action: "operate", resource },
+        principalId,
+      );
+    });
+  const denied = {
+    requested: requestedValues({ params: { secretId: "sec_1" } }),
+    actorId: "prn_caller",
+  };
+  assert.equal(requestFailure(await checked("prn_agent"), denied).message, GENERIC_DENIAL);
+  assert.equal(
+    requestFailure(await checked("prn_caller"), denied).message,
+    callerDenied("Secret operate", "Secret sec_1"),
+  );
+});
+
+// Finding 2585: a request names an ID through a path parameter or a reference field (`id`, or a
+// name ending in `Id` or `Ids`) at any depth of its query or body, never through free text.
+test("only path parameters and reference fields count as IDs a request sent", () => {
+  const sent = requestedValues({
+    params: { namespaceId: "ns_path", agentId: "agt_path" },
+    query: { q: "agt_search", cursor: "agt_cursor", revisionId: "rev_query" },
+    body: {
+      configurationId: "cfg_body",
+      name: "cfg_name",
+      secretBindings: [{ name: "TOKEN", secretId: "sec_nested" }],
+      secretIds: ["sec_list"],
+      ref: { kind: "secret", id: "sec_ref" },
+      description: "sec_free",
+    },
+  });
+  for (const id of [
+    "ns_path",
+    "agt_path",
+    "rev_query",
+    "cfg_body",
+    "sec_nested",
+    "sec_list",
+    "sec_ref",
+  ]) {
+    assert.equal(sent(id), true, id);
+  }
+  for (const id of ["agt_search", "agt_cursor", "cfg_name", "TOKEN", "secret", "sec_free"]) {
+    assert.equal(sent(id), false, id);
+  }
+  assert.equal(requestedValues({})("anything"), false);
+  // A path Agent ID also carries that Agent's SandboxPolicy ID, which is derived from it; a body
+  // or query Agent ID does not (finding 2594).
+  const agentUuid = "00000000-0000-4000-8000-000000000001";
+  assert.equal(
+    requestedValues({ params: { agentId: `agt_${agentUuid}` } })(`sbp_${agentUuid}`),
+    true,
+  );
+  assert.equal(
+    requestedValues({ body: { agentId: `agt_${agentUuid}` } })(`sbp_${agentUuid}`),
+    false,
+  );
+  assert.equal(
+    requestedValues({ params: { configurationId: `cfg_${agentUuid}` } })(`sbp_${agentUuid}`),
+    false,
+  );
+});
+
+// The console shows the API's named denial where the view has no grant or refusal of its own,
+// and keeps its own text for an older API's generic denial.
+test("the console shows a named denial unless the view names the grant itself", () => {
+  const named = callerDenied("Agent read", "Agent agt_1");
+  const denial = (serverMessage) => ({ status: 403, code: "FORBIDDEN", serverMessage });
+  assert.equal(message(denial(named)), named);
+  assert.equal(message(denial(GENERIC_DENIAL)), CONSOLE_ACCESS_DENIED);
+  assert.equal(message(denial("The admitted Namespace does not match.")), CONSOLE_ACCESS_DENIED);
+  const need = namespaceListNeed("Secrets");
+  assert.equal(message(denial(named), false, need), namespaceListDenied("Secrets"));
+  assert.equal(message({ ...denial(named), refusal: "View refusal." }), "View refusal.");
 });
