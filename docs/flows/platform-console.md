@@ -1,7 +1,7 @@
 ---
 created: 2026-09-01
-updated: 2026-10-22
-last_updated_session: authoring-run/22b185a7-9ab6-40ac-bcab-9efad66e89e0
+updated: 2026-10-21
+last_updated_session: authoring-run/634a754f-a79e-4aac-94fe-0646caf6a287
 ---
 
 # Platform console request flow

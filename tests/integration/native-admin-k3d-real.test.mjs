@@ -266,8 +266,7 @@ async function redeployWithNativeAdminAccess(topology, publicOrigin, nativeDomai
       ...(values.gateway?.auth ?? {}),
       trustedProxy: {
         ...(values.gateway?.auth?.trustedProxy ?? {}),
-        // Identity grants supply administration; device enrollment need not grant it.
-        deviceAutoApprove: { enabled: true, scopes: ["operator.read", "operator.write"] },
+        deviceAutoApprove: { enabled: true, scopes: ["operator.admin"] },
       },
     },
   };
