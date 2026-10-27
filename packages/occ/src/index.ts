@@ -19,6 +19,7 @@ export {
   preparedGitHubLive,
   readPreparedGitHubMetadata,
 } from "./state/prepared-github-state.ts";
+export type { PreparedGitHubMetadataAdmission } from "./state/prepared-github-state.ts";
 import {
   assertExecutionAdmission,
   assertExecutionReleaseAllowed,
@@ -323,6 +324,7 @@ import {
   SecretValueError,
 } from "./errors.ts";
 import {
+  refuseRetiredOpenClawSettings,
   validateConfigurationSettings,
   validateWorkspaceBootstrapSettings,
 } from "./configuration-settings.ts";
@@ -5670,13 +5672,10 @@ export class OpenClawController {
     }
     // A provisioned revision may probe before activation. It must still be the newest
     // admitted running revision; an older or superseded execution cannot keep using egress.
-    const revisions = await state.revisions.listRevisionMetadata(
-      execution.namespaceId,
-      execution.agentId,
-    );
     if (
-      revisions.at(-1)?.id !== execution.revisionId &&
-      agent.activeRevisionId !== execution.revisionId
+      agent.activeRevisionId !== execution.revisionId &&
+      (await state.revisions.listRevisionMetadata(execution.namespaceId, execution.agentId)).at(-1)
+        ?.id !== execution.revisionId
     ) {
       return deny("withdrawn");
     }
@@ -10028,6 +10027,8 @@ export class OpenClawController {
       // Native workspace setup refuses an invalid bootstrap setting only after the deployment
       // starts (finding 2699).
       validateWorkspaceBootstrapSettings(configuration.values);
+      // The Gateway refuses a setting the pinned OpenClaw retired and does not start (finding 2709).
+      refuseRetiredOpenClawSettings(configuration.values);
       this.validateComputeConfiguration(configuration.values);
       await configurationDriver.validate({ ...configuration, values: admittedConfiguration });
       if (resolveConfiguredHarnessId(admittedConfiguration) !== configuredHarnessId) {
@@ -14100,8 +14101,9 @@ export class OpenClawController {
       return;
     }
     const configuration = await readConfiguration();
-    // Deploy admission's rule for a stored Configuration that predates it (finding 2699).
+    // Deploy admission's rules for a stored Configuration that predates them (findings 2699, 2709).
     validateWorkspaceBootstrapSettings(configuration.values);
+    refuseRetiredOpenClawSettings(configuration.values);
     let configuredHarnessId: string;
     try {
       configuredHarnessId = resolveConfiguredHarnessId(configuration.values);
