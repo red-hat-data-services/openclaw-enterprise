@@ -1,3 +1,4 @@
+import { runOpenClawRuntimeHelper } from "../helpers/plugin-runtime.mjs";
 import { openShellRepositoryAccess } from "../../apps/controller/src/drivers/egress-proxy/openshell-git-runtime.ts";
 import {
   requireConfiguration,
@@ -24,6 +25,7 @@ import {
   PROTECTED_CODEX_WITH_NODE_ENTRYPOINT,
   RUNTIME_WRAPPER_COMMAND,
   SETUP_WRAPPER_COMMAND,
+  gatewayRuntimeEntrypoint,
 } from "../../apps/controller/src/drivers/compute/kubernetes/runtime-entrypoints.ts";
 import {
   nodeProgramArguments,
@@ -419,6 +421,9 @@ test("gateway readiness waits for the updated replica to replace the old ready p
 
   assert.equal(await driver.gatewayReady(ownership, name, namespace), false);
   deployment.status.replicas = 1;
+  deployment.status.observedGeneration = 1;
+  assert.equal(await driver.gatewayReady(ownership, name, namespace), false);
+  deployment.status.observedGeneration = 2;
   assert.equal(await driver.gatewayReady(ownership, name, namespace), true);
 });
 
@@ -2706,7 +2711,11 @@ test("dedicated startup initializes Harness plugins before enrolling its workspa
   const [harness] = read("Deployment", agentName).spec.template.spec.containers;
   const command = [...harness.command, ...harness.args];
   assert.equal(command[0], "/usr/bin/tini");
-  assert.ok(Buffer.byteLength(JSON.stringify(command)) <= EXEC_STRING_BUDGET);
+  const commandBytes = Buffer.byteLength(JSON.stringify(command));
+  assert.ok(
+    commandBytes <= EXEC_STRING_BUDGET,
+    `the serialized Harness command is ${commandBytes} bytes; the budget is ${EXEC_STRING_BUDGET}`,
+  );
   const program = inflateRawSync(
     Buffer.from(command.slice(command.indexOf("-e", 4) + 2).join(""), "base64"),
   );
@@ -6270,12 +6279,12 @@ test("gateway routing derives stable endpoints and exact Envoy HTTPRoutes", asyn
   const plainEnvironment = Object.fromEntries(
     plainPod.containers[0].env.map((entry) => [entry.name, entry]),
   );
-  assert.equal(plainEnvironment.OPENCLAW_CONFIG_PATH.value, "/etc/openclaw/openclaw.json");
+  assert.equal(plainEnvironment.OPENCLAW_CONFIG_PATH.value, "/home/node/.openclaw/openclaw.json");
   assert.deepEqual(
     plainPod.containers[0].volumeMounts.find(({ name }) => name === "openclaw-configuration"),
-    { name: "openclaw-configuration", mountPath: "/etc/openclaw", readOnly: true },
+    { name: "openclaw-configuration", mountPath: "/etc/openclaw-managed", readOnly: true },
   );
-  assert.equal(plainPod.initContainers[0].args[0].includes("copyFileSync"), false);
+  assert.equal(plainPod.initContainers[0].args[0].includes("copyFileSync"), true);
 
   const runtimeDriver = createKubernetesComputeDriver(
     routedOptions({
@@ -8935,8 +8944,7 @@ test("dedicated Codex admission rejects settings its Gateway entrypoint cannot r
         defaults: { ...base.agents.defaults, compaction: { memoryFlush: { enabled: true } } },
       },
     },
-    // Without the plugin entry the entrypoint leaves cron alone.
-    { ...base, cron: "off" },
+
     {
       ...base,
       models: {
@@ -9001,6 +9009,11 @@ test("dedicated Codex admission rejects settings its Gateway entrypoint cannot r
           `Configuration setting ${message}: a dedicated Codex Gateway cannot apply it otherwise.`,
     );
   }
+  assert.throws(
+    () => driver.validateHarnessAuth(codex, auth, { ...base, cron: "off" }),
+    /Configuration setting cron must be an object/,
+    "the dedicated baseline now disables triggers even without a Codex plugin entry",
+  );
   // A long submitted provider key (matched trimmed, so padded with whitespace) is cut, with
   // "…", so the message fits the 256-character error cap and keeps the rule wording
   // (finding 664).
@@ -9565,6 +9578,7 @@ test("dedicated OpenClaw renders an enrolled Harness without exposing model cred
     configurationId: "cfg-native-worker",
     configurationKind: "agent",
     configurationGeneration: 1,
+    gatewayManagedMode: true,
     configuration,
     harness: { id: "openclaw", version: "1.0.0", mode: "dedicated" },
     harnessAuth: apiKeyAuth,
@@ -10002,104 +10016,56 @@ test("dedicated OpenClaw renders an enrolled Harness without exposing model cred
   );
   assert.equal(worker.readinessProbe.timeoutSeconds, 3);
 
-  const nodeRequire = createRequire(import.meta.url);
-  const files = new Map([["/etc/openclaw/openclaw.json", JSON.stringify(configuration)]]);
-  let started = false;
-  // Execute the generated Gateway startup program: every session must use the
-  // enrolled worker without requiring a user-selected Cloud Worker destination.
-  // Keep JSON in the VM realm, as the wrapper's native deep comparison requires.
-  const sandbox = {
-    Buffer,
-    URL,
-    console,
-    process: {
-      env: {
-        HOME: "/home/node",
-        OPENCLAW_CONFIG_PATH: "/etc/openclaw/openclaw.json",
-        OPENCLAW_GATEWAY_PORT: "8080",
-        OPENCLAW_NATIVE_WORKER_PROFILE: "dedicated-native",
-        OPENCLAW_STATE_DIR: "/home/node/.openclaw",
-        OPENCLAW_WORKSPACE_NODE_ID: deviceId,
-      },
-      on() {},
-      exit() {},
-    },
-    setTimeout() {
-      return { unref() {} };
-    },
-    setInterval() {
-      return { unref() {} };
-    },
-    require(specifier) {
-      if (specifier === "node:fs") {
-        return {
-          cpSync() {},
-          existsSync() {
-            return false;
-          },
-          lstatSync() {
-            throw new Error("Unexpected lstat");
-          },
-          mkdirSync() {},
-          readFileSync(path) {
-            const value = files.get(path);
-            if (value === undefined) {
-              throw new Error(`Unexpected read: ${path}`);
-            }
-            return value;
-          },
-          readdirSync() {
-            return [];
-          },
-          rmSync() {},
-          writeFileSync(path, value) {
-            files.set(path, value);
-          },
-        };
-      }
-      if (specifier === "node:child_process") {
-        return {
-          spawn() {
-            started = true;
-            return { kill() {}, on() {} };
-          },
-          spawnSync() {
-            throw new Error("Unexpected child process");
-          },
-        };
-      }
-      return nodeRequire(specifier);
+  // Execute the production launcher with the admitted worker identity and the
+  // candidate image's source identity; native image tests qualify its binary.
+  const runtimeOptions = {
+    baseConfig: configuration,
+    files: [["/etc/openclaw-managed/openclaw.json", JSON.stringify(configuration)]],
+    env: {
+      OPENCLAW_GATEWAY_PORT: "8080",
+      OPENCLAW_NATIVE_WORKER_PROFILE: "dedicated-native",
+      OPENCLAW_STATE_DIR: "/home/node/.openclaw",
+      OPENCLAW_WORKSPACE_NODE_ID: deviceId,
     },
   };
-  await runInNewContext(GATEWAY_RUNTIME_ENTRYPOINT, sandbox);
-  assert.equal(started, true);
+  const { files, calls, sandbox } = await runOpenClawRuntimeHelper(undefined, [], runtimeOptions);
+  assert.equal(
+    calls.some(({ args }) => args?.[1] === "gateway"),
+    true,
+  );
   const effectiveConfiguration = JSON.parse(files.get("/home/node/.openclaw/openclaw.json"));
   assert.equal(effectiveConfiguration.cloudWorkers.requiredProfile, "dedicated-native");
   assert.deepEqual(effectiveConfiguration.cloudWorkers.profiles["dedicated-native"], {
     provider: "device",
     settings: { device: deviceId, inference: "worker" },
   });
-  // Restart the wrapper against its generated writable configuration. The
-  // admitted revision still owns the profile; only the exact generated value is reusable.
-  started = false;
-  const restart = {
-    ...sandbox,
-    process: { ...sandbox.process, env: { ...sandbox.process.env } },
-  };
-  await runInNewContext(GATEWAY_RUNTIME_ENTRYPOINT, restart);
-  assert.equal(started, true);
+  // Restart against the writable configuration: reuse only the exact admitted worker profile.
+  const restartOptions = { ...runtimeOptions, env: { ...sandbox.process.env }, files };
+  const restarted = await runOpenClawRuntimeHelper(undefined, [], restartOptions);
+  assert.equal(
+    restarted.calls.some(({ args }) => args?.[1] === "gateway"),
+    true,
+  );
 
   effectiveConfiguration.cloudWorkers.profiles["dedicated-native"].settings.device = "b".repeat(64);
-  files.set("/home/node/.openclaw/openclaw.json", JSON.stringify(effectiveConfiguration));
-  started = false;
+  const conflictingFiles = new Map(restarted.files);
+  conflictingFiles.set(
+    "/home/node/.openclaw/openclaw.json",
+    JSON.stringify(effectiveConfiguration),
+  );
+  const conflictingCalls = [];
   await assert.rejects(
-    runInNewContext(GATEWAY_RUNTIME_ENTRYPOINT, {
-      ...sandbox,
-      process: { ...sandbox.process, env: { ...sandbox.process.env } },
+    runOpenClawRuntimeHelper(undefined, [], {
+      ...restartOptions,
+      files: conflictingFiles,
+      calls: conflictingCalls,
     }),
     /worker profile conflicts with admitted configuration/u,
   );
-  assert.equal(started, false);
+  assert.equal(
+    conflictingCalls.some(({ args }) => args?.[1] === "gateway"),
+    false,
+  );
 });
 
 test("account-token authentication grants only the exact Codex revision outbound HTTPS", () => {
@@ -11439,7 +11405,8 @@ test("Kubernetes status readback skips provider-fenced Harness Pods", async () =
   assert.notEqual(ordinaryObservation.agentStatus, undefined);
 });
 
-async function exerciseEmbeddedReplacement({ providerId, model, environmentName, api, baseUrl }) {
+async function exerciseEmbeddedReplacement(scenario) {
+  const { providerId, model, environmentName, api, baseUrl, predecessorManagedMode } = scenario;
   const modelRef = `${providerId}/${model}`;
   const driver = createKubernetesComputeDriver(
     routedOptions({
@@ -11463,6 +11430,7 @@ async function exerciseEmbeddedReplacement({ providerId, model, environmentName,
     configurationId: "cfg_00000000-0000-4000-8000-000000000077",
     configurationKind: "agent",
     configurationGeneration: 1,
+    gatewayManagedMode: true,
     harness: { id: "openclaw", version: "1.0.0", mode: "embedded" },
     harnessAuth: apiKeyAuth,
     compute: { id: driver.id, implementation: driver.implementation },
@@ -11474,6 +11442,7 @@ async function exerciseEmbeddedReplacement({ providerId, model, environmentName,
     ...base,
     id: "revision-embedded-recovery-bad",
     revision: 7,
+    gatewayManagedMode: predecessorManagedMode,
     configuration: {
       agents: { defaults: { model: modelRef } },
       logging: {
@@ -11808,6 +11777,7 @@ async function exerciseEmbeddedReplacement({ providerId, model, environmentName,
   });
 
   const expected = { namespaceId: tenant.id, agentId, revisionId: replacement.id };
+  assert.equal(driver.requiresStoppedPredecessors(replacement), false);
   assert.deepEqual(await driver.prepareRevision(replacement, authContext(replacement)), {
     ...expected,
     ready: true,
@@ -11859,6 +11829,22 @@ async function exerciseEmbeddedReplacement({ providerId, model, environmentName,
   const replaced = objects.get(key("Deployment", gatewayName));
   assert.equal(replaced.metadata.annotations["openclaw.dev/agent-revision-id"], replacement.id);
   assert.equal(replaced.spec.strategy.type, "Recreate");
+  for (const [deployment, managed] of [
+    [predecessor, predecessorManagedMode],
+    [replaced, true],
+  ]) {
+    const container = deployment.spec.template.spec.containers[0];
+    assert.equal(
+      containerProgram(container).includes('"OPENCLAW_DISABLE_GATEWAY_LOCAL_TERMINALS":"1"'),
+      managed,
+    );
+    if (!managed) {
+      assert.equal(
+        container.env.find(({ name }) => name === "OPENCLAW_CONFIG_PATH").value,
+        "/home/node/.openclaw/openclaw.json",
+      );
+    }
+  }
   assert.deepEqual(
     [...objects.values()]
       .filter(({ kind }) => kind === "Deployment")
@@ -11956,6 +11942,7 @@ test("embedded replacement cuts over an unready shared gateway and waits for act
       environmentName: "OPENAI_API_KEY",
       api: "openai-responses",
       baseUrl: "https://api.openai.com/v1",
+      predecessorManagedMode: false,
     },
     {
       providerId: "anthropic",
@@ -11963,6 +11950,7 @@ test("embedded replacement cuts over an unready shared gateway and waits for act
       environmentName: "ANTHROPIC_API_KEY",
       api: "anthropic-messages",
       baseUrl: "https://api.anthropic.com",
+      predecessorManagedMode: true,
     },
   ]) {
     await t.test(scenario.providerId, () => exerciseEmbeddedReplacement(scenario));
@@ -14396,7 +14384,7 @@ test("an owner cancellation ends a Kubernetes retry wait at once", async () => {
   assert.ok(Date.now() - started < 1_500);
 });
 
-test("revision lifecycle rejects another driver or missing identity before cluster access", async () => {
+test("revision lifecycle rejects invalid ownership and unsupported workloads before cluster access", async () => {
   const driver = createKubernetesComputeDriver(options());
   const revision = {
     id: "revision-a-1",
@@ -14407,6 +14395,7 @@ test("revision lifecycle rejects another driver or missing identity before clust
     configurationId: "cfg_00000000-0000-4000-8000-000000000001",
     configurationKind: "agent",
     configurationGeneration: 1,
+    gatewayManagedMode: false,
     configuration: {
       agents: { defaults: { model: "codex/gpt-5" } },
       gateway: { controlUi: { enabled: false } },
@@ -14423,6 +14412,16 @@ test("revision lifecycle rejects another driver or missing identity before clust
     servicePrincipalId: "service-principal-agent-a",
     createdAt: tenant.createdAt,
   };
+
+  const managed = { ...revision, gatewayManagedMode: true };
+  const unsupportedManaged = {
+    name: "ConfigurationHarnessError",
+    message:
+      "Agent setting gatewayManagedMode requires a supported Gateway runtime on Kubernetes Compute.",
+  };
+  assert.throws(() => driver.admitRevision(managed), unsupportedManaged);
+  await assert.rejects(driver.prepareRevision(managed), unsupportedManaged);
+  await assert.rejects(driver.activateRevision(managed), unsupportedManaged);
 
   for (const provider of ["slack", "msteams"]) {
     for (const configuration of [{ enabled: true }, { accounts: { support: { enabled: true } } }]) {
@@ -15228,6 +15227,7 @@ test("Gateway and Harness storage are separate and preserve ephemeral Codex cred
           name: "configuration-2",
           revision: 2,
           revisionId: "revision-2",
+          gatewayManagedMode: false,
           annotations: {},
           loggingLevel: "info",
         },
@@ -18544,6 +18544,60 @@ test("external ChatGPT source preparation delivers the exact placeholder and acc
   }
 });
 
+test("only the ordinary embedded Gateway gets the Pod-local recovery key", async () => {
+  for (const variant of ["embedded", "dedicated", "custom-environment"]) {
+    const { driver, revision, objects, context } = workspaceSetupFixture(variant !== "dedicated");
+    if (variant === "custom-environment") {
+      driver.setLifecycleDrivers([
+        {
+          id: "custom-environment",
+          capability: "configuration",
+          implementation: "test",
+          computeLifecycleHooks: {
+            async beforeWorkloadStart(_revision, launch) {
+              launch.environment.EXTRA_INPUT = "opaque-key";
+            },
+          },
+        },
+      ]);
+    }
+    await driver.prepareRevision(revision, context);
+    const deployments = [...objects.values()].filter(({ kind }) => kind === "Deployment");
+    assert.ok(deployments.length > 0);
+    for (const { spec } of deployments) {
+      const pod = spec.template.spec;
+      const gateway = pod.containers[0];
+      const volumes = pod.volumes.filter(({ name }) => name.startsWith("gateway-owner-"));
+      const marker = gateway.env.find(({ name }) => name === "OPENCLAW_EMBEDDED_GATEWAY_OWNER");
+      if (variant !== "embedded") {
+        assert.deepEqual(volumes, [], variant);
+        assert.equal(marker, undefined, variant);
+        continue;
+      }
+      assert.equal(marker.value, "1");
+      assert.equal(
+        gateway.env.find(({ name }) => name === "OPENCLAW_POD_UID").valueFrom.fieldRef.fieldPath,
+        "metadata.uid",
+      );
+      assert.equal(pod.containers.length, 1);
+      assert.equal(pod.shareProcessNamespace, undefined);
+      assert.deepEqual(
+        volumes.map(({ emptyDir }) => emptyDir.medium),
+        ["Memory", "Memory"],
+      );
+      const key = { name: "gateway-owner-key", mountPath: "/run/oce-gateway-owner-key" };
+      const scratch = { name: "gateway-owner-start", mountPath: "/run/oce-gateway-owner-start" };
+      const mounts = (container) =>
+        container.volumeMounts.filter(({ name }) => volumes.some((volume) => volume.name === name));
+      assert.deepEqual(mounts(gateway), [{ ...key, readOnly: true }, scratch]);
+      const keyInits = pod.initContainers.filter((init) => mounts(init).length > 0);
+      assert.equal(keyInits.length, 1);
+      // An init that also mounts the writable Agent state could follow a link planted there.
+      assert.deepEqual(keyInits[0].volumeMounts, [key, scratch]);
+    }
+  }
+});
+
 for (const embedded of [true, false]) {
   test(`Kubernetes ${embedded ? "embedded" : "dedicated"} setup stays private and retains only its completion guard`, async () => {
     const { driver, revision, objects, records, state, setup, context } =
@@ -18750,9 +18804,11 @@ test("rendered exec arguments and environment values stay within the per-string 
       // Runtime programs travel as bounded pieces and arrive intact.
       const program = containerProgram(spec.template.spec.containers[0]);
       assert.ok(
-        [GATEWAY_RUNTIME_ENTRYPOINT, AGENT_RUNTIME_ENTRYPOINT, AGENT_WITH_NODE_ENTRYPOINT].some(
-          (entrypoint) => program.endsWith(withoutLineComments(entrypoint)),
-        ),
+        [
+          gatewayRuntimeEntrypoint(revision.gatewayManagedMode),
+          AGENT_RUNTIME_ENTRYPOINT,
+          AGENT_WITH_NODE_ENTRYPOINT,
+        ].some((entrypoint) => program.endsWith(withoutLineComments(entrypoint))),
       );
     }
   }
@@ -22223,5 +22279,67 @@ test("Kubernetes embedded setup uses a Main roster entry's workspace", async () 
   assert.equal(
     containerProgram(gateway.spec.template.spec.containers[0]).includes("/srv/elsewhere"),
     false,
+  );
+});
+
+test("dedicated Gateway tool policy is checked at Agent admission for both Harnesses", () => {
+  const driver = new KubernetesComputeDriver(options());
+  const rejectedPolicies = [
+    [{ allow: ["plugins"] }, /must not grant Gateway administrative tools/],
+    [{ allow: ["gateway_exec"] }, /must not grant Gateway administrative tools/],
+    [{ allow: ["group:runtime"] }, /concrete tool/],
+    [{ allow: ["message"], actions: { message: ["set-profile"] } }, /reviewed task actions/],
+    [{ allow: ["sessions"] }, /actions.sessions must list/],
+    [null, /must be an object/],
+  ];
+  for (const id of ["openclaw", "codex"]) {
+    const harness = { id, version: "1.0.0", mode: "dedicated" };
+    const config = createHarnessConfiguration(id, "gpt-4o-mini");
+    for (const [gatewayPolicy, expected] of rejectedPolicies) {
+      assert.throws(
+        () =>
+          driver.validateHarnessAuth(
+            harness,
+            apiKeyAuth,
+            {
+              ...config,
+              tools: { gatewayPolicy },
+            },
+            null,
+          ),
+        expected,
+      );
+    }
+    for (const gatewayPolicy of [
+      undefined,
+      { allow: [] },
+      { allow: ["sessions", "diffs"], actions: { sessions: ["patch"] } },
+    ]) {
+      assert.doesNotThrow(() =>
+        driver.validateHarnessAuth(
+          harness,
+          apiKeyAuth,
+          {
+            ...config,
+            tools: gatewayPolicy === undefined ? {} : { gatewayPolicy },
+          },
+          null,
+        ),
+      );
+    }
+  }
+  const embedded = { id: "openclaw", version: "1.0.0", mode: "embedded" };
+  assert.doesNotThrow(
+    () =>
+      driver.validateHarnessAuth(
+        embedded,
+        apiKeyAuth,
+        {
+          ...createHarnessConfiguration("openclaw", "gpt-4o-mini"),
+          tools: { gatewayPolicy: { allow: ["gateway"] } },
+        },
+        null,
+      ),
+    "dedicated baseline does not alter embedded configuration",
   );
 });
