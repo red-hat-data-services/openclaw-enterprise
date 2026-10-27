@@ -14,6 +14,7 @@ import {
 } from "../../packages/occ/src/credential-proxy.ts";
 import { EgressSendReceipts } from "../../packages/occ/src/egress-send-receipts.ts";
 import { InMemoryPlatformState } from "../../packages/occ/src/state/platform-state.ts";
+import { deferred } from "../helpers/deferred.ts";
 import { syntheticDispatchFixture } from "../helpers/static-egress.mjs";
 
 async function exchange(t: TestContext, key: string | undefined) {
@@ -62,19 +63,16 @@ async function exchange(t: TestContext, key: string | undefined) {
   };
   let captured: CapturedEgressUse | undefined;
   let check = ports.check;
+  const begin = receipts.begin.bind(receipts);
+  receipts.begin = async (sender, attempt) => {
+    const begun = await begin(sender, attempt);
+    afterBegin?.();
+    return begun;
+  };
   const proxy = new CredentialProxy({
     ...ports,
     installation: async () => installation,
-    receipts: {
-      begin: async (sender, attempt) => {
-        const begun = await receipts.begin(sender, attempt);
-        afterBegin?.();
-        return begun;
-      },
-      authorize: (...args) => receipts.authorize(...args),
-      record: (...args) => receipts.record(...args),
-      observe: (...args) => receipts.observe(...args),
-    },
+    receipts,
     check: (...args) => {
       checks += 1;
       return check(...args);
@@ -483,14 +481,6 @@ test("exchange send snapshots authenticated peers across receipt reservation", a
     }
   }
 });
-
-function deferred() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((done) => {
-    resolve = done;
-  });
-  return { promise, resolve };
-}
 
 test("exchange reserves simultaneous response phases without discarding the winner", async (t) => {
   for (const first of ["claim", "renew"] as const) {

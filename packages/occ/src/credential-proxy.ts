@@ -28,7 +28,6 @@ import type {
   EgressSelectionEvidence,
   ProtectedEgressSource,
   PreparedTokenIssuer,
-  PreparedTokenSource,
   StaticEgressSource,
   VersionedSecretValue,
 } from "@openclaw-enterprise/contracts";
@@ -46,11 +45,23 @@ export type {
   EgressStreamProgress,
 } from "@openclaw-enterprise/contracts";
 
+/** Process-local selection for one exchange; never serialized with source or material evidence. */
+export interface ExchangeProvider {
+  readonly receiver: CredentialProviderDefinition;
+  readonly methods: Readonly<
+    Pick<
+      CredentialProviderDefinition,
+      "classify" | "inject" | "normalizeGrant" | "credentialRejected" | "protectResponse"
+    >
+  >;
+  readonly isCurrent: () => boolean;
+}
+
 export interface EgressAuthorityPorts {
   readonly exchangeOwner: EgressExchangeOwner;
   readonly now: () => number;
   installation(peer: EgressPeer): Promise<EgressInstallation | undefined>;
-  provider(route: EgressRoute): CredentialProviderDefinition | undefined;
+  provider(route: EgressRoute): CredentialProviderDefinition | "ambiguous" | undefined;
   /**
    * Each call must open a new policy unit, independent of the capture and Secret read.
    * With `stream`, the check runs during a leased response: it is bounded by the lease,
@@ -60,20 +71,23 @@ export interface EgressAuthorityPorts {
     use: CapturedEgressUse,
     material?: EgressSelectionEvidence,
     stream?: { readonly until: string },
+    provider?: ExchangeProvider,
   ): Promise<ProtectedEgressSource | EgressRefusal>;
   read(
     source: StaticEgressSource,
     lifetime: CredentialReadLifetime,
+    isProviderCurrent: () => boolean,
   ): Promise<VersionedSecretValue & { readonly materialId: string }>;
   readonly readPrepared?: PreparedTokenIssuer["readWarm"];
-  /** The exact current selection and the possible-send receipt share this transaction. */
-  authorizePrepared?(
+  /** Check the exact selection, then mint once immediately before the possible-send receipt. */
+  authorizeSend(
     use: CapturedEgressUse,
-    source: PreparedTokenSource,
+    source: ProtectedEgressSource,
     attempt: SendAttempt,
-    authorization: AuthorizedSend,
+    mintAuthorization: () => AuthorizedSend | EgressRefusal,
+    provider: ExchangeProvider,
   ): Promise<StoredSendReceipt | EgressRefusal>;
-  readonly receipts: Pick<EgressSendReceipts, "begin" | "authorize" | "record" | "observe">;
+  readonly receipts: Pick<EgressSendReceipts, "begin" | "record" | "observe">;
 }
 
 /**
@@ -253,7 +267,7 @@ interface OperationCharge {
 interface OperationRecord {
   readonly charge: OperationCharge;
   readonly use: CapturedEgressUse;
-  readonly provider: CredentialProviderDefinition;
+  readonly provider: ExchangeProvider;
   readonly source: ProtectedEgressSource;
   readonly evidence: EgressSelectionEvidence;
   readonly attempt: SendAttempt;
@@ -274,6 +288,47 @@ interface OperationRecord {
   streamCheckAttemptedAt?: number;
   timer?: ReturnType<typeof setTimeout>;
   release?: () => void;
+}
+
+function captureProvider(
+  ports: EgressAuthorityPorts,
+  route: EgressRoute,
+): ExchangeProvider | "ambiguous" | undefined {
+  const receiver = ports.provider(route);
+  if (!receiver || receiver === "ambiguous") {
+    return receiver;
+  }
+  const ref = immutableCopy(receiver.ref);
+  const methods = Object.freeze({
+    classify: receiver.classify,
+    inject: receiver.inject,
+    normalizeGrant: receiver.normalizeGrant,
+    credentialRejected: receiver.credentialRejected,
+    protectResponse: receiver.protectResponse,
+  });
+  let current = true;
+  return Object.freeze({
+    receiver,
+    methods,
+    isCurrent: () => {
+      if (!current) {
+        return false;
+      }
+      try {
+        current =
+          ports.provider(route) === receiver &&
+          isDeepStrictEqual(receiver.ref, ref) &&
+          receiver.classify === methods.classify &&
+          receiver.inject === methods.inject &&
+          receiver.normalizeGrant === methods.normalizeGrant &&
+          receiver.credentialRejected === methods.credentialRejected &&
+          receiver.protectResponse === methods.protectResponse;
+      } catch {
+        current = false;
+      }
+      return current;
+    },
+  });
 }
 
 function refuse(
@@ -536,14 +591,39 @@ export class CredentialProxy implements CredentialProxyExchange {
     ) {
       return refuse("identity");
     }
-    const matches = installation.plan.routes.flatMap((route) => {
+    // Select every candidate before invoking a classifier: one classifier cannot replace
+    // the provider of a later route and make that substitute the original selection.
+    const candidates: { route: EgressRoute; provider: ExchangeProvider }[] = [];
+    for (const route of installation.plan.routes) {
       if (request.bindingId !== undefined && route.binding.binding.id !== request.bindingId) {
-        return [];
+        continue;
       }
-      const provider = this.ports.provider(route);
-      const operation = provider?.classify(route, request);
-      return provider && operation ? [{ route, provider, operation }] : [];
-    });
+      const provider = captureProvider(this.ports, route);
+      if (provider === "ambiguous") {
+        return refuse("stale_configuration");
+      }
+      if (provider) {
+        candidates.push({ route, provider });
+      }
+    }
+    const matches = [];
+    for (const { route, provider } of candidates) {
+      if (!provider.isCurrent()) {
+        return refuse("stale_configuration");
+      }
+      let operation;
+      try {
+        operation = Reflect.apply(provider.methods.classify, provider.receiver, [route, request]);
+      } catch {
+        return refuse("unsupported_operation");
+      }
+      if (!provider.isCurrent()) {
+        return refuse("stale_configuration");
+      }
+      if (operation) {
+        matches.push({ route, provider, operation });
+      }
+    }
     if (matches.length !== 1) {
       return refuse(matches.length > 1 ? "ambiguous_route" : "unsupported_operation");
     }
@@ -575,7 +655,7 @@ export class CredentialProxy implements CredentialProxyExchange {
     }
     let source: ProtectedEgressSource | EgressRefusal;
     try {
-      source = await this.ports.check(captured);
+      source = await this.ports.check(captured, undefined, undefined, provider);
     } catch {
       return { kind: "refused", error: { kind: "unavailable", code: "authority" } };
     }
@@ -591,6 +671,9 @@ export class CredentialProxy implements CredentialProxyExchange {
       if (this.ports.now() >= deadline) {
         return { kind: "deadline_exceeded" };
       }
+      if (!provider.isCurrent()) {
+        return { kind: "denied", code: "stale_configuration" };
+      }
     };
     const beforeSelection = accessEnded();
     if (beforeSelection) {
@@ -598,7 +681,7 @@ export class CredentialProxy implements CredentialProxyExchange {
     }
     try {
       // Recheck the same accepted response owner after selection, including any independent material read.
-      const material = await this.selectMaterial(source, captured, signal);
+      const material = await this.selectMaterial(source, captured, signal, provider);
       const afterSelection = accessEnded();
       if (afterSelection) {
         return { kind: "refused", error: afterSelection };
@@ -611,7 +694,13 @@ export class CredentialProxy implements CredentialProxyExchange {
         return { kind: "refused", error: { kind: "not_ready", code: "material_missing" } };
       }
       const headers =
-        evidence.kind === "no_material_required" ? [] : provider.inject(material.value!);
+        evidence.kind === "no_material_required"
+          ? []
+          : Reflect.apply(provider.methods.inject, provider.receiver, [material.value!]);
+      const afterInjection = accessEnded();
+      if (afterInjection) {
+        return { kind: "refused", error: afterInjection };
+      }
       const digest = egressInjectionDigest(headers);
       const handle = randomUUID();
       const record: OperationRecord = {
@@ -657,6 +746,7 @@ export class CredentialProxy implements CredentialProxyExchange {
     source: ProtectedEgressSource,
     use: CapturedEgressUse,
     signal: AbortSignal,
+    provider: ExchangeProvider,
   ): Promise<{ value?: string; evidence: EgressSelectionEvidence } | EgressRefusal> {
     const { route, request } = use;
     const deadline = Date.parse(request.deadlineAt);
@@ -733,7 +823,7 @@ export class CredentialProxy implements CredentialProxyExchange {
     if (use.operation.kind !== "inference") {
       return { kind: "denied", code: "scope_mismatch" };
     }
-    const material = await this.ports.read(source, lifetime);
+    const material = await this.ports.read(source, lifetime, provider.isCurrent);
     const observed = Date.parse(material.authoritativeObservedAt);
     const usableUntil = Math.min(
       deadline,
@@ -908,88 +998,95 @@ export class CredentialProxy implements CredentialProxyExchange {
       return deny({ kind: "cancelled" });
     }
     // Fresh transport and policy checks follow possibly slow durable persistence and exact selection.
-    let decision: ProtectedEgressSource | EgressRefusal;
     let finalPeer: EgressPeer | undefined;
     try {
       finalPeer = await this.verifyPeer(authorization);
       if (!finalPeer || !isDeepStrictEqual(finalPeer, peer)) {
         return deny({ kind: "denied", code: "identity" });
       }
-      // Prepared currentness must stay locked through receipt commit below.
-      decision =
-        record.source.adoption === "prepared"
-          ? record.source
-          : await this.ports.check(record.use, record.evidence);
     } catch {
       return deny({ kind: "unavailable", code: "authority" });
-    }
-    if (!("key" in decision) || !isDeepStrictEqual(decision, record.source)) {
-      return deny("key" in decision ? { kind: "denied", code: "stale_configuration" } : decision);
     }
     if (signal.aborted) {
       return deny({ kind: "cancelled" });
     }
-    const now = this.ports.now();
-    const sendStartBy = Math.min(
-      now + 1000,
-      Date.parse(record.use.request.deadlineAt),
-      record.evidence.kind === "no_material_required"
-        ? Infinity
-        : Date.parse(record.evidence.usableUntil),
-      Date.parse(finalPeer.expiresAt),
-      record.peerExpiresAt,
-    );
-    if (
-      !(sendStartBy > now) ||
-      this.records.get(handle) !== record ||
-      record.phase !== "checking"
-    ) {
-      return deny({ kind: "deadline_exceeded" });
-    }
-    const authorized: AuthorizedSend = immutableCopy({
-      association: record.association,
-      requestDigest: createHash("sha256")
-        .update(
-          JSON.stringify({
-            ...record.use.request,
-            body: Buffer.from(record.use.request.body).toString("base64"),
-          }),
-        )
-        .digest("hex"),
-      injectionDigest: record.digest,
-      authorizedAt: new Date(now).toISOString(),
-      sendStartBy: new Date(sendStartBy).toISOString(),
-    });
+    let authorized: AuthorizedSend | undefined;
+    let sendStartBy = 0;
+    const mintAuthorization = (): AuthorizedSend | EgressRefusal => {
+      // This closure belongs to one reserved registration; a permit is never extended.
+      if (authorized || signal.aborted || !this.owns(record.association, record.use)) {
+        return { kind: "cancelled" };
+      }
+      const now = this.ports.now();
+      sendStartBy = Math.min(
+        now + 1000,
+        Date.parse(record.use.request.deadlineAt),
+        record.evidence.kind === "no_material_required"
+          ? Infinity
+          : Date.parse(record.evidence.usableUntil),
+        Date.parse(finalPeer.expiresAt),
+        record.peerExpiresAt,
+      );
+      if (
+        !(sendStartBy > now) ||
+        this.records.get(handle) !== record ||
+        record.phase !== "checking"
+      ) {
+        return { kind: "deadline_exceeded" };
+      }
+      if (!record.provider.isCurrent()) {
+        return { kind: "denied", code: "stale_configuration" };
+      }
+      authorized = immutableCopy({
+        association: record.association,
+        requestDigest: createHash("sha256")
+          .update(
+            JSON.stringify({
+              ...record.use.request,
+              body: Buffer.from(record.use.request.body).toString("base64"),
+            }),
+          )
+          .digest("hex"),
+        injectionDigest: record.digest,
+        authorizedAt: new Date(now).toISOString(),
+        sendStartBy: new Date(sendStartBy).toISOString(),
+      });
+      return authorized;
+    };
     if (!this.owns(record.association, record.use)) {
       return deny({ kind: "denied", code: "identity" });
     }
     try {
-      const committed =
-        record.source.adoption === "prepared"
-          ? await this.ports.authorizePrepared!(
-              record.use,
-              record.source,
-              record.attempt,
-              authorized,
-            )
-          : await this.ports.receipts.authorize(peer.sender, record.attempt, authorized);
+      const committed = await this.ports.authorizeSend(
+        record.use,
+        record.source,
+        record.attempt,
+        mintAuthorization,
+        record.provider,
+      );
       if ("kind" in committed) {
         return deny(committed);
       }
       // Never repair/replay a lost acknowledgment or extend the bound across this await.
       if (
+        !authorized ||
         !isDeepStrictEqual(committed.authorization, authorized) ||
         signal.aborted ||
         this.records.get(handle) !== record ||
         record.phase !== "checking" ||
         this.ports.now() >= sendStartBy ||
         sendStartBy > record.peerExpiresAt ||
-        !this.owns(record.association, record.use)
+        !this.owns(record.association, record.use) ||
+        !record.provider.isCurrent()
       ) {
         this.discard(handle, record);
         return refuse("invalid_handle");
       }
     } catch {
+      if (!authorized) {
+        // Discard before awaiting settlement: a retained callback cannot mint during refusal.
+        return deny({ kind: "unavailable", code: "authority" });
+      }
       this.discard(handle, record);
       return { kind: "refused", error: { kind: "unavailable", code: "authority" } };
     }
@@ -997,7 +1094,7 @@ export class CredentialProxy implements CredentialProxyExchange {
     record.phase = "permitted";
     return {
       kind: "allow",
-      authorization: authorized,
+      authorization: authorized!,
       sendStartBy: new Date(sendStartBy).toISOString(),
       injectionDigest: record.digest,
       noMaterialRequired: record.evidence.kind === "no_material_required",
@@ -1096,6 +1193,10 @@ export class CredentialProxy implements CredentialProxyExchange {
       (record.streamCheckAttemptedAt !== undefined &&
         this.ports.now() - record.streamCheckAttemptedAt < STREAM_LEASE_RECHECK_MS)
     ) {
+      if (!record.provider.isCurrent()) {
+        this.discard(handle, record);
+        return undefined;
+      }
       return lease();
     }
     record.phase = "renewing";
@@ -1110,7 +1211,8 @@ export class CredentialProxy implements CredentialProxyExchange {
         !(record.expiresAt > now) ||
         !(Date.parse(record.use.peer.expiresAt) > now) ||
         !(Date.parse(peer.expiresAt) > now) ||
-        !this.owns(record.association, record.use)
+        !this.owns(record.association, record.use) ||
+        !record.provider.isCurrent()
       ) {
         this.discard(handle, record);
         return undefined;
@@ -1156,9 +1258,12 @@ export class CredentialProxy implements CredentialProxyExchange {
     record: OperationRecord,
   ): Promise<ProtectedEgressSource | EgressRefusal> {
     try {
-      return await this.ports.check(record.use, undefined, {
-        until: new Date(record.expiresAt).toISOString(),
-      });
+      return await this.ports.check(
+        record.use,
+        undefined,
+        { until: new Date(record.expiresAt).toISOString() },
+        record.provider,
+      );
     } catch {
       return { kind: "unavailable", code: "authority" };
     }
@@ -1179,19 +1284,34 @@ export class CredentialProxy implements CredentialProxyExchange {
     record.phase = "observing";
     record.charge.holds += 1;
     try {
-      const rejected =
-        inspect &&
-        record.evidence.kind !== "no_material_required" &&
-        record.provider.credentialRejected(response);
-      const safe =
-        inspect && !signal.aborted && record.expiresAt > this.ports.now()
-          ? record.provider.protectResponse(
+      let rejected = false;
+      let safe: EgressResponse | undefined;
+      try {
+        if (inspect && record.provider.isCurrent()) {
+          rejected =
+            record.evidence.kind !== "no_material_required" &&
+            Reflect.apply(record.provider.methods.credentialRejected, record.provider.receiver, [
               response,
-              record.value,
-              record.use.request,
-              record.use.operation,
-            )
-          : undefined;
+            ]);
+          if (
+            !signal.aborted &&
+            record.expiresAt > this.ports.now() &&
+            record.provider.isCurrent()
+          ) {
+            safe = Reflect.apply(
+              record.provider.methods.protectResponse,
+              record.provider.receiver,
+              [response, record.value, record.use.request, record.use.operation],
+            );
+          }
+        }
+      } catch {
+        safe = undefined;
+      }
+      if (!record.provider.isCurrent()) {
+        rejected = false;
+        safe = undefined;
+      }
       const observed: SendObservation =
         safe === undefined
           ? { kind: "response_blocked", dispatch: "confirmed", code: "response_policy" }
@@ -1212,7 +1332,8 @@ export class CredentialProxy implements CredentialProxyExchange {
         this.records.get(handle) === record &&
         !signal.aborted &&
         record.expiresAt > this.ports.now() &&
-        this.owns(record.association, record.use);
+        this.owns(record.association, record.use) &&
+        record.provider.isCurrent();
       if (safe === undefined || !stillOwnsResponse()) {
         return undefined;
       }
