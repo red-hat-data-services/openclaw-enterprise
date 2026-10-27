@@ -49,7 +49,7 @@ import {
 import { embeddedGatewayRecoveryPreamble } from "../embedded-gateway-owner.ts";
 import {
   gatewayManagedModeEnvironment,
-  gatewayStateMigrationHelper,
+  openClawStateMigrationHelper,
   startupPhaseHelper,
 } from "../runtime-startup.ts";
 import {
@@ -153,6 +153,9 @@ const HARNESS_VERSION_LABEL = "org.openclaw.enterprise.harness-version";
 const VERSION_LABEL = "org.openclaw.enterprise.version";
 const SOCKET_PATH = "/var/run/docker.sock";
 const REQUEST_TIMEOUT_MS = 10_000;
+// Docker's own default stop timeout. The Gateway wrapper escalates to SIGKILL
+// after 8 s, so it exits first and Docker's SIGKILL is only the backstop.
+const CONTAINER_STOP_TIMEOUT_SECONDS = 10;
 const MAX_DOCKER_API_RESPONSE_BYTES = 4 * 1024 * 1024;
 const STARTUP_TIMEOUT_MS = 120_000;
 const GATEWAY_PORT = 8080;
@@ -248,7 +251,7 @@ const { spawn } = require("node:child_process");
 ${PLUGIN_RUNTIME_HELPERS}
 ${GATEWAY_TOOL_POLICY_RUNTIME}
 ${startupPhaseHelper("gateway")}
-${gatewayStateMigrationHelper("deploy the Agent again")}
+${openClawStateMigrationHelper("Gateway", "deploy the Agent again")}
 
 function forwardTermination(child) {
   let terminating = false;
@@ -290,11 +293,12 @@ if (gatewayToolPolicyInput !== undefined) configureManagedGatewayTools(gatewayTo
 // reads the configuration written above; current state adds no await before
 // the spawn. A failure exits: the Driver reports the container that stopped
 // before readiness and nothing restarts it.
-const outdatedDatabases = outdatedAgentDatabases();
+const gatewayStateDirectory = process.env.OPENCLAW_STATE_DIR || "/home/node/.openclaw";
+const outdatedDatabases = outdatedOpenClawDatabases(gatewayStateDirectory);
 if (outdatedDatabases.length === 0) {
   startGateway();
 } else {
-  migrateGatewayState(outdatedDatabases).then(
+  migrateOpenClawState(gatewayStateDirectory, outdatedDatabases, process.env).then(
     (migrated) => {
       if (migrated) startGateway();
       else process.exit(1);
@@ -1540,13 +1544,36 @@ ${WORKSPACE_SETUP_RUNTIME}`,
     return containerIds;
   }
 
+  // Stop before removal: Docker sends SIGTERM and a Gateway that exits on it
+  // releases its OpenClaw state lock. A force-removed (SIGKILL) Gateway that this
+  // Driver did not observe (removeGateway) leaves the lock on the Agent's state
+  // volume, and its replacement, in another PID namespace, refuses the state.
+  // A failed stop (not a cancelled operation) still force-removes the container,
+  // so no caller leaves it behind, and then reports the stop failure. A Gateway
+  // killed that way can leave its lock: the replacement refuses it (fails closed).
   private async removeContainer(name: string): Promise<void> {
+    let stopFailure: unknown;
+    try {
+      await this.request(
+        "POST",
+        `/containers/${encodeURIComponent(name)}/stop?t=${CONTAINER_STOP_TIMEOUT_SECONDS}`,
+        undefined,
+        [204, 304, 404],
+        CONTAINER_STOP_TIMEOUT_SECONDS * 1000 + REQUEST_TIMEOUT_MS,
+      );
+    } catch (error) {
+      currentComputeAbortSignal()?.throwIfAborted();
+      stopFailure = error;
+    }
     await this.request(
       "DELETE",
       `/containers/${encodeURIComponent(name)}?force=true&v=true`,
       undefined,
       [204, 404],
     );
+    if (stopFailure !== undefined) {
+      throw stopFailure;
+    }
   }
 
   private async waitForHealthyContainer(name: string): Promise<DockerContainerInspect> {
@@ -1572,9 +1599,10 @@ ${WORKSPACE_SETUP_RUNTIME}`,
     path: string,
     body: unknown,
     expected: readonly number[],
+    timeoutMs = REQUEST_TIMEOUT_MS,
   ): Promise<unknown> {
     const ownerSignal = currentComputeAbortSignal();
-    const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const timeout = AbortSignal.timeout(timeoutMs);
     const signal = ownerSignal === undefined ? timeout : AbortSignal.any([ownerSignal, timeout]);
     return withComputeAbortSignal(
       signal,
