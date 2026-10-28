@@ -15,6 +15,11 @@ const soulVersion = (version) =>
   ).join("");
 const create = "/console/agents/new?namespace=ns_00000000-0000-4000-8000-000000000001";
 const click = (text) => ({ click: text });
+const submitPassword = [
+  { selector: "#username", value: "operator@example.com" },
+  { selector: "#password", value: "demo-only" },
+  click("Sign in"),
+];
 const runtimeLogsPage = {
   group: "Pages/Agent detail",
   path: `${candidateVersion}&tab=logs`,
@@ -896,12 +901,18 @@ export const scenarios = {
     path: "/console/login",
     signedOut: true,
     rules: [{ path: "/api/auth/sign-in/email", method: "POST", status: 401 }],
-    actions: [
-      { selector: "#username", value: "operator@example.com" },
-      { selector: "#password", value: "demo-only" },
-      click("Sign in"),
-    ],
+    actions: submitPassword,
     description: "A rejected sign-in leaves the form available for retry.",
+  },
+  passwordSignInUnconfirmed: {
+    group: "Pages/Sign in",
+    name: "Password sign-in unconfirmed",
+    path: "/console/login",
+    signedOut: true,
+    rules: [{ path: "/api/auth/sign-in/email", method: "POST", bodyError: true }],
+    actions: submitPassword,
+    description:
+      "An interrupted password response leaves the result unknown. Reload to check the session before entering the password again.",
   },
   expired: {
     group: "Pages/Sign in",
@@ -4452,6 +4463,51 @@ export const scenarios = {
     description:
       "A pending save blocks further Configuration edits and deployment; a timed-out write requires draft readback.",
   },
+  gatewaySafety: {
+    group: "Pages/Agent detail",
+    name: "Collaboration and safety settings",
+    path: draft,
+    deployed: true,
+    description:
+      "The Configuration tab shows the Gateway collaboration and safety settings a deployment runs with. By default, other participants can steer a running turn, and apply_patch changes files only in the workspace.",
+    steps: [
+      "Read each toggle's state and where it comes from: Default: on.",
+      "Turn on Strict mode. The Configuration JSON opens with both locked-down values written, and focus stays on Strict mode.",
+      "Turn steering back on. Its value leaves the JSON and Strict mode turns off. Cancel, or Save Configuration and deploy a new version.",
+    ],
+    gap: "Simulated UI proof; does not show a deployed Gateway steering a turn.",
+  },
+  gatewaySafetyStrict: {
+    group: "Pages/Agent detail",
+    name: "Strict mode staged in the Configuration JSON",
+    path: draft,
+    deployed: true,
+    actions: [{ selector: "#gateway-safety-strict", click: true }],
+    description:
+      "Strict mode writes every locked-down value into the Configuration JSON; Save Configuration keeps them, and the next deployment applies them.",
+    gap: "Simulated UI proof; does not show a deployed Gateway steering a turn.",
+  },
+  gatewaySafetyCorporate: {
+    group: "Pages/Agent detail",
+    name: "Collaboration and safety, corporate preset",
+    path: `${draft}&tab=configuration`,
+    deployed: true,
+    securityPreset: "corporate",
+    description:
+      "With OpenClaw's corporate security preset, steering is off by default, and the help text says the Gateway refuses another participant's message and asks them to resend it with /followup.",
+    gap: "Simulated UI proof; does not show a deployed Gateway refusing a message.",
+  },
+  gatewaySafetyReader: {
+    group: "Pages/Agent detail",
+    name: "Collaboration and safety, viewer can only read",
+    path: `${draft}&tab=configuration`,
+    deployed: true,
+    readOnlyPermissionSummary: true,
+    collaborativeSteering: false,
+    description:
+      "A viewer sees the saved strict settings, with every toggle unavailable and the reason linked to each. The note above them names the grant to ask for.",
+    gap: "The permission answer is simulated; the API still authorizes every save.",
+  },
   pluginsUpdateDenied: {
     group: "Pages/Agent detail",
     name: "Plugin selections, viewer cannot update the Agent",
@@ -5684,8 +5740,20 @@ export const scenarios = {
     path: `${candidateVersion}&tab=deployment`,
     deployed: true,
     candidateDeploymentStatus: "succeeded",
+    rules: [
+      {
+        method: "GET",
+        suffix: "/deployments/rev_00000000-0000-4000-8000-000000000007",
+        skip: 1,
+        delayMs: 1800,
+      },
+    ],
     description:
       "v7 is now selected and its original deployment recorded success. This remains historical evidence, not a live probe.",
+    steps: [
+      "Focus Refresh record and press Enter. While Refreshing… is shown, the button keeps focus and repeated Enter or Space does not start another read. Completion leaves focus on Refresh record.",
+      "Refresh again and press Tab before the response arrives. Completion leaves focus on the control you moved to.",
+    ],
   },
   deploymentActivityLoading: {
     group: "Pages/Agent detail",
@@ -8578,7 +8646,7 @@ export const scenarios = {
     deployed: true,
     firstDeploymentFailed: true,
     description:
-      "A failed first deployment leaves the Agent requested to run with no selected version, so the danger zone has no Stop row, as the Agents list has no Stop icon.",
+      "A failed first deployment leaves the Agent requested to run with no selected version, so the danger zone has no Stop row.",
     gap: "Simulated UI proof only; this preview does not run a deployment.",
   },
   stopFirstDeploymentQueued: {
