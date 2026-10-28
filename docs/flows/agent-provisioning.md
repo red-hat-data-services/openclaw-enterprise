@@ -99,17 +99,10 @@ Source-backed provisioning records the canonical model source and grants only so
 Admission, replay, retry and execution recheck caller authority, source readiness and Gateway
 ownership. Queued or running work prevents source deletion.
 
-Compute prepares runtime credentials without loopback HTTP. Kubernetes
-`kubernetesGatewayConfigurationDocument` renders trusted-proxy configuration
-and preserves explicit human identities/scopes alongside
-machine administration, defaulting to machine-only. Provisioning and deploy
-admission reject unknown or padded operator scopes, blank or padded identity keys,
-grants for identities outside `allowUsers`, and human admission with admin device
-scopes, including whitespace. These refusals precede workload replacement.
-Human ingress and its network policy remain operator-managed; no OCE human
-account is required. See [Gateway authentication](../reference/drivers/kubernetes-compute/gateway-authentication.md).
-Provisioning supplies no Gateway token or trust override. Losing its claim cancels
-Kubernetes Configuration requests, freeing the worker.
+Compute prepares runtime credentials without loopback HTTP. Kubernetes owns trusted-proxy
+configuration and credential protection; provisioning supplies neither gateway token nor trust
+override. Losing the provisioning claim cancels outstanding Kubernetes Configuration requests,
+freeing the serial worker.
 
 ### 4. Deployment becomes the lifecycle owner
 

@@ -322,10 +322,6 @@
                             "label": "Networking and Isolation"
                           },
                           {
-                            "page": "reference/drivers/kubernetes-compute/gateway-authentication",
-                            "label": "Gateway Authentication"
-                          },
-                          {
                             "page": "reference/drivers/kubernetes-compute/storage-and-credentials",
                             "label": "Storage and Credentials"
                           },
@@ -532,6 +528,10 @@
                   {
                     "page": "guides/deploy/breaking-changes",
                     "label": "Breaking Changes"
+                  },
+                  {
+                    "page": "guides/deploy/breaking-changes-before-2026-10-26",
+                    "label": "Breaking Changes Before 2026-10-26"
                   },
                   {
                     "page": "guides/deploy/breaking-changes-later-2026-10-24",
@@ -1026,6 +1026,10 @@
                   {
                     "page": "contributing/documentation",
                     "label": "Overview"
+                  },
+                  {
+                    "page": "taxonomy",
+                    "label": "Document Types"
                   },
                   {
                     "page": "local-preview",
