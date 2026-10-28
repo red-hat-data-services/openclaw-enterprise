@@ -229,7 +229,7 @@ silently.
 Envoy authenticates the OCC service key and the route rewrites identity headers
 ([service key and native identity](../../gateway-routing.md#service-key-and-native-identity)).
 Native `allowRealIpFallback` accepts Envoy's direct downstream address when OCC
-and Envoy share a Pod CIDR.
+and Envoy share a Pod CIDR. Loopback port-forwarding alone cannot supply native attribution.
 
 ## Namespaces and isolation
 
