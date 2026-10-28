@@ -1,0 +1,162 @@
+ARG BASE_IMAGE=registry.access.redhat.com/hi/nodejs:24@sha256:894f30fa12a8992a39ad4241fd353fec4ec71d223d398aeb1deb3dc3f06abbc0
+ARG BUILDER_IMAGE=registry.access.redhat.com/hi/nodejs:24-builder@sha256:df03f3031d7bf9f9bbce2cd1f9c0eea2e7eba23b66aaa22c457db3c770d6af74
+
+# OpenClaw Enterprise (OCE) controller image on Hummingbird.
+#
+# Konflux port of the root Dockerfile. Non-hermetic: it follows its runtime
+# target, swapping Debian node:24 for the Hummingbird Node.js 24 runtime and
+# builder streams. One image serves the API, console, worker, Slack proxy and
+# the migration and bootstrap jobs; the Helm chart selects each through the
+# node arguments. Dependencies install with lifecycle scripts disabled, as upstream
+# does, and the controller ships no native addons.
+
+FROM ${BUILDER_IMAGE} AS builder
+USER 0
+ARG PNPM_OCE_VERSION
+ARG PNPM_OCE_SHA512
+RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs git-core tar gzip \
+    && dnf clean all
+# Hummingbird ships neither corepack nor pnpm. Install the exact release that
+# OCE's packageManager field selects, verified with the same SHA-512 that
+# corepack would check.
+RUN /bin/bash -euo pipefail <<'EOF'
+cd /tmp
+curl -fsSLO "https://registry.npmjs.org/pnpm/-/pnpm-${PNPM_OCE_VERSION}.tgz"
+echo "${PNPM_OCE_SHA512}  pnpm-${PNPM_OCE_VERSION}.tgz" | sha512sum --check --strict
+mkdir -p /opt/pnpm/.bin
+tar -xzf "pnpm-${PNPM_OCE_VERSION}.tgz" -C /opt/pnpm --strip-components=1
+chmod 0755 /opt/pnpm/bin/pnpm.mjs
+ln -s ../bin/pnpm.mjs /opt/pnpm/.bin/pnpm
+rm "pnpm-${PNPM_OCE_VERSION}.tgz"
+PATH=/opt/pnpm/.bin:$PATH pnpm --version | grep -qx "${PNPM_OCE_VERSION}"
+EOF
+
+# The build context is this repository; .dockerignore keeps local state,
+# archived prior art and test trees out of it.
+FROM builder AS oce-source
+WORKDIR /oce
+COPY . .
+
+# Upstream dependencies stage: production dependencies of the workspace
+# packages the controller loads, resolved from their manifests alone.
+FROM oce-source AS dependencies
+ENV PATH=/opt/pnpm/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WORKDIR /app
+RUN /bin/bash -euo pipefail <<'EOF'
+node -e 'const [major, minor, patch] = process.versions.node.split(".").map(Number); if (major !== 24 || minor < 22 || (minor === 22 && patch < 1)) throw new Error(`Select a Node.js 24.22.1+ base image in the 24 series; found ${process.version}.`);'
+cd /oce
+cp --parents \
+    LICENSE package.json pnpm-lock.yaml pnpm-workspace.yaml \
+    apps/controller/package.json \
+    packages/audit/package.json \
+    packages/contracts/package.json \
+    packages/iam/package.json \
+    packages/occ/package.json \
+    packages/utils/package.json \
+    /app/
+cd /app
+pnpm install --frozen-lockfile --prod --ignore-scripts --store-dir=/tmp/pnpm-store
+rm -rf /tmp/pnpm-store
+EOF
+
+# Upstream console-build stage: stamp the console with the OCE build revision.
+# The stamp needs only Node, so it starts from the runtime base image the final
+# stage already uses. On the dependencies stage, every build that changed
+# runtime source had to unpack the full build base and its dependencies just
+# to rewrite one HTML file.
+FROM ${BASE_IMAGE} AS console-build
+USER 0
+WORKDIR /app
+COPY --from=oce-source /oce/apps/controller/src/console/index.html apps/controller/src/console/index.html
+COPY --from=oce-source /oce/scripts/build-console-metadata.mjs scripts/build-console-metadata.mjs
+ARG OCE_COMMIT
+# The labels and the console stamp need the source revision, which the script
+# would otherwise accept empty.
+RUN node -e 'if (!/^[a-f0-9]{40}$/.test(process.argv[1])) throw new Error("Invalid OCE build revision")' "${OCE_COMMIT}" \
+    && node scripts/build-console-metadata.mjs "${OCE_COMMIT}"
+
+# The files upstream's runtime stage copies, assembled into one tree.
+FROM dependencies AS controller-tree
+COPY --from=console-build /app/apps/controller/src/console/index.html /tmp/index.html
+RUN /bin/bash -euo pipefail <<'EOF'
+cd /oce
+cp --parents -R \
+    packages/audit/src \
+    packages/contracts/src \
+    packages/iam/src \
+    packages/occ/src \
+    packages/utils/src \
+    apps/controller/src \
+    migrations/[0-9]*.sql \
+    migrations/meta/_journal.json \
+    migrations/meta/_canonical-history.json \
+    scripts/migrate-production.mjs \
+    scripts/migration-history.mjs \
+    scripts/migration-catalog.mjs \
+    scripts/bootstrap-installation.mjs \
+    scripts/lib/bootstrap-configuration.mjs \
+    scripts/auth-maintain.mjs \
+    scripts/lib/auth-maintain-arguments.mjs \
+    deploy/presets \
+    scripts/production-healthcheck.mjs \
+    /app/
+cp /tmp/index.html /app/apps/controller/src/console/index.html
+# The fork's default console theme, staged for the /etc copy in the final stage.
+cp -R deploy/branding/redclaw /tmp/console-theme
+EOF
+
+FROM ${BASE_IMAGE}
+USER 0
+
+ARG BASE_IMAGE
+ARG BUILDER_IMAGE
+ARG OCE_COMMIT
+ARG VARIANT=oce-controller
+ARG NAME=agentic-oce-controller
+ARG SUMMARY="Red Hat AI Agentic OpenClaw Enterprise Controller Image"
+
+LABEL io.openshell.hummingbird.runtime-image="${BASE_IMAGE}" \
+      io.openshell.harness.version="${OCE_COMMIT}" \
+      io.openshell.hummingbird.builder-image="${BUILDER_IMAGE}" \
+      org.opencontainers.image.revision="${OCE_COMMIT}" \
+      name="${NAME}" \
+      com.redhat.component="${NAME}-container" \
+      summary="${SUMMARY}" \
+      description="${SUMMARY} built from OpenClaw Enterprise ${OCE_COMMIT}" \
+      io.k8s.display-name="${SUMMARY}" \
+      io.k8s.description="${SUMMARY}" \
+      io.openshift.tags="hummingbird openclaw-enterprise ${NAME}" \
+      distribution-scope="authoritative-source-only"
+
+# Hummingbird sets HOME=/tmp; upstream runs as the node image's node user.
+ENV HOME=/home/node
+ENV NODE_ENV=production
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false
+
+WORKDIR /app
+
+# The Helm chart runs every controller container as 1000:1000.
+RUN /bin/bash -euo pipefail <<'EOF'
+node -e 'const [major, minor, patch] = process.versions.node.split(".").map(Number); if (major !== 24 || minor < 22 || (minor === 22 && patch < 1)) throw new Error(`Select a Node.js 24.22.1+ base image in the 24 series; found ${process.version}.`);'
+echo 'node:x:1000:1000:node:/home/node:/bin/bash' >> /etc/passwd
+echo 'node:x:1000:' >> /etc/group
+install -d -o node -g node -m 755 /home/node
+EOF
+
+COPY --from=controller-tree --chown=1000:1000 /app/ /app/
+
+# Every entry point loads the production composition and its dependencies.
+RUN node --input-type=module -e 'await import("/app/apps/controller/src/composition/production.ts");'
+# Upstream precompiles the route validators and serializers with this image's
+# Node and dependencies, so the server does not compile every schema at start.
+RUN node apps/controller/src/precompile-route-schemas.mjs
+
+# Fork branding: the default console theme, root-owned and read-only like the
+# upstream stages. The API startup loader reads OCC_CONSOLE_THEME_DIR and
+# validates the bundle once before listening.
+COPY --from=controller-tree /tmp/console-theme/ /etc/openclaw/console-theme/
+ENV OCC_CONSOLE_THEME_DIR=/etc/openclaw/console-theme
+
+USER node
+ENTRYPOINT ["node"]
+CMD ["apps/controller/src/server.mjs"]

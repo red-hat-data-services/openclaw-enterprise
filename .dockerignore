@@ -4,6 +4,8 @@
 legacy/
 .worktrees/
 **/.worktrees/
+.claude/
+**/.claude/
 .kube/
 **/.kube/
 .npm/
