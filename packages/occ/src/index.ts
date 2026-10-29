@@ -1176,6 +1176,11 @@ const MAX_CONFIGURATION_LEFTOVER_LEAD = 100;
  * while it holds the Namespace and Secret locks, so the bound also limits that lock window.
  */
 const SECRET_CONSUMER_LIMIT = 50;
+/**
+ * The IDs of one kind that a NAMESPACE_NOT_EMPTY conflict examines and may name. Each costs
+ * one read decision while deletion holds the Namespace lock, so the bound limits that work.
+ */
+const NAMESPACE_NOT_EMPTY_ID_LIMIT = 20;
 const SECRET_CONSUMER_KINDS = Object.freeze([
   "agents",
   "configurations",
@@ -3343,7 +3348,7 @@ export class OpenClawController {
         principalId,
         namespace.id,
         workId,
-        "Only the initiating actor can retry provisioning.",
+        "retry",
       );
       const agent =
         record.agentId === undefined
@@ -6513,7 +6518,13 @@ export class OpenClawController {
     });
     const { namespace, gateway, refresh, deferred, source, values, issuer } = registration;
     const config = source.config;
-    const placed = gateway ? await this.credentialNamespace(namespace) : namespace;
+    // This fresh live registration writes neither a Gateway copy nor Refresh state.
+    const liveRegistrationWithoutWrite =
+      source.egress?.adoption === "live" && refresh === undefined;
+    const placed =
+      gateway && !liveRegistrationWithoutWrite
+        ? await this.credentialNamespace(namespace)
+        : namespace;
     let status: CredentialSourceStatus;
     // A returned result means every gateway effect of this attempt has finished; a throw does not.
     let terminal = false;
@@ -6585,7 +6596,8 @@ export class OpenClawController {
     });
     if (ready === undefined) {
       // A concurrent deletion owns the prepared family withdrawal. It must not be reconfigured or replayed.
-      if (gateway && source.egress?.adoption !== "prepared") {
+      // A fresh live registration made no external write to compensate. Leave DELETE's row alone.
+      if (gateway && source.egress?.adoption !== "prepared" && !liveRegistrationWithoutWrite) {
         await this.abandonCredentialRegistration(placed, gateway, source, true, refresh);
       }
       throw new ResourceStateConflictError("The credential source changed during registration.");
@@ -9119,9 +9131,23 @@ export class OpenClawController {
    * a repository binding saved beside the Agent's network grants gets the Driver's overlap
    * check here, before deploy. Other policy refusals stay with save, apply and deploy.
    */
-  private refuseRepositoryNetworkOverlap(policy: Readonly<SandboxPolicy> | undefined): void {
+  private async refuseRepositoryNetworkOverlap(
+    principalId: string,
+    policy: Readonly<SandboxPolicy> | undefined,
+  ): Promise<void> {
+    if (policy === undefined || policy.additions.length === 0) {
+      return;
+    }
+    // Finding 2881: the overlap refusal names a saved grant, so it comes after SandboxPolicy
+    // read, as deploy's admission does when saved additions exist (finding 2151). An Agent
+    // update without that read learns nothing from it.
+    await this.authorize(principalId, "read", {
+      kind: "sandbox_policy",
+      id: policy.id,
+      namespaceId: policy.namespaceId,
+    });
     const driver = this.sandboxDriver();
-    if (policy === undefined || policy.additions.length === 0 || !driver?.admitNetworkPolicy) {
+    if (!driver?.admitNetworkPolicy) {
       return;
     }
     try {
@@ -9208,11 +9234,16 @@ export class OpenClawController {
   ): Promise<Readonly<SandboxPolicy>> {
     this.requireNetworkPolicyFacet(facet);
     await this.authorize(principalId, "manage_policy", { kind: "agent", id: agentId, namespaceId });
-    await this.authorize(principalId, "update", {
+    const sandboxPolicy = {
       kind: "sandbox_policy",
       id: `sbp_${agentId.slice(4)}`,
       namespaceId,
-    });
+    } as const;
+    await this.authorize(principalId, "update", sandboxPolicy);
+    // Finding 2874: apply admits the saved additions (ceiling and Driver refusals name them)
+    // and returns the saved policy, so it needs SandboxPolicy read before either, even with
+    // no additions. Deploy needs read only when saved additions exist (finding 2151).
+    await this.authorize(principalId, "read", sandboxPolicy);
     // The cause comes before the editing setting and version checks it would otherwise hide (D774).
     this.requireNetworkPolicyAvailable();
     return this.mutate(async (state) => {
@@ -9943,7 +9974,8 @@ export class OpenClawController {
       // The reverse of the policy save's check: a binding added beside a saved grant that
       // reaches the repository hosts (finding 2144).
       if ((repositoryBindings ?? agent.repositoryBindings ?? []).length > 0) {
-        this.refuseRepositoryNetworkOverlap(
+        await this.refuseRepositoryNetworkOverlap(
+          principalId,
           await state.sandboxPolicies.find(namespace.id, agent.id),
         );
       }
@@ -10513,14 +10545,18 @@ export class OpenClawController {
       // Finding 2053: a protected execution keeps only its protected egress policy. It admits
       // no Agent policy snapshot, and the Agent's network policy additions are refused, never
       // dropped. The caller learns of them only with SandboxPolicy read access.
+      // Finding 2151: every refusal below that names saved additions (protected execution, the
+      // ceiling, the Driver) comes after SandboxPolicy read, so a deployer without it learns nothing.
       const protectedExecution = execution.executionAdmission.mode === "protected";
-      if (protectedExecution && policy !== undefined && policy.additions.length > 0) {
+      if (policy !== undefined && policy.additions.length > 0) {
         await this.authorize(principalId, "read", {
           kind: "sandbox_policy",
           id: policy.id,
           namespaceId: namespace.id,
         });
-        throw new ProtectedExecutionNetworkPolicyError("deploy");
+        if (protectedExecution) {
+          throw new ProtectedExecutionNetworkPolicyError("deploy");
+        }
       }
       const sandboxPolicy = protectedExecution
         ? undefined
@@ -10539,13 +10575,6 @@ export class OpenClawController {
         throw new ResourceStateConflictError(
           "The selected Sandbox Driver cannot enforce this Agent's network policy.",
         );
-      }
-      if (policy !== undefined && policy.additions.length > 0) {
-        await this.authorize(principalId, "read", {
-          kind: "sandbox_policy",
-          id: policy.id,
-          namespaceId: namespace.id,
-        });
       }
       const revisionDraft: AgentRevision = {
         id: revisionId,
@@ -10985,44 +11014,64 @@ export class OpenClawController {
         }
         return namespace;
       }
-      // The 409 names each remaining resource's ID: Configurations have no list view, so
-      // the error is the only place an operator can find what to delete.
+      // The 409 names remaining resources' IDs: Configurations have no list view, so the
+      // error is the only place an operator can find what to delete. Namespace delete does
+      // not grant child reads, so of the first IDs of each kind (as many as the response
+      // carries) it names only those the caller may read, and counts the rest (finding 2724).
       const contents: string[] = [];
       const ids: Record<string, readonly string[]> = {};
-      const remaining = (kind: string, resources: readonly { readonly id: string }[]) => {
+      const counts: Record<string, number> = {};
+      const remaining = async (
+        kind: string,
+        resourceKind: ResourceKind,
+        resources: readonly { readonly id: string }[],
+      ) => {
         contents.push(kind);
-        ids[kind] = resources.map((resource) => resource.id);
+        counts[kind] = resources.length;
+        const readable: string[] = [];
+        for (const { id } of resources.slice(0, NAMESPACE_NOT_EMPTY_ID_LIMIT)) {
+          // An authorization outage hides the ID rather than the conflict.
+          const resource = { kind: resourceKind, id, namespaceId: namespace.id };
+          if (await this.canRead(principalId, resource).catch(() => false)) {
+            readable.push(id);
+          }
+        }
+        ids[kind] = readable;
       };
       if (await state.namespaces.hasAgents(namespace.id)) {
-        remaining("Agents", await state.agents.listAgents(namespace.id));
+        await remaining("Agents", "agent", await state.agents.listAgents(namespace.id));
       }
       const configurationIds = await state.namespaces.listConfigurationIds(namespace.id);
       if (configurationIds.length > 0) {
-        remaining(
+        await remaining(
           "Configurations",
+          "configuration",
           configurationIds.map((id) => ({ id })),
         );
       }
       const presets = await state.presets.listPresets(namespace.id);
       const seededPresets = presets.filter((preset) => this.isUnmodifiedDefaultPreset(preset));
       if (seededPresets.length < presets.length) {
-        remaining(
+        await remaining(
           "Presets",
+          "preset",
           presets.filter((preset) => !seededPresets.includes(preset)),
         );
       }
       if (await state.namespaces.hasSecrets(namespace.id)) {
-        remaining("Secrets", await state.secrets.listSecrets(namespace.id));
+        await remaining("Secrets", "secret", await state.secrets.listSecrets(namespace.id));
       }
       if (await state.namespaces.hasCredentialSources(namespace.id)) {
-        remaining(
+        await remaining(
           "credential sources",
+          "credential_source",
           await state.credentialSources.listCredentialSources(namespace.id),
         );
       }
       if (await state.namespaces.hasServiceAccounts(namespace.id)) {
-        remaining(
+        await remaining(
           "service accounts",
+          "service_account",
           await state.serviceAccounts.listServiceAccounts(namespace.id),
         );
       }
@@ -11030,7 +11079,7 @@ export class OpenClawController {
         contents.push("pending Agent provisioning");
       }
       if (contents.length > 0) {
-        throw new NamespaceNotEmptyError(contents, ids);
+        throw new NamespaceNotEmptyError(contents, ids, counts);
       }
       // Installation defaults were seeded by Namespace creation, so deletion removes
       // them only while they still match the defaults; edited copies block above.
@@ -12039,13 +12088,11 @@ export class OpenClawController {
       const owner = this.credentialSourceOwner(source);
       if (owner.kind === "proxy") {
         if (!this.protectedSourceTypes().some((p) => p.type.type === source.type)) {
-          throw new CredentialSourceTypeNotOfferedError();
+          throw new CredentialSourceTypeNotOfferedError("proxy");
         }
         snapshots.push({ sourceId, credentialProxyId: owner.driver.id, sourceType: source.type });
       } else {
-        if (!this.protectedSourceTypes().some((p) => p.type.type === source.type)) {
-          await this.credentialSourceType(owner.driver, source.type);
-        }
+        await this.credentialSourceType(owner.driver, source.type);
         snapshots.push({ sourceId, credentialGatewayId: owner.driver.id, sourceType: source.type });
       }
     }
@@ -12079,9 +12126,9 @@ export class OpenClawController {
     principalId: string,
     record: Readonly<AgentProvisioningRecord>,
     {
-      statusRead = false,
+      statusRead,
       admission = false,
-    }: { readonly statusRead?: boolean; readonly admission?: boolean } = {},
+    }: { readonly statusRead?: "status" | "retry"; readonly admission?: boolean } = {},
   ): Promise<void> {
     const namespaceId = record.namespaceId;
     await this.authorizeProvisioningRequest(principalId, namespaceId);
@@ -12245,7 +12292,8 @@ export class OpenClawController {
         this.validateRepositoryBrokerNetworkProxy(harness, plugins, configuration, sandbox);
       }
     }
-    if (agent !== undefined) {
+    // Retry keeps this admission before its lifecycle checks; status only reads saved progress.
+    if (agent !== undefined && statusRead !== "status") {
       this.admitRepositoryCredentials(
         agent,
         compute,
@@ -12261,8 +12309,7 @@ export class OpenClawController {
     principalId: string,
     namespaceId: string,
     workId: string,
-    // What another actor is told: a retry says so, a status read says so (finding 2588).
-    otherActorDenial = "Only the initiating actor can read provisioning status.",
+    operation: "status" | "retry" = "status",
   ) {
     if (!isNonEmptyString(workId)) {
       throw new ScopeViolationError("The exact provisioning work identity is missing.");
@@ -12276,11 +12323,17 @@ export class OpenClawController {
       );
     }
     if (found.record.actorId !== principalId) {
-      throw new CallerStateDeniedError(otherActorDenial);
+      throw new CallerStateDeniedError(
+        operation === "retry"
+          ? "Only the initiating actor can retry provisioning."
+          : "Only the initiating actor can read provisioning status.",
+      );
     }
     // Retry repeats the full check, native support, plugin policy, the Compute plan and Harness
     // authentication checks included, after its lifecycle checks.
-    await this.authorizeProvisioningRecord(state, principalId, found.record, { statusRead: true });
+    await this.authorizeProvisioningRecord(state, principalId, found.record, {
+      statusRead: operation,
+    });
     return found;
   }
 

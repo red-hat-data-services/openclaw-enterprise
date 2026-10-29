@@ -48,6 +48,7 @@ import {
 } from "./console-agents-browser-helpers.mjs";
 import { createRuntimeAuthFixture } from "./console-agents-runtime-auth-fixture.mjs";
 import {
+  LIVE_BUTTON,
   createRepositoryLaunchFixture,
   focusedDescription,
   focusedText,
@@ -313,7 +314,9 @@ test("collaboration and safety toggles stage their settings in the Configuration
 
   // Returning steering to its default removes only that setting and preserves the fallback.
   await json.fill(JSON.stringify(rejectSteering, null, 2));
-  await page.locator("#gateway-safety-strict:checked:enabled").waitFor();
+  await page
+    .locator('#gateway-safety-strict:checked:enabled:not([aria-disabled="true"])')
+    .waitFor();
   await steering.check();
   const edited = JSON.parse(await json.inputValue());
   assert.deepEqual(edited, {
@@ -524,11 +527,7 @@ const inPlaceCases: {
     viewport: { width: 1280, height: 720 },
     async prepare(page) {
       await page.getByRole("heading", { name: "Prepare this version" }).waitFor();
-      await page.waitForFunction(
-        () =>
-          globalThis.document.querySelector<HTMLButtonElement>(".agent-draft-actions .primary")
-            ?.disabled === false,
-      );
+      await page.locator(".agent-draft-actions .primary").and(page.locator(LIVE_BUTTON)).waitFor();
       await page.getByRole("button", { name: "Edit Configuration" }).click();
       await openAdvancedSettings(page);
       const editor = page.getByLabel("Configuration JSON");
@@ -997,10 +996,25 @@ test("repository saves, Cancel and Reload draft update the Agent page in place",
     repositoryAccess("git-read"),
   );
 
-  // Cancel drops the edit and rebuilds from the saved state in place.
+  // Cancel drops the edit and rebuilds from the saved state in place. It reads the permission
+  // answer again, which can land after the Configuration. The rebuild waits for it: rebuilt
+  // before it, the tab had no editor yet, so the tab strip took focus and the page lost its
+  // place (finding 2892).
   await page.locator("#repository-default-git-full").check();
   assert.equal(await save.isEnabled(), true);
+  const permissions = await holdRequests(t, page, `${fixture.origin}${agentPath}/permissions`, {
+    once: true,
+    method: "GET",
+  });
+  const configurationRead = page.waitForResponse(
+    (response) =>
+      response.request().method() === "GET" &&
+      response.url() ===
+        `${fixture.origin}/namespaces/${namespace.id}/configurations/${agent.configurationId}`,
+  );
   await cancel.click();
+  await Promise.all([permissions.requested, configurationRead]);
+  permissions.release();
   await page.waitForFunction(
     () =>
       globalThis.document.querySelector<HTMLInputElement>("#repository-default-git-read")

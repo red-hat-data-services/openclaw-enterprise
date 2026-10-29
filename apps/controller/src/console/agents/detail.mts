@@ -22,11 +22,13 @@ import {
   element,
   fieldError,
   focusSaveOutcome,
+  isUnavailable,
   jsonObjectProblem,
   revealStatus,
   setHidden,
   setStatusTone,
   setText,
+  setUnavailable,
   statusBlock,
   validateFields,
   requestIdLine,
@@ -56,6 +58,7 @@ import {
   modelCredentialRejectedReadOnly,
   NEW_VERSIONS_READ,
   requestedVersionUnavailable,
+  unreadableCurrentVersion,
   VERSION_READ_DENIED,
   VERSION_UNAVAILABLE,
 } from "./access-reasons.mjs";
@@ -1150,21 +1153,31 @@ export async function renderAgentDetail(
   // Members have no console chat, and native admin needs administer (and is off under
   // external sign-in), so point only at paths that work in every sign-in mode.
   const readAccessHint = `${NEW_VERSIONS_READ} If this Agent is set up for a channel such as Slack, you can message it there when that channel allows you.`;
-  function renderCurrentVersion() {
+  // A current version the caller cannot read is named in the Agents list's words, not by its raw
+  // ID (finding D791): newer than every listed version beside the newest one's succeeded
+  // deployment. Null when it is listed or not known to be hidden: until every page of versions is
+  // loaded, it may be on an older one. revisionHidden is false until the version list loads, so
+  // the deployment status below is never read before its declaration.
+  function unreadableCurrentLabel() {
+    if (!currentRevisionId || !revisionHidden(currentRevisionId)) {
+      return null;
+    }
+    return unreadableCurrentVersion(
+      visibleRevisions.length > 0 && latestDeploymentStatus === "succeeded",
+    );
+  }
+  // The current version as the page names it: its number, those words, else its short ID.
+  function currentVersionLabel() {
     const current = visibleRevisions.find((revision) => revision.id === currentRevisionId);
-    const version = current
+    return current
       ? `v${current.revision}`
-      : currentRevisionId
-        ? shortId(currentRevisionId)
-        : "None";
-    setText(currentVersionValue, version);
+      : (unreadableCurrentLabel() ?? shortId(currentRevisionId ?? ""));
+  }
+  function renderCurrentVersion() {
+    setText(currentVersionValue, currentRevisionId ? currentVersionLabel() : "None");
     setText(
       currentVersionNote,
-      !currentRevisionId
-        ? "No version is currently selected for service."
-        : revisionHidden(currentRevisionId)
-          ? "Selected for service · you cannot read this version"
-          : "",
+      currentRevisionId ? "" : "No version is currently selected for service.",
     );
     const stopRequested =
       currentRuntimeState === "stopped" &&
@@ -1515,10 +1528,9 @@ export async function renderAgentDetail(
     path,
     () => latestPermissionsRead.then((permissions) => permissions?.administer),
     {
-      versionLabel: () => {
-        const current = visibleRevisions.find((revision) => revision.id === currentRevisionId);
-        return current ? `v${current.revision}` : shortId(currentRevisionId ?? "");
-      },
+      // One the caller cannot read is not named by its ID (finding D791).
+      versionLabel: () =>
+        unreadableCurrentLabel() === null ? currentVersionLabel() : "current version",
       recovery: (status) => {
         if (status === "stopped" || status === "unsupported") {
           return versionLink("Open draft", "draft", "configuration");
@@ -1675,7 +1687,7 @@ export async function renderAgentDetail(
       );
     }
     const deployButton = actions?.querySelector<HTMLButtonElement>("button.primary");
-    if (deployButton && !deployButton.disabled) {
+    if (deployButton && !isUnavailable(deployButton)) {
       deployButton.focus({ preventScroll: true });
     } else {
       tabControls.get(selectedTab)?.focus({ preventScroll: true });
@@ -1792,6 +1804,20 @@ export async function renderAgentDetail(
       }
     });
   }
+  // Installation administration ended while the page is open: an administrator-only read, such
+  // as the Access tab's recheck after a revoke, was refused and the permission answer settled
+  // "not an administrator". The page kept the administrator's Deploy, saves, Stop and Delete
+  // until Refresh, and Plugins sent a capabilities read the API refused (finding D795). It reads
+  // the Agent's permission answer again, as Refresh would, and its controls follow that answer
+  // without a reload. Views built meanwhile wait for it, so Plugins sends no read it denies.
+  context.onAdministrationEnded?.(() => {
+    if (!context.isCurrent() || deleting) {
+      return;
+    }
+    agentSaveDenied = rereadPermissions().then((permissions) =>
+      agentSaveDenial(permissions, agent),
+    );
+  });
   // Shown once by the tab a draft refresh rebuilds after a save (finding 1445).
   let savedNotice = "";
   let activityPanel = deploymentStatus;
@@ -2086,8 +2112,6 @@ export async function renderAgentDetail(
       trackRevisionControl(older);
     }
     const viewed = revisions.find((revision) => revision.id === selected);
-    const current = revisions.find((revision) => revision.id === currentRevisionId);
-    const currentLabel = current ? `v${current.revision}` : shortId(currentRevisionId ?? "");
     let viewing = "Saved draft for a future deployment";
     if (selected !== "draft") {
       viewing = viewed ? displayDate(viewed.createdAt) : "";
@@ -2105,11 +2129,7 @@ export async function renderAgentDetail(
         older,
         element("span", { className: "agent-version-date" }, viewing),
       ),
-      element(
-        "p",
-        { className: "agent-version-context" },
-        `${currentRevisionId ? `${currentLabel} remains selected for service.` : "No version is selected for service."} ${selected === "draft" ? "Deploy new version creates an immutable version from the saved draft." : "Browsing does not deploy or roll back."}`,
-      ),
+      element("p", { className: "agent-version-context" }, versionContext()),
       ...(olderError
         ? [statusBlock("danger", null, `Older versions unavailable. ${message(olderError)}`)]
         : []),
@@ -2134,6 +2154,12 @@ export async function renderAgentDetail(
     if (focus) {
       (focus === "older" && older ? older : chooser).focus({ preventScroll: true });
     }
+  }
+
+  // The line under the version chooser. Its current version's words can change when the newest
+  // version's deployment status arrives, so renderLatestDeployment rewrites it too.
+  function versionContext() {
+    return `${currentRevisionId ? `${currentVersionLabel()} remains selected for service.` : "No version is selected for service."} ${selected === "draft" ? "Deploy new version creates an immutable version from the saved draft." : "Browsing does not deploy or roll back."}`;
   }
 
   // Without a version list yet (still loading), its first render shows the new state.
@@ -2200,6 +2226,13 @@ export async function renderAgentDetail(
 
   function renderLatestDeployment() {
     markVersionOutcomes();
+    // An unreadable current version is newer beside a succeeded deployment (finding D791).
+    renderCurrentVersion();
+    nativeAdmin.updateTarget();
+    const versionContextLine = selector.querySelector(".agent-version-context");
+    if (versionContextLine) {
+      setText(versionContextLine, versionContext());
+    }
     const latest = visibleRevisions[0];
     setHidden(deploymentEmpty, Boolean(latest) || latestRevisionResult?.status !== "fulfilled");
     const needsAttention =
@@ -2265,7 +2298,7 @@ export async function renderAgentDetail(
           : deployedHere(hidden)
             ? deployAcceptedVersionUnreadable(shortId(hidden))
             : hidden === currentRevisionId
-              ? `You cannot read version ${shortId(hidden)}, so its progress and outcome are not shown here. ${readAccessHint}`
+              ? `You cannot read the current version, so its progress and outcome are not shown here. ${readAccessHint}`
               : requestedVersionUnavailable(shortId(hidden)),
       );
       setLiveServing(false);
@@ -2374,10 +2407,10 @@ export async function renderAgentDetail(
               : requestedVersionUnavailable(shortId(selected))
             : null,
           newerHidden && !currentIsAccepted
-            ? `The current version, ${shortId(currentRevisionId ?? "")}, is one you cannot read; v${latest.revision} is an older version.`
+            ? `The current version is one you cannot read; v${latest.revision} is an older version.`
             : null,
           failureBehindHidden && !currentIsAccepted
-            ? `The current version, ${shortId(currentRevisionId ?? "")}, is one you cannot read, so this page cannot tell whether the failed v${latest.revision} deployment affects it.`
+            ? `The current version is one you cannot read, so this page cannot tell whether the failed v${latest.revision} deployment affects it.`
             : null,
           failureBehindUnknown
             ? `The current version, ${shortId(currentRevisionId ?? "")}, is not among the versions listed, so this page cannot tell whether the failed v${latest.revision} deployment affects it.${olderCursor ? " Load older versions to check." : ""}`
@@ -2541,7 +2574,11 @@ export async function renderAgentDetail(
     visibleRevisionsLoaded = revisionResult.status === "fulfilled";
     stopPanel.setNoReadableVersions(visibleRevisionsLoaded ? revisions.length === 0 : null);
     const labels = new Map(revisions.map((revision) => [revision.id, `v${revision.revision}`]));
-    stopPanel.setVersionLabel((id) => labels.get(id));
+    // A current version the caller cannot read keeps the page's words, not its ID (finding D791).
+    stopPanel.setVersionLabel(
+      (id) =>
+        labels.get(id) ?? (id === currentRevisionId ? unreadableCurrentLabel() : null) ?? undefined,
+    );
     renderCurrentVersion();
     nativeAdmin.updateTarget();
     renderVersions(
@@ -2737,9 +2774,29 @@ export async function renderAgentDetail(
     );
   }
 
+  // The current version, viewed, when the newest page of versions lists every version the caller
+  // can read and leaves it out: the API sends a cursor only when an older readable version exists,
+  // so it is one the caller cannot read. Its read was an audited 403 on the first view per tab;
+  // the Agents list skips it on the same proof (findings D789, D791).
+  async function currentVersionUnlisted() {
+    if (selected === "draft" || selected !== currentRevisionId) {
+      return false;
+    }
+    const [listed] = await Promise.allSettled([revisionsPromise]);
+    return (
+      listed.status === "fulfilled" &&
+      listed.value.nextCursor === null &&
+      !listed.value.revisions.some(({ id }) => id === selected)
+    );
+  }
+
   async function readSnapshot() {
     // A denied read is audited, so reuse this tab's settled denial instead of asking per view.
-    if (context.deniedReads?.has(snapshotPath) || (await deployedVersionUnlisted())) {
+    if (
+      context.deniedReads?.has(snapshotPath) ||
+      (await deployedVersionUnlisted()) ||
+      (await currentVersionUnlisted())
+    ) {
       throw Object.assign(new Error("Access denied."), {
         status: 403,
         code: "FORBIDDEN",
@@ -3128,7 +3185,7 @@ export async function renderAgentDetail(
           Boolean(draftEditorNavigationBlock) ||
           Boolean(credentials?.mutationPending());
       }
-      deploy.disabled = deployIsDisabled();
+      const deployUnavailable = deployIsDisabled();
       const rejectedAccess =
         !runtimeAuth && credentialRejected()
           ? credentialFixAccess(agent.harnessAuth, callerPermissions)
@@ -3237,9 +3294,14 @@ export async function renderAgentDetail(
           }
         }
       }
-      // A disabled Deploy is described by the line that says why, or by a refused deployment's
-      // alert when that line defers to it (finding D749).
-      describeDisabled(deploy, deployStatus.textContent ? deployStatus : deployFeedback);
+      // An unavailable Deploy is described by the line that says why, or by a refused
+      // deployment's alert when that line defers to it (finding D749), and stays in the Tab order
+      // while one of them shows (finding 2878).
+      setUnavailable(
+        deploy,
+        deployUnavailable,
+        deployStatus.textContent ? deployStatus : deployFeedback,
+      );
       updateChecklist();
     }
     // The last deployment's model credential was rejected and the draft still uses it.
@@ -3805,6 +3867,7 @@ export async function renderAgentDetail(
           }
           // A grant or revocation since the last answer relabels the draft (finding 2421).
           applyDraftAccess();
+          deletion.applyDelete(permissions?.delete);
         }
         // An older reread still applies when no newer one has answered: a newer read that
         // fails resolves to this answer, which the controls would otherwise never see.
@@ -3835,6 +3898,13 @@ export async function renderAgentDetail(
       agentSaveDenial(permissions, agent),
     );
     const next = loadDetails();
+    // Other tabs draw from the last answer and follow the reread (finding 2421), but Repositories
+    // draws its editor only once the reread lands. Rebuilt before that, the tab was empty at the
+    // focus step below: Cancel was not found, the tab strip took focus, the shortened page lost
+    // the reader's place, and the editor drawn later showed no saved status (finding 2892).
+    if (selectedTab === "repositories") {
+      await agentSaveDenied;
+    }
     const data = await next;
     if (!context.isCurrent() || deleting || !data) {
       return;
@@ -3879,7 +3949,7 @@ export async function renderAgentDetail(
     const named = [...content.querySelectorAll("button")].find(
       (candidate) =>
         [focus].flat().includes(candidate.textContent) &&
-        !candidate.disabled &&
+        !isUnavailable(candidate) &&
         !candidate.closest("[hidden]"),
     );
     const status = saved
