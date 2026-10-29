@@ -106,10 +106,6 @@ graph TD
 
 ### 1. Compose discovery metadata and serve public assets
 
-Both final controller stages in the root `Dockerfile` select the fork's
-[bundle](../../deploy/branding/README.md) through `OCC_CONSOLE_THEME_DIR`.
-Overrides retain precedence. Host processes require explicit configuration.
-
 `apps/controller/src/api-startup.mjs:startApi` loads an optional
 [theme bundle](../reference/console/theming.md) once. Invalid bundles stop startup;
 ConfigMap links must resolve inside the bundle. `renderConsoleThemeShell` escapes
@@ -387,8 +383,6 @@ gateway startup and file availability.
 - 2026-10-28 13:01: Keep a held press on one Agent’s copy button from activating another Agent’s button after navigation. (fix-3678 - 594de5868)
 
 - 2026-10-27 14:42: Trace Namespace deletion and recovery. (authoring-run/20fc7b4c-0501-4d3e-9f0c-16a3fd016866 - 0402f1cf1)
-
-- 2026-10-22 14:09: Record fork image defaults (authoring-run/22b185a7-9ab6-40ac-bcab-9efad66e89e0 - d265e167a860a27f793d68f7b42567c5d6a7550e)
 
 - 2026-10-21 22:22: Connect console themes to API startup and the shared shell. (authoring-run/634a754f-a79e-4aac-94fe-0646caf6a287 - 2c9e7f6c4)
 
