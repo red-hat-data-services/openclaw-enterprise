@@ -62,7 +62,7 @@ function nativeAdminHarnessConfiguration(nativeOrigin) {
         trustedProxy: {
           userHeader: "x-occ-identity",
           allowUsers: ["occ-workspace-files"],
-          deviceAutoApprove: { enabled: true, scopes: ["operator.read", "operator.write"] },
+          deviceAutoApprove: { enabled: true, scopes: ["operator.admin"] },
         },
         identityScopes: { "occ-workspace-files": ["operator.admin"] },
       },
