@@ -110,6 +110,7 @@ See the [Agent repository flow](flows/agent-repository-credentials.md).
 | `deploy/runtime/`, `deploy/logging/`, `deploy/examples/` | Runtime packaging, logging configuration, and deployment examples.                               |
 | `deploy/presets/`                                        | Installable Agent Preset requests; see [standard Codex](guides/topics/standard-codex-preset.md). |
 | `deploy/branding/`                                       | Fork-owned default console bundle and [image verification](../deploy/branding/README.md).        |
+| `deploy/docker/`, `deploy/konflux/`                      | Fork-owned Konflux image builds; see [Konflux OCE images](../deploy/konflux/README.md).          |
 | `Dockerfile`, `compose*.yaml`                            | Controller image and local stack definitions or overlays.                                        |
 | `migrations/`, `drizzle.config.ts`                       | Database migrations and Drizzle tooling configuration.                                           |
 | `scripts/`                                               | Build, bootstrap, migration, generation, and maintenance commands.                               |
