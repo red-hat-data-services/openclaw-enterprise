@@ -36,7 +36,9 @@ import {
 import { temporaryDirectory } from "../helpers/temporary-directory.mjs";
 import { servedAs } from "../helpers/agent-identity.mjs";
 import {
+  OPENCLAW_SANDBOX_SETTINGS,
   admittedConfiguration,
+  openClawSandboxRefusal,
   withGatewaySecurityDefaults,
 } from "../helpers/admitted-configuration.mjs";
 
@@ -269,7 +271,7 @@ function createOpenClawConfiguration() {
       defaults: { store: "teamstore" },
       credential_proxy: { enabled: true },
     },
-    agents: { defaults: { sandbox: { mode: "all" } } },
+    agents: { defaults: { sandbox: { mode: "off", scope: "agent" } } },
     plugins: {
       entries: {
         knowledge: {
@@ -1224,7 +1226,9 @@ test("Configuration save and deployment refuse settings the pinned OpenClaw reti
   });
   const flushes = "memory flushes use the session model and its fallbacks";
   const retries = "cyber-policy retries use the active model";
+  const explicitControls = "configure the individual security controls explicitly";
   for (const [path, replacement, value] of [
+    ["security.preset", explicitControls, "personal"],
     ["agents.defaults.compaction.memoryFlush.model", flushes, "openai/gpt-4.1"],
     ["agents.defaults.embeddedAgent.cyberFailover.model", retries, "openai/gpt-4.1"],
     ["plugins.entries.codex.config.appServer.cyberFailover.model", retries, null],
@@ -1259,8 +1263,37 @@ test("Configuration save and deployment refuse settings the pinned OpenClaw reti
     ),
     { label: "Agent save" },
   );
+  // A saved corporate draft remains editable. A deploy must fail before enqueuing a replacement.
+  const corrected = {
+    ...runtimeSelected,
+    security: { audit: { suppressions: [{ checkId: "example.check" }] } },
+    messages: { queue: { allowCollaborativeSteering: false } },
+  };
+  const legacy = { ...corrected, security: { ...corrected.security, preset: "corporate" } };
+  await writePastOcc(configurationDriver, agent.configurationId, legacy);
+  const operations = context.controller.pendingOperations();
+  assertRefused(
+    await request(context.app, "POST", `${agent.agentPath}/deploy`),
+    setting(
+      "security.preset",
+      `must be removed: the OpenClaw runtime retired it (${explicitControls})`,
+    ),
+  );
+  assert.deepEqual(context.controller.pendingOperations(), operations);
+  const revisions = await request(context.app, "GET", `${agent.agentPath}/revisions`);
+  assert.deepEqual(revisions.body.data, []);
+  const read = await request(context.app, "GET", agent.item);
+  assert.deepEqual(read.body.data.values, legacy);
+  const saved = await request(context.app, "PATCH", agent.item, {
+    body: { values: corrected, expectedGeneration: read.body.data.generation },
+  });
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
+  const deployed = await request(context.app, "POST", `${agent.agentPath}/deploy`);
+  assert.equal(deployed.status, 202, JSON.stringify(deployed.body));
+  assert.deepEqual(deployed.body.data.configuration.security, corrected.security);
+  assert.deepEqual(deployed.body.data.configuration.messages, corrected.messages);
+
   // The settings beside them still save.
-  await writePastOcc(configurationDriver, agent.configurationId, runtimeSelected);
   await acceptedOnSave(context, {
     ...runtimeSelected,
     agents: {
@@ -1271,6 +1304,120 @@ test("Configuration save and deployment refuse settings the pinned OpenClaw reti
       },
     },
   });
+});
+
+test("Configuration save and deployment refuse OpenClaw's sandbox, which the OCE runtime cannot run", async () => {
+  // Finding 2767. The pinned OpenClaw runs sandboxed tools in Docker, which the OCE runtime does
+  // not have: a Configuration that turned the sandbox on saved and deployed, then failed every
+  // turn. Finding 2773: exec host "sandbox" sends shell commands to that sandbox, so each one
+  // failed. Every save path, Agent save and deployment run the rule, for the defaults and for one
+  // Agent's entry, which overrides them; configuration-occ.test.mjs proves each refused and
+  // accepted value.
+  const configurationDriver = createConfigurationBackend();
+  const context = await fixture({
+    configurationDriver,
+    computeDriver: kubernetesRules("compute-sandbox-integration", ...configurationRules),
+  });
+  const agent = await storedRowAgent(context, configurationDriver, runtimeSelected, {
+    name: "Sandbox consumer",
+    secretName: "sandbox-key",
+  });
+  const [sandboxMode, execHost] = OPENCLAW_SANDBOX_SETTINGS;
+  const defaultsMode = openClawSandboxRefusal(sandboxMode, sandboxMode.path);
+  const defaultsHost = openClawSandboxRefusal(execHost, execHost.path);
+  const entryHost = openClawSandboxRefusal(execHost, [
+    "agents",
+    "entries",
+    "main",
+    ...execHost.entry,
+  ]);
+  const withSandbox = (sandbox) => ({
+    agents: { defaults: { ...runtimeDefaults, ...(sandbox === undefined ? {} : { sandbox }) } },
+  });
+  // The exec host for every Agent (top-level tools), and for one Agent's entry.
+  const withHost = (host, agentHost) => ({
+    agents: {
+      defaults: runtimeDefaults,
+      ...(agentHost === undefined
+        ? {}
+        : { entries: { main: { tools: { exec: { host: agentHost } } } } }),
+    },
+    ...(host === undefined ? {} : { tools: { exec: { host } } }),
+  });
+  // One setting for every Agent, the other on one Agent's entry.
+  for (const [values, message] of [
+    [withSandbox({ mode: "all", scope: "session" }), defaultsMode],
+    [withHost("gateway", "sandbox"), entryHost],
+  ]) {
+    await refusedAtSaveAndDeploy(context, agent, values, message);
+    assertRefused(await savePreset(context, { configuration: { values } }), message, {
+      label: "Preset save",
+    });
+  }
+  // Agent save refuses a stored row the same way, before any deployment.
+  await writePastOcc(configurationDriver, agent.configurationId, withSandbox({ mode: "all" }));
+  assertRefused(
+    await request(context.app, "PATCH", agent.agentPath, {
+      body: { configurationId: agent.configurationId },
+    }),
+    defaultsMode,
+    { label: "Agent save" },
+  );
+  await writePastOcc(configurationDriver, agent.configurationId, runtimeSelected);
+  // Accepted values save, with the sandbox settings beside them.
+  await acceptedOnSave(context, {
+    agents: {
+      defaults: { ...runtimeDefaults, sandbox: { mode: "off", scope: "session" } },
+      entries: { main: { sandbox: { mode: "off" }, tools: { exec: { host: "node" } } } },
+    },
+    tools: { exec: { host: "auto" } },
+  });
+  // A Preset value that waits on a string variable is checked once filled when its written text
+  // can still spell "off"; a default fills it here, and a boolean variable never can.
+  const waiting = withSandbox({ mode: "{{ vars.mode }}" });
+  assertRefused(
+    await savePreset(context, {
+      variables: { mode: { type: "string", default: "all" } },
+      configuration: { values: waiting },
+    }),
+    defaultsMode,
+  );
+  const deferred = await savePreset(
+    context,
+    { variables: { mode: { type: "string" } }, configuration: { values: waiting } },
+    "Mode-deferred",
+  );
+  assert.equal(deferred.status, 201, JSON.stringify(deferred.body));
+  assertRefused(
+    await savePreset(
+      context,
+      { variables: { mode: { type: "boolean" } }, configuration: { values: waiting } },
+      "Mode-boolean",
+    ),
+    defaultsMode,
+  );
+  // The exec host follows the same rule, for every Agent and for one Agent's entry.
+  for (const [values, message] of [
+    [withHost("{{ vars.host }}"), defaultsHost],
+    [withHost(undefined, "{{ vars.host }}"), entryHost],
+  ]) {
+    assertRefused(
+      await savePreset(context, {
+        variables: { host: { type: "string", default: "sandbox" } },
+        configuration: { values },
+      }),
+      message,
+    );
+  }
+  const deferredHost = await savePreset(
+    context,
+    {
+      variables: { host: { type: "string" } },
+      configuration: { values: withHost("{{ vars.host }}") },
+    },
+    "Host-deferred",
+  );
+  assert.equal(deferredHost.status, 201, JSON.stringify(deferredHost.body));
 });
 
 test("SSH and Docker Compute refuse at save and deployment a Gateway tool policy their embedded Gateway refuses", async () => {
@@ -5004,4 +5151,66 @@ test("A stored Configuration with a literal Gateway password an older release ac
     const revisions = await request(context.app, "GET", `${agentPath}/revisions`);
     assert.deepEqual(revisions.body.data, [], label);
   }
+});
+
+// Exercise regular Configuration/Agent/deployment routes with real Kubernetes
+// admission and OCC Secret authorization; runtime execution is a separate proof.
+test("embedded custom provider deploys through the existing Secret binding workflow", async () => {
+  const { namespace, ...context } = await fixture({
+    computeDriver: kubernetesRules("compute-configured-provider", ...configurationRules),
+  });
+  const model = "router/vendor/model";
+  const values = {
+    agents: { defaults: { model, models: { [model]: { agentRuntime: { id: "openclaw" } } } } },
+    models: {
+      providers: {
+        router: {
+          baseUrl: "https://models.example.test/v1",
+          api: "openai-responses",
+          apiKey: { source: "env", provider: "default", id: "OCE_MODEL_API_KEY" },
+          models: [{ id: "vendor/model", name: "Configured model" }],
+        },
+      },
+    },
+  };
+  const { item, agentPath } = await deployableAgent(context, namespace, {
+    values,
+    name: "Configured provider consumer",
+    secretName: "configured-provider-key",
+  });
+  const saved = await request(context.app, "GET", item);
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.body.data.values.models, values.models);
+  const deployed = await request(context.app, "POST", `${agentPath}/deploy`);
+  assert.equal(deployed.status, 202, JSON.stringify(deployed.body));
+  const revisions = await request(context.app, "GET", `${agentPath}/revisions`);
+  assert.equal(revisions.status, 200);
+  assert.equal(revisions.body.data.length, 1);
+  assert.equal(revisions.body.data[0].harness.mode, "embedded");
+  const bound = await request(context.app, "GET", agentPath);
+  assert.equal(bound.body.data.harnessAuth.method, "api_key");
+  for (const apiKey of [
+    "${OPENAI_API_KEY}",
+    { source: "env", provider: "default", id: "OTHER_KEY" },
+  ]) {
+    const invalid = structuredClone(values);
+    invalid.models.providers.router.apiKey = apiKey;
+    const edited = await request(context.app, "PATCH", item, { body: { values: invalid } });
+    assert.equal(edited.status, 400, JSON.stringify(edited.body));
+    assert.match(JSON.stringify(edited.body), /OCE_MODEL_API_KEY/);
+  }
+  const competing = await request(context.app, "PATCH", agentPath, {
+    body: {
+      secretBindings: {
+        OCE_MODEL_API_KEY: {
+          source: {
+            kind: "secret",
+            namespaceId: namespace.id,
+            id: "sec_00000000-0000-4000-8000-000000000001",
+          },
+        },
+      },
+    },
+  });
+  assert.equal(competing.status, 400, JSON.stringify(competing.body));
 });

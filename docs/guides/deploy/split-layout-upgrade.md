@@ -188,7 +188,15 @@ Configurations, workspace files, transcripts and Secret values.
    for each one, then run the same command again. The ID map records every old
    and new ID, so a rerun after any failure resumes. Exit `4` lists what needs a
    hand: Agents whose deploy failed, such as a service-account Agent without an
-   issued credential, and access bindings it could not re-create.
+   issued credential, and access bindings it could not re-create. The ID map does
+   not record those bindings, so each rerun lists them again and exits `4`, also
+   after you re-create them by hand. Exit `0` does not restore bindings to old
+   Agent revisions; the import only logs them.
+
+   Presets are restored after service-account IDs are mapped, so their Harness
+   authentication refers to the restored account. Existing mapped Presets are
+   left unchanged; inspect their account references before resuming an older
+   import. See the [tenant restore flow](../../flows/tenant-restore.md).
 
 7. Put each Harness workspace back once the new Agent's Harness Pod runs:
 

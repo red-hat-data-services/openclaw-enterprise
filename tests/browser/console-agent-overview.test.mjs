@@ -43,6 +43,7 @@ import {
   versionChooser,
   versionOption,
   waitForChosenVersion,
+  waitForCondition,
   waitForEnabled,
   waitForIdleFetches,
   waitForSettledFetches,
@@ -319,13 +320,13 @@ test("A failed older version raises no recovery while the current version is hid
   await page.getByRole("heading", { name: "Hidden current" }).waitFor();
   const summary = page.locator(".agent-current-summary");
   await summary.getByText("v1 · Failed", { exact: true }).waitFor();
-  await summary.getByText("Selected for service · you cannot read this version").waitFor();
+  // Beside a failed deployment the hidden current version may be older or newer, so the page
+  // names it in the Agents list's words, without its raw ID (finding D791).
+  await summary.getByText("A version you cannot read", { exact: true }).waitFor();
   await page
     .locator(".agent-status-line")
     .getByText(
-      new RegExp(
-        `The current version, rev_.*, is one you cannot read, so this page cannot tell whether the failed v1 deployment affects it\\. ${RegExp.escape(NEW_VERSIONS_READ)}`,
-      ),
+      `The current version is one you cannot read, so this page cannot tell whether the failed v1 deployment affects it. ${NEW_VERSIONS_READ}`,
     )
     .waitFor();
   assert.equal(await page.locator(".deployment-recovery").isHidden(), true);
@@ -1137,9 +1138,7 @@ test("A failed version raises no recovery while the current version is on no loa
   assert.equal(await older.count(), 0);
   await statusLine
     .getByText(
-      new RegExp(
-        `The current version, rev_.*, is one you cannot read, so this page cannot tell whether the failed v2 deployment affects it\\. ${RegExp.escape(NEW_VERSIONS_READ)}`,
-      ),
+      `The current version is one you cannot read, so this page cannot tell whether the failed v2 deployment affects it. ${NEW_VERSIONS_READ}`,
     )
     .waitFor();
   assert.equal(await page.locator(".deployment-recovery").isHidden(), true);
@@ -1210,6 +1209,32 @@ test("A succeeded version says when the current version is on no loaded page", a
     .filter({ hasText: /^v1(?: ·|$)/ })
     .waitFor({ state: "attached" });
   await summary.getByText("Newer version hidden", { exact: true }).waitFor();
+});
+
+// The page skips the current version's read only when the newest page lists every version the
+// reader can read and leaves it out (finding D791). Here it is readable and on an older page: v2,
+// a later failed deployment, is the only version on the first page. The page still reads v1.
+test("A readable current version on an older page is still read", async (t) => {
+  const { fixture, namespace, agent, page } = await agentPage(t, "Paged current", "Paged current");
+  const active = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
+  const revision = await fixture.deployAgent(namespace.id, agent.id);
+  await routeFailedRecord(page, fixture, namespace, agent, revision);
+  await routeOneVersionPerPage(page, fixture, namespace, agent);
+  await trackSettledFetches(page);
+  const snapshotPath = `/namespaces/${namespace.id}/agents/${agent.id}/revisions/${active.revision.id}`;
+  const snapshot = page.waitForResponse(
+    (response) => new URL(response.url()).pathname === snapshotPath,
+  );
+
+  await login(
+    page,
+    fixture,
+    detailUrl(fixture, namespace.id, agent.id, undefined, "configuration"),
+  );
+  await page.getByRole("heading", { name: "Paged current" }).waitFor();
+  assert.equal((await snapshot).status(), 200);
+  await waitForIdleFetches(page);
+  assert.equal(await page.getByText("You cannot read this version", { exact: true }).count(), 0);
 });
 
 test("Recovery offers no draft link without Agent update or deploy permission", async (t) => {
@@ -2114,17 +2139,14 @@ test("a late first deployment read moves nothing above the version tabs", async 
     return sizes;
   };
   // Control: a pending record read before the page shows opens its details as before, and the
-  // summary's note, empty by then, gives its line back.
+  // summary keeps a status note for both successful and delayed updates.
   answer = Promise.resolve(deploymentStatusResponse(revision, { status: "running" }));
   await page.goto(detailUrl(fixture, namespace.id, agent.id, "draft", "configuration").href);
   await page.locator(".agent-detail-pending").waitFor({ state: "detached" });
   await expectDeploymentOutcome(page, "In progress", { folded: false });
-  assert.equal(
-    await summary
-      .locator(":scope > div:nth-child(2) > p")
-      .evaluate((node) => node.checkVisibility()),
-    false,
-  );
+  const freshnessNote = summary.locator(":scope > div:nth-child(2) > p");
+  assert.equal(await freshnessNote.textContent(), "Latest update received.");
+  assert.equal(await freshnessNote.evaluate((node) => node.checkVisibility()), true);
 
   const unavailable = apiErrorResponse(503, "DEPENDENCY_UNAVAILABLE", "Service unavailable.");
   for (const c of [
@@ -2362,9 +2384,9 @@ test("A failed deployment's recovery link scrolls without motion under reduced m
 // A version whose deploy is running, and a page at `viewport` for it. Once the test routes its
 // record, open() signs in to its Access tab (where Share Agent is) under a fake clock and waits
 // for it to settle.
-async function pendingDeploy(t, viewport, name) {
+async function pendingDeploy(t, viewport, name, fixtureOptions) {
   const size = `${viewport.width}x${viewport.height}`;
-  const { fixture, namespace } = await readyNamespace(t, `${name} deploy ${size}`);
+  const { fixture, namespace } = await readyNamespace(t, `${name} deploy ${size}`, fixtureOptions);
   const agent = await fixture.createAgent(namespace.id, `${name} Deploy`, nativeValues("v1"));
   await fixture.seedActiveAgentRevision(namespace.id, agent.id);
   const pending = await fixture.deployAgent(namespace.id, agent.id);
@@ -2510,6 +2532,148 @@ for (const viewport of [
     assert.ok(Math.abs(attemptTop - firstTop) <= 1, `moved ${attemptTop - firstTop} px`);
     assert.ok(settledTop <= firstTop + 1, `moved down ${settledTop - firstTop} px`);
   });
+}
+
+// Exercise the real Controller page and reads; only the deployment response models a
+// worker transition. A terminal poll must not make its automatic overview reread look manual.
+for (const refreshDuring of ["terminal poll", "automatic overview reread"]) {
+  test(
+    `terminal deployment refresh stays quiet and coalesces a click during ${refreshDuring}`,
+    { timeout: 30_000 },
+    async (t) => {
+      const { page, recordUrl, pending, open } = await pendingDeploy(
+        t,
+        { width: 1440, height: 900 },
+        "Terminal refresh",
+        { recordOperations: true },
+      );
+      const agentUrl = recordUrl.split("/deployments/")[0];
+      const revisionsUrl = `${agentUrl}/revisions`;
+      let terminal = false;
+      let terminalReads = 0;
+      let release;
+      const gate = new Promise((resolve) => {
+        release = resolve;
+      });
+      t.after(() => release());
+      let held;
+      const holding = new Promise((resolve) => {
+        held = resolve;
+      });
+      // Completion now reuses the verified record; hold the actual overview read.
+      if (refreshDuring === "automatic overview reread") {
+        await page.route(agentUrl, async (route) => {
+          if (!terminal) {
+            await route.continue();
+            return;
+          }
+          const response = await route.fetch();
+          held();
+          await gate;
+          await route.fulfill({ response });
+        });
+      }
+      await page.route(recordUrl, async (route) => {
+        const response = await route.fetch();
+        assert.equal(response.status(), 200);
+        const body = await response.json();
+        assert.equal(body.data.deploymentId, pending.id);
+        assert.equal(body.data.status, "queued");
+        body.data.status = terminal ? "succeeded" : "running";
+        body.data.progress = null;
+        if (terminal && ++terminalReads === 1 && refreshDuring === "terminal poll") {
+          held();
+          await gate;
+        }
+        await route.fulfill({ response, json: body });
+      });
+      await open();
+      const now = await page.evaluate(() => Date.now());
+      await page.clock.pauseAt(new Date(now + 1000));
+      await showDeploymentTab(page);
+      const refresh = page.getByRole("button", { name: "Refresh deployment", exact: true });
+      await refresh.hover();
+      await refresh.focus();
+      await page.clock.runFor(400);
+      const original = await refresh.elementHandle();
+      const appearance = () =>
+        original.evaluate((button) => ({
+          connected: button.isConnected,
+          focused: globalThis.document.activeElement === button,
+          hovered: button.matches(":hover"),
+          label: button.textContent,
+          disabled: button.getAttribute("aria-disabled"),
+          background: globalThis.getComputedStyle(button).backgroundColor,
+        }));
+      const before = await appearance();
+      assert.equal(before.disabled, "false");
+      assert.equal(before.hovered, true);
+      assert.notEqual(before.background, "rgba(0, 0, 0, 0)");
+      await original.evaluate((button) => {
+        globalThis.refreshDisabledChanges = [];
+        new globalThis.MutationObserver((changes) => {
+          globalThis.refreshDisabledChanges.push(...changes.map((change) => change.oldValue));
+        }).observe(button, {
+          attributes: true,
+          attributeFilter: ["aria-disabled"],
+          attributeOldValue: true,
+        });
+      });
+      const reads = { record: 0, agent: 0, revisions: 0 };
+      page.on("request", (request) => {
+        if (request.method() !== "GET") {
+          return;
+        }
+        if (request.url() === recordUrl) {
+          reads.record += 1;
+        } else if (request.url() === agentUrl) {
+          reads.agent += 1;
+        } else if (request.url() === revisionsUrl) {
+          reads.revisions += 1;
+        }
+      });
+
+      terminal = true;
+      await page.clock.runFor(DEPLOYMENT_POLL_MS);
+      await holding;
+      if (refreshDuring === "automatic overview reread") {
+        await waitForCondition(
+          () => reads.agent === 1 && reads.revisions === 1,
+          "automatic full overview reads started",
+        );
+      }
+      await page.clock.runFor(400);
+      assert.deepEqual(
+        await appearance(),
+        before,
+        "unattended reads retain the stationary hover and focus",
+      );
+      assert.deepEqual(await page.evaluate(() => globalThis.refreshDisabledChanges), []);
+      assert.equal(await refresh.evaluate((button, prior) => button === prior, original), true);
+
+      // An operator click acknowledges immediately, then waits for the quiet read. Repeated
+      // activation cannot queue another full batch, even when the poll also found completion.
+      await refresh.click();
+      assert.equal(await refresh.getAttribute("aria-disabled"), "true");
+      await original.evaluate((button) => button.click());
+      const manual = await holdRequests(t, page, agentUrl, { once: true, afterServer: true });
+      release();
+      await manual.requested;
+      assert.equal(await refresh.getAttribute("aria-disabled"), "true");
+      assert.equal(await refresh.evaluate((button, prior) => button === prior, original), true);
+      manual.release();
+      await waitForIdleFetches(page);
+      await page.clock.runFor(400);
+      assert.deepEqual(await appearance(), before);
+      await expectDeploymentOutcome(page, "Completed", { folded: false });
+      // Terminal records stop polling. A second interval also exposes an accidentally queued batch.
+      await page.clock.runFor(DEPLOYMENT_POLL_MS * 2);
+      await waitForIdleFetches(page);
+      const fullReads = refreshDuring === "terminal poll" ? 1 : 2;
+      assert.deepEqual(reads, { record: 2, agent: fullReads, revisions: fullReads });
+      assert.equal(await refresh.evaluate((button, prior) => button === prior, original), true);
+    },
+  );
 }
 
 // A queued deploy's details list when its next attempt is eligible; the first claim drops that
@@ -3495,7 +3659,10 @@ for (const viewport of [
         tabsTop: box(doc.querySelector(".agent-tabs")).top,
         tabsWidth: box(doc.querySelector(".agent-tabs")).width,
         layoutWidth: box(doc.querySelector(".agent-version-layout")).width,
-        primaries: doc.querySelectorAll(".content .button--primary:not(:disabled)").length,
+        // An unavailable control (aria-disabled, such as Open Agent UI) is not a live primary.
+        primaries: doc.querySelectorAll(
+          '.content .button--primary:not(:disabled, [aria-disabled="true"])',
+        ).length,
         activityShown: [...doc.querySelectorAll(".deployment-status")].some((node) =>
           node.checkVisibility(),
         ),

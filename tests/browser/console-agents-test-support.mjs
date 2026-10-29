@@ -6,6 +6,7 @@ import { GitHubRepositoryPolicy } from "../../apps/controller/src/drivers/repo/g
 import { validateGitHubRepositoryRegistry } from "../../apps/controller/src/drivers/repo/github/credentials/registry.ts";
 import { UnixRepositoryCredentialControlClient } from "../../apps/controller/src/backends/repository-credentials/control-client.ts";
 import { createConsoleAppFixture, backendFixtures } from "../helpers/console-app.mjs";
+import { withNativeAdminGateway } from "../helpers/harness-configuration.mjs";
 import { createTestKubernetesComputeDriver } from "../helpers/kubernetes-compute.mjs";
 import { PROVISIONING_NOT_COMPLETED } from "../helpers/refusal-text.mjs";
 import {
@@ -137,6 +138,34 @@ export async function waitForCreateFormReads(page) {
 
 export async function expectNativeAdminHidden(page) {
   assert.equal(await page.locator(".native-admin-access").isVisible(), false);
+  assert.equal(
+    await page.getByRole("link", { name: "Open Agent UI", exact: true }).isVisible(),
+    false,
+  );
+}
+
+// Unavailable native admin access keeps an "Open Agent UI" button in the Tab order, marked
+// aria-disabled and described by its reason, so a keyboard user reaches why it cannot open
+// (finding 2714). A natively disabled button takes no focus.
+export async function expectNativeAdminUnavailable(page, reason) {
+  const control = page.getByRole("button", { name: "Open Agent UI", exact: true });
+  await control.focus();
+  assert.deepEqual(
+    await control.evaluate((node) => {
+      const document = node.ownerDocument;
+      const description = (node.getAttribute("aria-describedby") ?? "")
+        .split(/\s+/)
+        .map((id) => document.getElementById(id)?.textContent?.trim() ?? "")
+        .filter(Boolean)
+        .join(" ");
+      return {
+        focused: document.activeElement === node,
+        ariaDisabled: node.getAttribute("aria-disabled"),
+        description,
+      };
+    }),
+    { focused: true, ariaDisabled: "true", description: reason },
+  );
   assert.equal(
     await page.getByRole("link", { name: "Open Agent UI", exact: true }).isVisible(),
     false,
@@ -523,6 +552,10 @@ function repositoryPolicyDriver(
   );
 }
 
+// A button the reader can press: an unavailable one is natively disabled, or aria-disabled
+// while a visible reason says why (finding 2878).
+export const LIVE_BUTTON = 'button:not([disabled], [aria-disabled="true"])';
+
 // Back, in-app navigation and reloads can first restore an inert copy of the old view with its
 // controls disabled, until revalidation re-enables it or replaces it with a rebuilt view. Only a
 // live control shows the current view, including any draft it restored.
@@ -531,36 +564,19 @@ export async function waitForLiveControls(page, ids) {
     (controlIds) =>
       controlIds.every((id) => {
         const control = globalThis.document.getElementById(id);
-        return control && !control.disabled && !control.closest("[inert]");
+        return (
+          control &&
+          !control.disabled &&
+          control.getAttribute("aria-disabled") !== "true" &&
+          !control.closest("[inert]")
+        );
       }),
     ids,
   );
 }
 
 export function nativeAdminValues(marker, origin) {
-  const values = nativeValues(marker);
-  return {
-    ...values,
-    gateway: {
-      ...(values.gateway ?? {}),
-      controlUi: {
-        ...(values.gateway?.controlUi ?? {}),
-        enabled: true,
-        allowedOrigins: [origin],
-      },
-      auth: {
-        mode: "trusted-proxy",
-        trustedProxy: {
-          userHeader: "x-occ-identity",
-          allowUsers: ["occ-workspace-files"],
-          deviceAutoApprove: { enabled: true, scopes: ["operator.admin"] },
-        },
-        identityScopes: {
-          "occ-workspace-files": ["operator.admin"],
-        },
-      },
-    },
-  };
+  return withNativeAdminGateway(nativeValues(marker), origin);
 }
 
 // Without a caller-permission summary the console keeps controls enabled, so the API's own
