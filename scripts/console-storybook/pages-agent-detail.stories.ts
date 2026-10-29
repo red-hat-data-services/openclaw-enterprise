@@ -25,7 +25,7 @@ export const GatewayPasswordSaveDenied = story("gatewayPasswordSaveDenied");
 export const GatewayPasswordSaving = story("gatewayPasswordSaving");
 export const GatewaySafety = story("gatewaySafety");
 export const GatewaySafetyStrict = story("gatewaySafetyStrict");
-export const GatewaySafetyCorporate = story("gatewaySafetyCorporate");
+export const GatewaySafetyRejectSteering = story("gatewaySafetyRejectSteering");
 export const GatewaySafetyReader = story("gatewaySafetyReader");
 export const PluginsDraft = story("pluginsDraft");
 export const PluginsUpdateDenied = story("pluginsUpdateDenied");
@@ -62,7 +62,14 @@ export const DeploymentRetrying = story("deploymentRetrying");
 export const DeploymentRunning = story("deploymentRunning");
 export const DeploymentRunningActivates = story("deploymentRunningActivates");
 export const DeploymentCompletesRereadFails = story("deploymentCompletesRereadFails");
-export const DeploymentStatusReadRecovers = story("deploymentStatusReadRecovers");
+export const DeploymentStatusReadRecovers = {
+  ...story("deploymentStatusReadRecovers"),
+  name: "New version in progress, one status read fails",
+};
+export const DeploymentRecordRefused = {
+  ...story("deploymentRecordRefused"),
+  name: "Selected record refusal clears shared evidence",
+};
 export const DeploymentActivityLoading = story("deploymentActivityLoading");
 export const CurrentVersionDuringDeployment = story("currentVersionDuringDeployment");
 export const DeploymentFailed = story("deploymentFailed");
@@ -73,6 +80,9 @@ export const AgentHeader = story("agentHeader");
 export const AgentHeaderMobile = story("agentHeaderMobile");
 export const AgentHeaderNoClipboard = story("agentHeaderNoClipboard");
 export const DraftCredentialRejected = story("draftCredentialRejected");
+export const DraftRetiredSetting = story("draftRetiredSetting");
+export const CredentialRejectedBindingEditor = story("credentialRejectedBindingEditor");
+export const CredentialRejectedHiddenSecretUpdater = story("credentialRejectedHiddenSecretUpdater");
 export const DeploymentFailedLogsFromDraft = story("deploymentFailedLogsFromDraft");
 export const DeploymentModelProbeFailed = story("deploymentModelProbeFailed");
 export const DeploymentFailsWhileWatching = story("deploymentFailsWhileWatching");
@@ -107,6 +117,7 @@ export const RuntimeLogsSlowFirstStatus = story("runtimeLogsSlowFirstStatus");
 export const RuntimeLogsSlowTabClick = story("runtimeLogsSlowTabClick");
 export const RuntimeLogsStartupWarnings = story("runtimeLogsStartupWarnings");
 export const RuntimeLogsDedicatedPods = story("runtimeLogsDedicatedPods");
+export const RuntimeLogsMissingAgentPod = story("runtimeLogsMissingAgentPod");
 export const RuntimeLogsFilteredDownload = story("runtimeLogsFilteredDownload");
 export const RuntimeLogsRateLimited = story("runtimeLogsRateLimited");
 export const RuntimeLogsRefreshRateLimited = story("runtimeLogsRefreshRateLimited");
@@ -124,6 +135,10 @@ export const AgentMissing = { ...story("agentMissing"), name: "Agent unavailable
 export const ConfigurationError = {
   ...story("configurationError"),
   name: "Configuration unavailable",
+};
+export const ConfigurationReadDeniedReloadRefocus = {
+  ...story("configurationReadDeniedReloadRefocus"),
+  name: "Configuration read denied across reload and refocus",
 };
 export const UnreadableAgentConfiguration = story("unreadableAgentConfiguration");
 export const UnreadableRevisionConfiguration = story("unreadableRevisionConfiguration");
@@ -190,6 +205,7 @@ export const SharingHoldsNavigation = { ...story("agentSharingHoldsNavigation") 
 export const SharingHoldsAfterDelete = { ...story("agentSharingHoldsAfterDelete") };
 export const SharingRemoved = { ...story("agentSharingRemoved") };
 export const SharingDenied = { ...story("agentSharingDenied") };
+export const SharingRefusedOnReturn = { ...story("agentSharingRefusedOnReturn") };
 export const SharingUnknown = { ...story("agentSharingUnknown") };
 
 export const BootstrapFailureCleanupPending = story("deploymentBootstrapCleanup");
@@ -237,3 +253,12 @@ export const PolicyApplied = story("policyApplied");
 export const PolicyRetryApplication = story("policyRetryApplication");
 export const PolicyEditingAdminDenied = story("policyEditingAdminDenied");
 export const PolicyNoNetworkLimits = story("policyNoNetworkLimits");
+
+export const AuthenticationReadDenied = {
+  ...story("authenticationReadDenied"),
+  name: "Authentication Save read denied",
+};
+export const ConfigurationSaveReadDenied = {
+  ...story("configurationSaveReadDenied"),
+  name: "Configuration Save read denied",
+};

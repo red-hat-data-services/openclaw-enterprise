@@ -9,7 +9,11 @@ import {
   renderAgentDetail,
 } from "./agents.mjs";
 import { clearRuntimeDenials, forgetRuntimeDenials } from "./agents/logs.mjs";
-import { ASK_INSTALLATION_ADMINISTRATOR, askForGrant } from "./agents/access-reasons.mjs";
+import {
+  ASK_INSTALLATION_ADMINISTRATOR,
+  askForGrant,
+  NAMESPACE_UNAVAILABLE,
+} from "./agents/access-reasons.mjs";
 import { createApiClient } from "./api-client.mjs";
 import { createViewLifetime } from "./view-lifetime.mjs";
 import { createNavigation, pages } from "./navigation.mjs";
@@ -30,14 +34,8 @@ const app = document.querySelector("#app");
 const lifetime = createViewLifetime();
 let session = null;
 let namespaces = [];
-// Namespaces a list read in this sign-in returned: only those can be ones the reader "no
-// longer" has access to (finding 2550).
-const listedNamespaceIds = new Set();
 function setNamespaces(readable) {
   namespaces = sorted(readable);
-  for (const item of namespaces) {
-    listedNamespaceIds.add(item.id);
-  }
 }
 let namespaceId = null;
 let observabilityUrl = null;
@@ -746,10 +744,9 @@ const { publicPanel, renderRows, switchNamespace } = shellUI;
 // selector, which is disabled when no Namespace is readable (a member whose only grant was
 // revoked, on a bookmarked link), so the panel then points at the header's Refresh, as the
 // no-readable-Namespace panel does (findings 2371, 2393).
-function namespaceUnavailablePanel(view, unavailableId) {
-  const why = listedNamespaceIds.has(unavailableId)
-    ? "This Namespace is missing or you no longer have access"
-    : "This Namespace is missing or not shared with you";
+function namespaceUnavailablePanel(view) {
+  // Deleted, never shared and no longer shared read alike: one sentence for every page (D753).
+  const why = NAMESPACE_UNAVAILABLE;
   if (namespaces.length) {
     panel(
       view,
@@ -1147,7 +1144,6 @@ function clearPrivate() {
   session = null;
   backendsDenied = false;
   namespaces = [];
-  listedNamespaceIds.clear();
   namespaceId = null;
   observabilityUrl = null;
   observabilityOwner = null;
@@ -2085,6 +2081,7 @@ async function loadPage({
       reusable: true,
       mutations: 0,
       reads: new Map(),
+      readablePaths: new Set(),
       metaReads: new Set(),
       // Each read's Installation-administration option, so a return replays it gated (finding
       // 2636).
@@ -2121,6 +2118,7 @@ async function loadPage({
         // Live reads (runtime status, log pages) differ on every call; replaying them to
         // revalidate a cached view would only spend the reader's rate limit.
         if ((options.method ?? "GET") === "GET" && options.revalidate !== false) {
+          viewState.readablePaths.add(path);
           recordRead(readSignature(result, options.includeMeta));
           if (options.includeMeta) {
             viewState.metaReads.add(path);
@@ -2187,7 +2185,7 @@ async function loadPage({
           "Ask an Installation administrator to create a Namespace or to give you access to one, then Refresh.",
         );
       } else {
-        namespaceUnavailablePanel(shell.view, namespaceId);
+        namespaceUnavailablePanel(shell.view);
       }
       return;
     }
@@ -2428,8 +2426,20 @@ async function loadPage({
         `/namespaces/${encodeURIComponent(namespaceId)}/agents/${encodeURIComponent(current.agentId)}`,
         JSON.stringify(firstAgent),
       );
+      viewState.readablePaths.add(
+        `/namespaces/${encodeURIComponent(namespaceId)}/agents/${encodeURIComponent(current.agentId)}`,
+      );
       const agent = await renderAgentDetail(
-        { ...agentContext, agentId: current.agentId },
+        {
+          ...agentContext,
+          agentId: current.agentId,
+          onProtectedReadDenied(error, receipt) {
+            if (lifetime.isCurrent(viewState.active)) {
+              agentContext.drafts.clear();
+              showAgentReadFailure(current, namespaceId, error, receipt);
+            }
+          },
+        },
         { agent: firstAgent },
       );
       // The load settles with the Agent's page shown, not its placeholder.
@@ -2455,9 +2465,27 @@ async function loadPage({
       showChatLinkFailure(shell.view, chatLinkFailure);
     } else if (current.feature === "namespaces") {
       renderNamespaces(
-        { ...agentContext, reload: () => loadPage(), fromRefresh },
+        {
+          ...agentContext,
+          reload: () => loadPage(),
+          fromRefresh,
+          sorted,
+          onRemoved(namespace) {
+            clearRetainedViewsForNamespace(namespace.id);
+            setNamespaces(namespaces.filter((item) => item.id !== namespace.id));
+            if (namespaceId === namespace.id) {
+              namespaceId =
+                (
+                  namespaces.find((item) => item.status === "ready") ??
+                  namespaces.find((item) => item.status !== "deleting") ??
+                  namespaces[0]
+                )?.id ?? null;
+              replaceUrl(pageUrl("namespaces"));
+            }
+            shellUI.updateNamespaces(namespaces);
+          },
+        },
         items,
-        renderRows,
       );
     } else if (current.feature === "secrets") {
       renderSecrets({
@@ -2697,6 +2725,36 @@ async function locateAgentNamespace(agentId, excluded) {
   return { namespaceId: null, complete };
 }
 
+function showAgentReadFailure(current, selectedNamespace, error, receipt) {
+  resetReads();
+  if ([400, 403, 404].includes(error.status)) {
+    clearRetainedViewsForNamespace(selectedNamespace);
+  }
+  const shell = renderShell(current.feature);
+  panel(
+    shell.view,
+    error.status === 403
+      ? "Access denied"
+      : error.status === 404
+        ? "Resource unavailable"
+        : "Request unavailable",
+    error.status === 403
+      ? agentPageReadRefusal(error)
+      : "The read could not be completed. Retry to check current access and saved state.",
+    // A permission refusal offers the header's Refresh, not a Retry that repeats it.
+    error.status === 403 ? undefined : "Retry",
+    error.status === 403 ? undefined : () => void loadPage(),
+    receipt ? undefined : error.requestId,
+  );
+  if (receipt) {
+    shell.view.append(receipt);
+  }
+  if (error.status === 403) {
+    shell.refresh.disabled = false;
+  }
+  return shell.view;
+}
+
 async function revalidateMountedAgent(current) {
   const key = routeKey(current);
   const view = app.querySelector('.content [aria-live="polite"]');
@@ -2767,10 +2825,7 @@ async function revalidateMountedAgent(current) {
     if (!namespaces.some((item) => item.id === selectedNamespace)) {
       clearRetainedViewsForNamespace(selectedNamespace);
       resetReads();
-      namespaceUnavailablePanel(
-        renderShell(current.feature, false, { page: null }).view,
-        selectedNamespace,
-      );
+      namespaceUnavailablePanel(renderShell(current.feature, false, { page: null }).view);
       return;
     }
     checking = "detail";
@@ -2782,13 +2837,28 @@ async function revalidateMountedAgent(current) {
     if (current.url.searchParams.get("tab") !== "workspace") {
       const selected =
         current.url.searchParams.get("revision") ?? agent.activeRevisionId ?? "draft";
+      const snapshotPath =
+        selected === "draft"
+          ? `/namespaces/${encodeURIComponent(selectedNamespace)}/configurations/${encodeURIComponent(agent.configurationId)}`
+          : `${path}/revisions/${encodeURIComponent(selected)}`;
+      const previousSnapshotRead = mountedViewState?.reads.get(snapshotPath);
+      const snapshotWasReadable = mountedViewState?.readablePaths.has(snapshotPath);
       await Promise.all([
         request(`${path}/revisions`),
-        request(
-          selected === "draft"
-            ? `/namespaces/${encodeURIComponent(selectedNamespace)}/configurations/${encodeURIComponent(agent.configurationId)}`
-            : `${path}/revisions/${encodeURIComponent(selected)}`,
-        ),
+        request(snapshotPath).catch((error) => {
+          // Initial admission can show an Agent with its draft Configuration denied. Keep
+          // that same refusal, but scrub a page whose previously readable data was revoked.
+          if (
+            selected === "draft" &&
+            error.status === 403 &&
+            (previousSnapshotRead === refusedRead(403) ||
+              deniedReadsFor(owner).has(snapshotPath)) &&
+            snapshotWasReadable === false
+          ) {
+            return;
+          }
+          throw error;
+        }),
       ]);
     }
   } catch (error) {
@@ -2799,35 +2869,14 @@ async function revalidateMountedAgent(current) {
       showExpiredLogin();
       return;
     }
-    resetReads();
     if (checking !== "detail") {
+      resetReads();
       // Drafts survive an unavailable check, as in loadPage (finding 1935).
       clearPrivate();
       showAdmissionUnavailable(checking !== "session", error.status);
       return;
     }
-    if ([400, 403, 404].includes(error.status)) {
-      clearRetainedViewsForNamespace(selectedNamespace);
-    }
-    const shell = renderShell(current.feature);
-    panel(
-      shell.view,
-      error.status === 403
-        ? "Access denied"
-        : error.status === 404
-          ? "Resource unavailable"
-          : "Request unavailable",
-      error.status === 403
-        ? agentPageReadRefusal(error)
-        : "The read could not be completed. Retry to check current access and saved state.",
-      // A permission refusal offers the header's Refresh, not a Retry that repeats it.
-      error.status === 403 ? undefined : "Retry",
-      error.status === 403 ? undefined : () => void loadPage(),
-      error.requestId,
-    );
-    if (error.status === 403) {
-      shell.refresh.disabled = false;
-    }
+    showAgentReadFailure(current, selectedNamespace, error);
   } finally {
     clearTimeout(stillChecking);
     clearStillChecking?.();
