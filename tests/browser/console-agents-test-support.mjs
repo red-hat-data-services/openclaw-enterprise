@@ -1,3 +1,4 @@
+import { DEDICATED_OPENCLAW_SUPPORT } from "../helpers/sandbox-driver.ts";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -117,6 +118,61 @@ export async function openAdvancedSettings(page) {
   if (await summary.count()) {
     await summary.click();
   }
+}
+
+// Create Agent's access slot above the form. A refused Installation read's answer is one status
+// block there, never the grey hint under the fields (finding 2092): its text appears once on the
+// page. `retry` says whether the block offers Retry permission check as its action.
+export async function expectCreateAccess(page, { tone, body, retry = false }) {
+  const access = page.locator("#create-agent-access");
+  await access.locator(".status-body").getByText(body, { exact: true }).waitFor();
+  assert.deepEqual(
+    await access.evaluate((node) => ({
+      role: node.getAttribute("role"),
+      tone: node.getAttribute("data-tone"),
+      label: node.querySelector(".status-label")?.textContent,
+      body: [...node.querySelectorAll(".status-body")].map((line) => line.textContent),
+      next: node.nextElementSibling?.id,
+    })),
+    {
+      role: tone === "info" ? "status" : "alert",
+      tone,
+      label: "Your access",
+      body: [body],
+      next: "create-agent-form",
+    },
+  );
+  assert.equal(await page.getByText(body, { exact: true }).count(), 1);
+  assert.equal(
+    await access.getByRole("button", { name: "Retry permission check", exact: true }).isVisible(),
+    retry,
+  );
+  // The capability retry under the fields never stands in for the permission retry.
+  assert.equal(
+    await page.getByRole("button", { name: "Retry capability check", exact: true }).count(),
+    0,
+  );
+  return access;
+}
+
+// Create Agent with a permission answer that refuses Agent create: the refusal takes the form's
+// place, with no start choices and no access block, whether the page loaded with that answer or a
+// permission retry brought it (findings 1521, 2908). Returns the refusal.
+export async function expectCreateRefused(page, body) {
+  const refusal = page.locator(".state-panel").filter({
+    has: page.getByRole("heading", { name: "Creating Agents is not available", exact: true }),
+  });
+  await refusal.waitFor();
+  assert.deepEqual(
+    await refusal.evaluate((node) => ({
+      status: [...node.querySelectorAll('[role="status"]')].map((line) => line.textContent),
+      form: node.ownerDocument.querySelectorAll("#create-agent-form").length,
+      access: node.ownerDocument.querySelectorAll("#create-agent-access").length,
+    })),
+    { status: [body], form: 0, access: 0 },
+  );
+  assert.equal(await page.getByRole("button", { name: /^Start (with|without) / }).count(), 0);
+  return refusal;
 }
 
 // Create Agent stays disabled while the form reads Installation capabilities and repository
@@ -336,6 +392,7 @@ export function nativeSandboxDriver(facets = ["networking", "filesystem", "proce
     id: "console-native-sandbox",
     capability: "sandbox",
     implementation: "console-native",
+    supportsHarnessExecutionMode: DEDICATED_OPENCLAW_SUPPORT,
     facets,
     async provisionHarness() {
       assert.fail("provisioning admission must leave effects to the worker");
