@@ -75,6 +75,14 @@ assert_ok "build.json records OCE_COMMIT" podman run --rm "$IMAGE" node -e \
     'const b = require("/opt/oce/runtime/build.json"); process.exit(b.commit === process.argv[1] ? 0 : 1)' "$OCE_COMMIT"
 REVISION=$(podman image inspect --format '{{index .Labels "org.opencontainers.image.revision"}}' "$IMAGE")
 assert_ok "revision label matches OCE_COMMIT" test "$REVISION" = "$OCE_COMMIT"
+assert_ok "OCE Google skill ships with the managed Google CLI" run_in "$IMAGE" \
+    test -f /usr/local/lib/oce/plugins/google/skills/oce-google/SKILL.md
+assert_ok "managed Google CLI matches its release manifest" run_in "$IMAGE" node -e '
+const root = "/usr/local/lib/oce/plugins/google";
+const release = require(`${root}/release.json`);
+const reported = require("node:child_process").execFileSync(`${root}/bin/${release.executable}`, ["--version"], { encoding: "utf8" });
+process.exit(reported.split(/\s/, 1)[0] === `v${release.version}` ? 0 : 1);
+'
 assert_ok "repository-credentials client is installed" podman run --rm "$IMAGE" \
     test -x /opt/oce/repository-credentials/bin/gh
 assert_ok "repository-credentials oce-github is installed" podman run --rm "$IMAGE" \

@@ -87,6 +87,7 @@ cp --parents -R \
     packages/occ/src \
     packages/utils/src \
     apps/controller/src \
+    apps/controller/plugins \
     migrations/[0-9]*.sql \
     migrations/meta/_journal.json \
     migrations/meta/_canonical-history.json \
