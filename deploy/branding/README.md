@@ -50,7 +50,9 @@ restores the image's environment default.
 
 Keep edits confined to this directory and the two Dockerfile blocks marked
 `Fork branding`. Do not patch the console, theme loader, Compose configuration,
-or Helm templates for branding. Merge upstream normally and preserve both blocks
+Helm templates, or upstream documentation for branding. Document fork behavior
+on this page; lines added to upstream pages conflict with upstream edits during
+the downstream sync. Merge upstream normally and preserve both blocks
 if the final stages move. Changes to the upstream theme schema or image recipe
 need review; a newly introduced controller image target must include the bundle
 and its environment default too.
