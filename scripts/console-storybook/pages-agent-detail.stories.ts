@@ -28,6 +28,7 @@ export const GatewaySafetyStrict = story("gatewaySafetyStrict");
 export const GatewaySafetyRejectSteering = story("gatewaySafetyRejectSteering");
 export const GatewaySafetyReader = story("gatewaySafetyReader");
 export const PluginsDraft = story("pluginsDraft");
+export const PluginsPrefetchReturn = story("pluginsPrefetchReturn");
 export const PluginsUpdateDenied = story("pluginsUpdateDenied");
 export const DraftReader = story("draftReader");
 export const DraftSourcesOperateDenied = story("draftSourcesOperateDenied");
@@ -46,6 +47,7 @@ export const InvalidConfiguration = {
 export const InvalidConfigurationInvisibleCharacters = story(
   "invalidConfigurationInvisibleCharacters",
 );
+export const InvalidConfigurationCurlyQuotes = story("invalidConfigurationCurlyQuotes");
 export const ConfigurationChangedElsewhereMerged = story("configurationChangedElsewhereMerged");
 export const Admitted = story("admitted");
 export const RepositoryDraft = {
@@ -118,6 +120,8 @@ export const RuntimeLogsSlowTabClick = story("runtimeLogsSlowTabClick");
 export const RuntimeLogsStartupWarnings = story("runtimeLogsStartupWarnings");
 export const RuntimeLogsDedicatedPods = story("runtimeLogsDedicatedPods");
 export const RuntimeLogsMissingAgentPod = story("runtimeLogsMissingAgentPod");
+export const RuntimeLogsNoPod = story("runtimeLogsNoPod");
+export const RuntimeLogsReplacedVersion = story("runtimeLogsReplacedVersion");
 export const RuntimeLogsFilteredDownload = story("runtimeLogsFilteredDownload");
 export const RuntimeLogsRateLimited = story("runtimeLogsRateLimited");
 export const RuntimeLogsRefreshRateLimited = story("runtimeLogsRefreshRateLimited");
@@ -177,6 +181,7 @@ export const DeployAgentPrincipalDenied = {
   ...story("deployAgentPrincipalDenied"),
   name: "Deployment denied for the Agent's service principal",
 };
+export const DeploySandboxPolicyReadDenied = story("deploySandboxPolicyReadDenied");
 
 export const RepositoryEditor = story("repositoryEditor");
 export const RepositoryEditorUpdateDenied = story("repositoryEditorUpdateDenied");
@@ -206,7 +211,10 @@ export const SharingHoldsAfterDelete = { ...story("agentSharingHoldsAfterDelete"
 export const SharingRemoved = { ...story("agentSharingRemoved") };
 export const SharingDenied = { ...story("agentSharingDenied") };
 export const SharingRefusedOnReturn = { ...story("agentSharingRefusedOnReturn") };
+export const SharingRegranted = { ...story("agentSharingRegranted") };
 export const SharingUnknown = { ...story("agentSharingUnknown") };
+export const CurrentVersionHidden = story("agentCurrentVersionHidden");
+export const CurrentVersionHiddenLogs = story("agentCurrentVersionHiddenLogs");
 
 export const BootstrapFailureCleanupPending = story("deploymentBootstrapCleanup");
 export const BootstrapContainerStatusAndLogs = story("runtimeBootstrapContainers");
@@ -224,6 +232,7 @@ export const PolicyDenialsMissingMetadata = story("policyDenialsMissingMetadata"
 export const PolicyDenialsFailed = story("policyDenialsFailed");
 export const PolicyApplicationCeilingChanged = story("policyApplicationCeilingChanged");
 export const PolicyDenialsApplyRejected = story("policyDenialsApplyRejected");
+export const PolicyDenialsApplyDenied = story("policyDenialsApplyDenied");
 export const PolicyIncompletePreview = story("policyIncompletePreview");
 export const PolicyUnconfirmedSave = story("policyUnconfirmedSave");
 export const PolicyDenialsEditDenied = story("policyDenialsEditDenied");

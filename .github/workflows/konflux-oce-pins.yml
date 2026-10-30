@@ -1,0 +1,51 @@
+name: Konflux OCE Pins
+
+# The Konflux OCE images port deploy/runtime/Dockerfile and the root Dockerfile
+# to Hummingbird by hand. This check fails when an upstream sync changes either
+# recipe beyond its pins, or when the derived build-args drift from
+# deploy/runtime, so the port lands with the sync instead of breaking the build.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/konflux-oce-pins.yml
+      - Dockerfile
+      - deploy/docker/Dockerfile.konflux.oce-*
+      - deploy/konflux/**
+      - deploy/runtime/**
+      - package.json
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/konflux-oce-pins.yml
+      - Dockerfile
+      - deploy/docker/Dockerfile.konflux.oce-*
+      - deploy/konflux/**
+      - deploy/runtime/**
+      - package.json
+
+concurrency:
+  group: konflux-oce-pins-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check OCE Konflux pins
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The review baseline is read from history with git show.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Unit tests
+        run: python3 -m unittest -v deploy/konflux/test_oce_pins.py
+      - name: Pins and recipe drift
+        run: python3 deploy/konflux/oce_pins.py --check
+      - name: Shell scripts
+        run: shellcheck -S warning -x deploy/konflux/*.sh deploy/konflux/*/*.sh

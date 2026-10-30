@@ -1,0 +1,11 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github>red-hat-data-services/konflux-central//renovate/default-renovate.json5"],
+  "packageRules": [
+    {
+      "description": "No Konflux build gates the OCE images yet, and the org default ignores tests when it automerges",
+      "matchFileNames": ["deploy/docker/Dockerfile.konflux.oce-*"],
+      "automerge": false
+    }
+  ]
+}

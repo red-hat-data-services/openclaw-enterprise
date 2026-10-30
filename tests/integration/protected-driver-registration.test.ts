@@ -1,3 +1,4 @@
+import { bindRepositoryGitTransport } from "../../apps/controller/src/composition/repository-credentials/transport.ts";
 import {
   openShellGitRuntimeFixture,
   registry as runtimeRegistry,
@@ -16,10 +17,14 @@ import {
   type OpenShellSandboxDriverOptions,
 } from "../../apps/controller/src/drivers/sandbox/openshell.ts";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { temporaryDirectory } from "../helpers/temporary-directory.mjs";
 import { GitHubRepositoryPolicy } from "../../apps/controller/src/drivers/repo/github/policy.ts";
-import { composeRepositoryAccess } from "../../apps/controller/src/composition/repository-credentials/platform.ts";
+import { loadRepositoryPolicy } from "../../apps/controller/src/composition/repository-credentials/policy.ts";
+import { requireConfiguration } from "../../packages/contracts/src/index.ts";
+import type { RepositorySelectionMode } from "../helpers/repository-selection-load.ts";
+import { fileURLToPath } from "node:url";
 import { createServer } from "node:https";
 import { protectedDriverPackage } from "../helpers/protected-driver-package.ts";
 import { join } from "node:path";
@@ -27,13 +32,22 @@ import test, { afterEach } from "node:test";
 import type {
   AgentRevision,
   ComputeDriver,
+  CredentialProxyDriver,
   Driver,
   EgressInstallation,
   Namespace,
+  ProtectedRepositoryGitAuthority,
   SandboxHarnessStatusContext,
 } from "../../packages/contracts/src/index.ts";
-import { InstalledDriver, OpenClawController } from "../../packages/occ/src/index.ts";
-import { loadInstallationConfiguration } from "../../apps/controller/src/composition/installation-config.ts";
+import {
+  InstalledDriver,
+  OpenClawController,
+  type PostgresPool,
+} from "../../packages/occ/src/index.ts";
+import {
+  loadInstallationConfiguration,
+  type InstallationRuntimeDrivers,
+} from "../../apps/controller/src/composition/installation-config.ts";
 import { installEgressAuthority } from "../../apps/controller/src/composition/egress-authority.ts";
 import { ProtectedExecutionDriver } from "../../apps/controller/src/drivers/compute/protected-execution-driver.ts";
 import { ComputeLifecycleDispatcher } from "../../apps/controller/src/drivers/compute/lifecycle-hooks.ts";
@@ -432,7 +446,7 @@ test("protected Git resolves repository and installation grants without granting
   const registryPath = join(directory, "registry.json");
   await writeFile(registryPath, JSON.stringify(registry), { mode: 0o600 });
   const compose = () =>
-    composeRepositoryAccess({
+    loadRepositoryPolicy({
       backend: {
         id: registry.backendId,
         type: "github",
@@ -445,7 +459,10 @@ test("protected Git resolves repository and installation grants without granting
         definition: GitHubRepositoryPolicy,
         configuration: { sessionDurationSeconds: 600 },
       },
-      protectedGit: true,
+      policyConfiguration: requireConfiguration<{ readonly sessionDurationSeconds: number }>(
+        GitHubRepositoryPolicy,
+        { sessionDurationSeconds: 600 },
+      ),
     });
   const access = await compose();
   const resolve = access.resolveRepositoryDelivery;
@@ -475,11 +492,17 @@ test("protected Git resolves repository and installation grants without granting
     },
   };
   assert.deepEqual(resolve(standing), resolve(revision));
-  // Removing the approval policy does not change the finite grant's identity.
+  // Composition from a registry that withdrew standing approval keeps the finite grant's
+  // identity and refuses the standing revision itself, so the worker's
+  // REPOSITORY_STANDING_POLICY_CHANGED recheck is not the only refusal.
   const { allowStandingApprovals: _standing, ...finiteRegistry } = registry;
-  const noStanding = createGitHubRepositoryDeliveryResolver(finiteRegistry);
-  assert.deepEqual(noStanding(revision), resolve(revision));
-  assert.throws(() => noStanding(standing), /Standing repository policy is unavailable/);
+  await writeFile(registryPath, JSON.stringify(finiteRegistry));
+  const finite = await compose();
+  assert.deepEqual(finite.resolveRepositoryDelivery(revision), resolve(revision));
+  assert.throws(
+    () => finite.resolveRepositoryDelivery(standing),
+    /Standing repository policy is unavailable/,
+  );
   for (const changed of [
     { ...binding, repositoryRef: "other" },
     { ...binding, grant: { ...binding.grant, repositoryId: "99999" } },
@@ -544,7 +567,7 @@ test("OpenShell registration pairs its capabilities using only a Repo delivery r
     },
   };
   let runtime: OpenShellGitRuntime | undefined;
-  const capabilities = createOpenShellCapabilities({
+  const input = {
     sandbox: {
       id: "openshell-sandbox",
       implementation: "openshell",
@@ -579,12 +602,70 @@ test("OpenShell registration pairs its capabilities using only a Repo delivery r
         authority: {} as OpenShellGitRuntime["configuration"]["authority"],
       },
     },
-  });
+  } satisfies Parameters<typeof createOpenShellCapabilities>[0];
+  const capabilities = createOpenShellCapabilities(input);
   t.after(() => capabilities.close());
   assert.ok(runtime);
   assert.ok(capabilities.sandbox.repositoryAccess);
   assert.ok(capabilities.proxy?.bindRepositoryGit);
+  assert.ok(capabilities.repositoryTransport);
   assert.equal(runtime.configuration.protectedExecution, true);
+  // Observe the actual bundled handoff without starting listeners or contacting PostgreSQL.
+  const authority = {} as ProtectedRepositoryGitAuthority;
+  const connect = t.mock.method(runtime, "connectRouteStore");
+  const bind = t.mock.method(
+    capabilities.proxy as Required<Pick<CredentialProxyDriver, "bindRepositoryGit">>,
+    "bindRepositoryGit",
+    async (received: ProtectedRepositoryGitAuthority) => {
+      assert.equal(connect.mock.callCount(), 1);
+      assert.equal(received, authority);
+      return { async close() {} };
+    },
+  );
+  const registration = {
+    capabilities: { sandbox: capabilities.sandbox, credential_proxy: capabilities.proxy },
+  };
+  const selected = new InstalledDriver(input.sandbox, registration);
+  const drivers = {
+    protectedDriver: selected,
+    repositoryGitDriver: selected,
+    repositoryTransport: capabilities.repositoryTransport,
+  } as InstallationRuntimeDrivers;
+  const pool = {} as PostgresPool;
+  const { repositoryGitDriver: _repositoryGitDriver, ...withoutDriver } = drivers;
+  for (const [selection, availableAuthority] of [
+    [{ ...drivers, protectedDriver: new InstalledDriver(input.sandbox, registration) }, authority],
+    [withoutDriver, authority],
+    [drivers, undefined],
+  ] as const) {
+    await assert.rejects(
+      bindRepositoryGitTransport(selection, availableAuthority, pool),
+      /selected Driver/,
+    );
+  }
+  await assert.rejects(
+    // @ts-expect-error Deliberately exercise a malformed runtime call.
+    capabilities.repositoryTransport.bind(undefined, pool),
+    /selected Driver/,
+  );
+  assert.equal(connect.mock.callCount(), 0);
+  assert.equal(bind.mock.callCount(), 0);
+  await bindRepositoryGitTransport(drivers, authority, pool);
+  assert.equal(bind.mock.callCount(), 1);
+
+  // Reject the unsupported helper path before constructing any Sandbox or Git runtime.
+  const construct = t.mock.fn(input.createSandbox);
+  const { proxy: _proxy, repository, ...bareInput } = input;
+  assert.throws(
+    () => createOpenShellCapabilities({ ...bareInput, repository, createSandbox: construct }),
+    /protected.*proxy/i,
+  );
+  assert.equal(construct.mock.callCount(), 0);
+  const bare = createOpenShellCapabilities(bareInput);
+  t.after(() => bare.close());
+  assert.equal(bare.sandbox.id, input.sandbox.id);
+  assert.equal(bare.repositoryTransport, undefined);
+  assert.equal(bare.sandbox.repositoryAccess, undefined);
 });
 
 test("the running OpenShell recipient refuses a changed Repo ref or foreign supplier identity without restoring access", async () => {
@@ -678,6 +759,46 @@ test("repository scope changes invalidate the external Driver identity while a r
   const original = await load();
   const reloaded = await load();
   assert.deepEqual(reloaded.protectedDriver!.ref, original.protectedDriver!.ref);
+  // A fresh process observes resolution before the installation loader can warm its module cache.
+  const modes: Record<RepositorySelectionMode, object> = {
+    none: base,
+    protected: configuration,
+    native: {
+      ...configuration,
+      repository: {
+        ...configuration.repository,
+        nativeSender: { controlSocket: "/unselected/control.sock", publicCaPath: certFile },
+      },
+      drivers: {
+        ...base.drivers,
+        compute: {
+          ...base.drivers.compute,
+          configuration: {
+            ...base.drivers.compute.configuration,
+            network: {
+              ...base.drivers.compute.configuration.network,
+              repositoryCredentials: {
+                namespace: "occ-system",
+                podLabels: { app: "repository" },
+                port: 8443,
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+  const helper = fileURLToPath(new URL("../helpers/repository-selection-load.ts", import.meta.url));
+  for (const [mode, value] of Object.entries(modes)) {
+    const selectedPath = join(directory, `${mode}.json`);
+    await writeFile(selectedPath, JSON.stringify(value));
+    const child = spawnSync(process.execPath, [helper, mode, selectedPath, directory], {
+      encoding: "utf8",
+      timeout: 30_000,
+      env: { NODE_ENV: "production" },
+    });
+    assert.equal(child.status, 0, child.error?.message ?? child.stderr);
+  }
   const binding = await original.repositoryPolicy!.resolve({
     namespaceId: "namespace-a",
     bindings: [{ repositoryRef: "application", profile: "git-write" }],
