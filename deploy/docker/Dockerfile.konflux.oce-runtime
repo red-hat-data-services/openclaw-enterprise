@@ -111,6 +111,20 @@ FROM builder AS oce-source
 WORKDIR /oce
 COPY . .
 
+# Upstream runtime stage: the managed Google CLI, installed by upstream's
+# installer from the reviewed release manifest next to the OCE skill. Upstream
+# runs it in the final stage; here it runs in the builder, which has curl and
+# tar, and the final stage copies the tree.
+FROM oce-source AS google-cli
+ARG TARGETARCH
+RUN /bin/bash -euo pipefail <<'EOF'
+plugin=/out/usr/local/lib/oce/plugins/google
+mkdir -p "$plugin/bin"
+cp -R apps/controller/plugins/oce-google-workspace/skills "$plugin/skills"
+cp apps/controller/plugins/oce-google-workspace/ai.openclaw.oce/release.json "$plugin/release.json"
+node deploy/runtime/google/install-gog.mts "$plugin" "linux-${TARGETARCH}" "$plugin/bin" scripts/ci/download-pinned.sh
+EOF
+
 # Repository-credentials client, built from the same OCE checkout. Lifecycle
 # scripts stay disabled, as upstream does. Upstream compiles only the client
 # closure and assembles it as one tree with fixed modes and timestamps, copied
@@ -223,11 +237,14 @@ RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce
 # lock reinspection and custody still guard every destructive operation.
 RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce-runtime \
     git apply /tmp/oce-runtime/openclaw-terminated-gateway-namespace.patch
+# Forward the scoped Google placeholder and the OpenShell TLS root to native worker children.
+RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce-runtime \
+    git apply /tmp/oce-runtime/openclaw-google-worker-placeholder.patch
 
 # Run the bridge tests alongside the build using the same patched source.
 # Packaging mounts this stage so a failed test still blocks the runtime image.
 FROM openclaw-patched-source AS openclaw-bridge-tests
-# One runner invocation for both Node test files: the runner compiles the whole
+# One runner invocation for the Node test files: the runner compiles the whole
 # source tree for its workers first (about a minute), and a second invocation on
 # a fresh .artifacts mount would compile it again. The test runner restores its
 # cache by renaming directories; a fresh mount keeps those renames off the
@@ -235,7 +252,7 @@ FROM openclaw-patched-source AS openclaw-bridge-tests
 RUN --network=none --mount=type=tmpfs,target=/source/.artifacts \
     OPENCLAW_VITEST_RUNTIME=node OPENCLAW_VITEST_MAX_WORKERS=1 pnpm_config_verify_deps_before_run=false \
     node --import ./scripts/tsx.mjs scripts/test-projects.mts src/gateway/server.required-placement-scopes.test.ts \
-    src/infra/gateway-lock-recovery.test.ts
+    src/infra/gateway-lock-recovery.test.ts src/node-host/node-worker-google-placeholder.test.ts
 # Type-check the two UI test graphs touched by the bridge. The upstream runner
 # generates its database types and compiler cache under .artifacts.
 RUN --network=none --mount=type=tmpfs,target=/source/.artifacts \
@@ -439,6 +456,8 @@ gh_state="$(mktemp -d)"
 XDG_STATE_HOME="$gh_state" /usr/local/bin/gh --version | grep -q '^gh version '
 rm -rf "$gh_state"
 EOF
+
+COPY --from=google-cli /out/ /
 
 COPY --from=openclaw-runtime-assets /out/ /opt/oce/runtime/
 COPY --from=openclaw-runtime-assets /source/ /app/node_modules/openclaw/

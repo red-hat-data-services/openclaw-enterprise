@@ -21,6 +21,8 @@ assert_ok "console carries the OCE build revision" podman run --rm "$IMAGE" -e \
     'const html = require("node:fs").readFileSync("/app/apps/controller/src/console/index.html", "utf8"); process.exit(html.includes(`<meta name="occ-build-revision" content="${process.argv[1]}" />`) ? 0 : 1)' "$OCE_COMMIT"
 assert_ok "migrations are present" podman run --rm --entrypoint bash "$IMAGE" \
     -c 'compgen -G "/app/migrations/[0-9]*.sql" > /dev/null && test -f /app/migrations/meta/_journal.json'
+assert_ok "Google Workspace plugin is installed" run_in "$IMAGE" \
+    test -f /app/apps/controller/plugins/oce-google-workspace/ai.openclaw.oce/release.json
 assert_ok "route compilers are precompiled" podman run --rm --entrypoint bash "$IMAGE" \
     -c 'test -s /app/apps/controller/dist/route-compilers.cjs'
 assert_ok "presets are present" podman run --rm "$IMAGE" -e \
