@@ -197,16 +197,11 @@ async function createLiveNativeAgent(fixture, namespace, name, options = {}) {
     options.nativeDomain ?? nativeDomain,
     options.publicOrigin ?? publicOrigin,
   );
-  const configuration = withNativeAdminGateway(
-    createHarnessConfiguration("openclaw", "gpt-4.1"),
-    nativeOrigin,
+  await fixture.updateConfiguration(
+    namespace.id,
+    agent.configurationId,
+    withNativeAdminGateway(createHarnessConfiguration("openclaw", "gpt-4.1"), nativeOrigin),
   );
-  // The identity grant supplies operator.admin; device enrollment stays narrower.
-  configuration.gateway.auth.trustedProxy.deviceAutoApprove.scopes = [
-    "operator.read",
-    "operator.write",
-  ];
-  await fixture.updateConfiguration(namespace.id, agent.configurationId, configuration);
   const revision = await fixture.controller.deployAgent(
     adminPrincipal(fixture).id,
     { namespaceId: namespace.id, agentId: agent.id },
