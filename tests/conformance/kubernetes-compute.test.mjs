@@ -79,10 +79,21 @@ import { createOccLogger, emitOccLogEvent } from "../../apps/controller/src/logg
 import { harnessTlsFixture } from "../helpers/harness-tls.mjs";
 import { conformanceKubeconfig } from "../helpers/kubernetes-compute.mjs";
 import {
+  CODEX_PLACEMENT_REFUSAL,
+  DEDICATED_OPENCLAW_SANDBOX_REQUIRED,
+  DEDICATED_STORAGE_ROUTING_REQUIRED,
+  EMBEDDED_API_KEY_REQUIRED,
+  codexApiKeyRefusal,
+  unsupportedChannelRefusal,
   KUBERNETES_GATEWAY_PASSWORD_REFUSAL,
   KUBERNETES_GATEWAY_PASSWORD_REQUIREMENT,
+  kubernetesGatewayPasswordRequirement,
   dedicatedCodexVariableRefusal,
   unboundPluginSecretRefusal,
+  unreadablePluginSecretRefusal,
+  unboundUnreadablePluginSecretRefusal,
+  appServerUnreadablePluginSecretRefusal,
+  unreadableGatewayPasswordRefusal,
   unboundReferenceRefusal,
   unreadableSlackTokenRefusal,
   unsubstitutedFallbackRefusal,
@@ -781,10 +792,9 @@ test("dedicated runtime rejects missing workspace transport before cluster acces
       },
     });
     for (const operation of ["prepareRevision", "activateRevision"]) {
-      await assert.rejects(
-        driver[operation](revision),
-        /Dedicated Harness storage requires gateway routing and node enrollment/,
-      );
+      await assert.rejects(driver[operation](revision), {
+        message: DEDICATED_STORAGE_ROUTING_REQUIRED,
+      });
     }
     assert.equal(clusterReads, 0);
   }
@@ -5742,7 +5752,7 @@ test("deployment admission refuses the Compute-rendered settings preparation ref
           runtime: { transportSecretPrefix: "transport", gatewayStorageClassName: "local-path" },
         }),
       ).validateHarnessAuth(codex, apiKeyAuth, previews, {}),
-    /Dedicated Agents need gateway routing and node enrollment/,
+    { message: CODEX_PLACEMENT_REFUSAL },
   );
   // Compute relays native hooks only for Codex: a dedicated OpenClaw document keeps the key.
   const openclaw = {
@@ -7306,7 +7316,7 @@ test("agent provisioning validation reuses native trusted-proxy admission before
         executionMode: "embedded",
         configuration: revision.configuration,
       }),
-    /dedicated execution mode/i,
+    { message: "Kubernetes Agent provisioning supports only dedicated execution mode." },
   );
 
   // Gateway settings in the caller's own Configuration are refused with a typed error that
@@ -9011,7 +9021,7 @@ test("direct service account token is confined to the model container and exact 
         revision.harnessAuth,
         revision.configuration,
       ),
-    /Agent setting harnessAuth\.method must be api_key for embedded OpenClaw on Kubernetes Compute: change harnessAuth or executionMode\./,
+    { message: EMBEDDED_API_KEY_REQUIRED },
   );
   assert.throws(
     () =>
@@ -9490,6 +9500,12 @@ test("deployment admission refuses Gateway breakers before a dedicated deploymen
       passwordRule,
     ],
     [withPassword("${OPENCLAW_GATEWAY_PASSWORD}"), "gateway.auth.password", passwordRule],
+    // The offered reference names the alias OpenClaw reads from the environment by default.
+    [
+      { ...withPassword("${OPENCLAW_GATEWAY_PASSWORD}"), secrets: { defaults: { env: "custom" } } },
+      "gateway.auth.password",
+      kubernetesGatewayPasswordRequirement("custom"),
+    ],
   ]) {
     const label = JSON.stringify(configuration);
     for (const validate of [
@@ -9505,6 +9521,65 @@ test("deployment admission refuses Gateway breakers before a dedicated deploymen
       );
     }
   }
+  // Finding 3057: the password surface is always active (Compute admits no token), so OpenClaw
+  // reads the reference at every start and exits on one it cannot read from the environment,
+  // while its configuration still validates: a provider no secrets.providers entry configures for
+  // env (the built-in alias moves with secrets.defaults.env), an allowlist that omits the name.
+  // Finding 3062: its strict config schema refuses an object with other keys or without a text
+  // provider (null, blank, a number), and the Gateway exits 78; the fix names the default alias.
+  const passwordRef = (provider, secrets) => ({
+    ...withPassword(
+      provider === undefined
+        ? { source: "env", id: "OPENCLAW_GATEWAY_PASSWORD" }
+        : { source: "env", provider, id: "OPENCLAW_GATEWAY_PASSWORD" },
+    ),
+    ...(secrets === undefined ? {} : { secrets }),
+  });
+  const envProvider = (allowlist) => ({ source: "env", ...(allowlist ? { allowlist } : {}) });
+  for (const [configuration, ...refused] of [
+    [passwordRef(undefined), "providerless"],
+    [passwordRef(undefined, { defaults: { env: "custom" } }), "providerless", "env", "custom"],
+    [passwordRef(null), "providerless"],
+    [passwordRef(" "), "providerless"],
+    [passwordRef(7), "providerless"],
+    [
+      withPassword({
+        source: "env",
+        provider: "default",
+        id: "OPENCLAW_GATEWAY_PASSWORD",
+        description: "generated",
+      }),
+      "keys",
+    ],
+    [passwordRef("vault"), "provider", "vault"],
+    [passwordRef("default", { defaults: { env: "custom" } }), "provider", "default"],
+    [passwordRef("vault", { providers: { vault: { source: "file" } } }), "provider", "vault"],
+    [
+      passwordRef("default", { providers: { default: envProvider(["OTHER"]) } }),
+      "allowlist",
+      "OPENCLAW_GATEWAY_PASSWORD",
+    ],
+    [
+      passwordRef("vault", { providers: { vault: envProvider([]) } }),
+      "allowlist",
+      "OPENCLAW_GATEWAY_PASSWORD",
+      "vault",
+    ],
+  ]) {
+    const label = JSON.stringify(configuration);
+    for (const validate of [
+      () => routed.validateGatewaySettings(configuration),
+      () => routed.validateAgentProvisioning({ executionMode: "dedicated", configuration }),
+    ]) {
+      assert.throws(
+        validate,
+        (error) =>
+          error instanceof ComputeGatewaySettingError &&
+          error.message === unreadableGatewayPasswordRefusal(...refused),
+        label,
+      );
+    }
+  }
   for (const configuration of [
     withPolicy("never"),
     withPolicy("on-request"),
@@ -9512,6 +9587,12 @@ test("deployment admission refuses Gateway breakers before a dedicated deploymen
     // The Gateway entrypoint replaces a null plugin config.
     { ...base, plugins: { entries: { codex: { config: null } } } },
     withPassword({ source: "env", provider: "default", id: "OPENCLAW_GATEWAY_PASSWORD" }),
+    // OpenClaw reads each of these from the environment: the alias secrets.defaults.env names,
+    // and a configured env provider with no allowlist or one that lists the name.
+    passwordRef("custom", { defaults: { env: "custom" } }),
+    passwordRef("vault", { providers: { vault: envProvider() } }),
+    passwordRef("default", { providers: { default: envProvider(["OPENCLAW_GATEWAY_PASSWORD"]) } }),
+    passwordRef("vault", { providers: { vault: envProvider(["OPENCLAW_GATEWAY_PASSWORD"]) } }),
   ]) {
     routed.validateGatewaySettings(configuration);
     routed.validateAgentProvisioning({ executionMode: "dedicated", configuration });
@@ -9625,11 +9706,6 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
       "APP_SERVER_TOKEN",
     ],
     [
-      withCodex({ config: { appServer: { authToken: envRef("app_server_token") } } }),
-      authToken,
-      "app_server_token",
-    ],
-    [
       withCodex({ config: { appServer: { headers: { "X-Relay": "${APP_SERVER_RELAY}" } } } }),
       relayHeader,
       "APP_SERVER_RELAY",
@@ -9658,15 +9734,263 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
     // OpenClaw trims a secret-input value before it reads `${NAME}`, so padding still stops the
     // Gateway (finding 3046).
     [withSearchHeader(" ${RELAY_TOKEN}\n"), searchHeader, "RELAY_TOKEN", "google"],
-    [
-      withSearchHeader(envRef("relay_token"), { enabled: true }),
-      searchHeader,
-      "relay_token",
-      "google",
-    ],
   ]) {
     refusedUntilBound(embeddedAdmission, configuration, refused);
   }
+  // References OpenClaw cannot read at all stop the Gateway whatever sets the variable, and its
+  // configuration still validates, so the runtime hold does not catch them (finding 3056). That
+  // holds for an input with a runtime owner too (beam, active only when enabled), so deployment,
+  // bound or not, and Agent save refuse them on every topology.
+  const beamToken = "plugins.entries.beam.config.mirror.token";
+  const withBeam = (token, entry = { enabled: true }) =>
+    withPlugin("beam", { ...entry, config: { mirror: { token } } });
+  // An allowlist on the default env alias that keeps the Gateway password OpenClaw reads there.
+  const allowlist = (ids) => ({
+    secrets: {
+      providers: {
+        default: { source: "env", allowlist: ["OPENCLAW_GATEWAY_PASSWORD", ...ids] },
+      },
+    },
+  });
+  const codexDriverAdmission = admission(driver, codex);
+  const codexBase = createHarnessConfiguration("codex", "gpt-5");
+  for (const [configuration, setting, plugin, held, ...shown] of [
+    [
+      withCodex({ config: { appServer: { authToken: { source: "env", id: "RELAY_TOKEN" } } } }),
+      authToken,
+      "codex",
+      "providerless",
+    ],
+    [
+      withSearchHeader({ source: "env", id: "RELAY_TOKEN" }),
+      searchHeader,
+      "google",
+      "providerless",
+    ],
+    [withBeam({ source: "env", id: "RELAY_TOKEN" }), beamToken, "beam", "providerless"],
+    // A file ref has no built-in provider to add.
+    [withBeam({ source: "file", id: "/token" }), beamToken, "beam", "providerless", "file"],
+    [
+      withCodex({
+        config: { appServer: { authToken: { ...envRef("RELAY_TOKEN"), provider: "vault" } } },
+      }),
+      authToken,
+      "codex",
+      "provider",
+      "vault",
+    ],
+    [
+      withSearchHeader({ source: "file", provider: "default", id: "/token" }),
+      searchHeader,
+      "google",
+      "provider",
+      "default",
+      "file",
+    ],
+    [
+      withBeam({ ...envRef("RELAY_TOKEN"), provider: "vault" }),
+      beamToken,
+      "beam",
+      "provider",
+      "vault",
+    ],
+    // An alias outside OpenClaw's provider grammar, even a configured one.
+    [
+      {
+        ...withSearchHeader({ ...envRef("RELAY_TOKEN"), provider: "Vault" }),
+        secrets: { providers: { Vault: { source: "env" } } },
+      },
+      searchHeader,
+      "google",
+      "provider",
+      "Vault",
+    ],
+    // The default alias moves with secrets.defaults.env.
+    [
+      { ...withSearchHeader(envRef("RELAY_TOKEN")), secrets: { defaults: { env: "custom" } } },
+      searchHeader,
+      "google",
+      "provider",
+      "default",
+    ],
+    [withSearchHeader(envRef("relay_token")), searchHeader, "google", "id", "relay_token"],
+    [withSearchHeader(envRef("_RELAY")), searchHeader, "google", "id", "_RELAY"],
+    [withSearchHeader(envRef(" RELAY_TOKEN ")), searchHeader, "google", "id", '" RELAY_TOKEN "'],
+    [withBeam(envRef("relay-token")), beamToken, "beam", "id", '"relay-token"'],
+    [
+      withCodex({ config: { appServer: { authToken: envRef("app_server_token") } } }),
+      authToken,
+      "codex",
+      "id",
+      "app_server_token",
+    ],
+    [
+      { ...withSearchHeader("$RELAY_TOKEN"), ...allowlist(["OTHER"]) },
+      searchHeader,
+      "google",
+      "allowlist",
+      "RELAY_TOKEN",
+    ],
+    [
+      { ...withBeam("$RELAY_TOKEN"), ...allowlist([]) },
+      beamToken,
+      "beam",
+      "allowlist",
+      "RELAY_TOKEN",
+    ],
+  ]) {
+    const expected = refusal(unreadablePluginSecretRefusal(setting, plugin, held, ...shown));
+    const label = JSON.stringify(configuration);
+    refusedByMode(embeddedAdmission, configuration, expected, label);
+    assert.throws(
+      () => embeddedAdmission(configuration, { RELAY_TOKEN: { source } }),
+      expected,
+      label,
+    );
+    // A Dedicated Codex Gateway keeps the same entries beside its own codex entry, whose
+    // `${APP_SERVER_TOKEN}` Compute sets, so an allowlist that omits it does not apply there.
+    if (plugin !== "codex") {
+      const dedicated = {
+        ...configuration,
+        ...codexBase,
+        plugins: withEntries(codexBase, configuration.plugins.entries).plugins,
+      };
+      refusedByMode(codexDriverAdmission, dedicated, expected, label);
+    }
+  }
+  // OpenClaw reads each of these, so the binding alone decides: an env SecretRef on the default
+  // alias secrets.defaults.env names, one on a configured env provider whose allowlist lists it,
+  // the $NAME shorthand there, and a `${_NAME}`, which OpenClaw only substitutes.
+  for (const [configuration, name = "RELAY_TOKEN"] of [
+    [{ ...withSearchHeader(envRef("RELAY_TOKEN")), ...allowlist(["RELAY_TOKEN"]) }],
+    [{ ...withSearchHeader("$RELAY_TOKEN"), ...allowlist(["RELAY_TOKEN"]) }],
+    // OpenClaw substitutes a set `${NAME}` (padded too) before it reads SecretRefs, so an
+    // allowlist that omits NAME never applies to it; unset, it stops the Gateway as before.
+    [{ ...withSearchHeader(" ${RELAY_TOKEN} "), ...allowlist(["OTHER"]) }],
+    [
+      {
+        ...withSearchHeader({ ...envRef("RELAY_TOKEN"), provider: "custom" }),
+        secrets: { defaults: { env: "custom" } },
+      },
+    ],
+    [
+      {
+        ...withSearchHeader({ ...envRef("RELAY_TOKEN"), provider: "vault" }),
+        secrets: { providers: { vault: { source: "env" } } },
+      },
+    ],
+    [{ ...withSearchHeader("$RELAY_TOKEN"), secrets: { defaults: { env: "custom" } } }],
+    [withSearchHeader("${_RELAY}"), "_RELAY"],
+  ]) {
+    refusedUntilBound(embeddedAdmission, configuration, [searchHeader, name, "google"]);
+  }
+  // At an input with a runtime owner an unset variable only makes the owner unavailable, but
+  // OpenClaw keeps an unset `${NAME}` as a SecretRef, and an allowlist's denial of it is not
+  // isolated to the owner: it stops the Gateway. So deployment refuses it while unbound; bound,
+  // OpenClaw substitutes it. Agent save does not know the bindings and leaves it to deployment.
+  const imapPassword = "plugins.entries.imap.config.accounts.main.password";
+  for (const [configuration, setting, plugin] of [
+    [{ ...withBeam("${RELAY_TOKEN}"), ...allowlist(["OTHER"]) }, beamToken, "beam"],
+    [
+      {
+        ...withPlugin("imap", {
+          enabled: true,
+          config: { accounts: { main: { password: "${RELAY_TOKEN}" } } },
+        }),
+        ...allowlist([]),
+      },
+      imapPassword,
+      "imap",
+    ],
+  ]) {
+    const expected = refusal(
+      unboundUnreadablePluginSecretRefusal(
+        setting,
+        plugin,
+        "RELAY_TOKEN",
+        "allowlist",
+        "RELAY_TOKEN",
+      ),
+    );
+    for (const bindings of [undefined, {}]) {
+      assert.throws(() => embeddedAdmission(configuration, bindings), expected);
+    }
+    embeddedAdmission(configuration, { RELAY_TOKEN: { source } });
+    embeddedAdmission(configuration, null);
+  }
+  // An allowlist that lists the unset name leaves only the owner unavailable, and OpenClaw keeps
+  // an unset `${_NAME}` as written, never as a SecretRef.
+  embeddedAdmission({ ...withBeam("${RELAY_TOKEN}"), ...allowlist(["RELAY_TOKEN"]) }, {});
+  embeddedAdmission({ ...withBeam("${_RELAY}"), ...allowlist([]) }, {});
+  // An APP_SERVER_ name there is never set on an embedded or Dedicated OpenClaw Agent, and no
+  // binding can set it, so the Agent's mode alone decides: deployment and Agent save refuse it
+  // under an allowlist that omits it (finding 3060). A Dedicated Codex Gateway sets
+  // APP_SERVER_TOKEN, so OpenClaw substitutes it there; an allowlist that lists the name, or none,
+  // leaves only the owner unavailable.
+  const imapEntry = (password) => ({
+    imap: { enabled: true, config: { accounts: { main: { password } } } },
+  });
+  const nativeBase = createHarnessConfiguration("openclaw", "gpt-4o-mini");
+  for (const [admit, configuration, setting, plugin, agent] of [
+    [
+      embeddedAdmission,
+      { ...withBeam("${APP_SERVER_TOKEN}"), ...allowlist(["OTHER"]) },
+      beamToken,
+      "beam",
+      "an embedded",
+    ],
+    [
+      admission(nativeDriver, native),
+      { ...withEntries(nativeBase, imapEntry(" ${APP_SERVER_URL} ")), ...allowlist([]) },
+      imapPassword,
+      "imap",
+      "a Dedicated OpenClaw",
+    ],
+  ]) {
+    const name = plugin === "beam" ? "APP_SERVER_TOKEN" : "APP_SERVER_URL";
+    refusedByMode(
+      admit,
+      configuration,
+      refusal(appServerUnreadablePluginSecretRefusal(setting, plugin, agent, "allowlist", name)),
+      JSON.stringify(configuration),
+    );
+  }
+  for (const [admit, configuration] of [
+    [embeddedAdmission, { ...withBeam("${APP_SERVER_TOKEN}"), ...allowlist(["APP_SERVER_TOKEN"]) }],
+    [embeddedAdmission, withBeam("${APP_SERVER_TOKEN}")],
+    [
+      codexDriverAdmission,
+      {
+        ...withEntries(codexBase, {
+          beam: { enabled: true, config: { mirror: { token: "${APP_SERVER_TOKEN}" } } },
+        }),
+        ...allowlist([]),
+      },
+    ],
+  ]) {
+    admit(configuration, {});
+    admit(configuration, null);
+  }
+  // A Dedicated Codex Agent whose allowlist omits APP_SERVER_TOKEN: its own codex entry reads
+  // `${APP_SERVER_TOKEN}`, which Compute sets, so OpenClaw substitutes it and the Gateway starts.
+  // `$APP_SERVER_TOKEN` stays a SecretRef, which that allowlist denies.
+  const codexAllowlisted = { ...codexBase, ...allowlist([]) };
+  codexDriverAdmission(codexAllowlisted, {});
+  codexDriverAdmission(codexAllowlisted, null);
+  const codexEntry = codexBase.plugins.entries.codex;
+  refusedByMode(
+    codexDriverAdmission,
+    withEntries(codexAllowlisted, {
+      codex: {
+        ...codexEntry,
+        config: {
+          ...codexEntry.config,
+          appServer: { ...codexEntry.config.appServer, authToken: "$APP_SERVER_TOKEN" },
+        },
+      },
+    }),
+    refusal(unreadablePluginSecretRefusal(authToken, "codex", "allowlist", "APP_SERVER_TOKEN")),
+  );
   // Each of these embedded Gateways starts: OpenClaw skips an inactive plugin's secret inputs, a
   // fallback replaces the unset name, a reference inside other text and the URL are not read as
   // secrets, a name no binding may set is left to Compute and the image, and a plugin input with
@@ -9684,6 +10008,14 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
     withSearchHeader("${OPENAI_API_KEY}"),
     withSearchHeader("${HOSTNAME}"),
     withPlugin("beam", { enabled: true, config: { mirror: { token: "${RELAY_TOKEN}" } } }),
+    // beam is inactive unless enabled, and OpenClaw reads a providerless SecretRef outside a
+    // manifest secret input (google webSearch.apiKey) as an env one.
+    withBeam({ source: "env", id: "RELAY_TOKEN" }, {}),
+    // An object with keys beyond source, provider and id is no SecretRef: OpenClaw keeps it.
+    withSearchHeader({ ...envRef("RELAY_TOKEN"), provider: "vault", note: "kept" }),
+    withPlugin("google", {
+      config: { webSearch: { apiKey: { source: "env", id: "RELAY_TOKEN" } } },
+    }),
     withPlugin("voice-call", {
       enabled: true,
       config: { twilio: { authToken: "${RELAY_TOKEN}" } },
@@ -9754,14 +10086,20 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
 });
 
 test("preparation still refuses a gateway password Compute does not generate", async () => {
-  // Admission refuses it first; preparation runs the same rule on the revision it renders.
-  for (const password of ["literal-gateway-password", { source: "env", id: "OTHER" }]) {
+  // Admission refuses it first; preparation runs the same rule on the revision it renders,
+  // with the revision's own secrets settings (finding 3057).
+  for (const [password, message] of [
+    ["literal-gateway-password", KUBERNETES_GATEWAY_PASSWORD_REFUSAL],
+    [{ source: "env", id: "OTHER" }, KUBERNETES_GATEWAY_PASSWORD_REFUSAL],
+    [
+      { source: "env", provider: "vault", id: "OPENCLAW_GATEWAY_PASSWORD" },
+      unreadableGatewayPasswordRefusal("provider", "vault"),
+    ],
+  ]) {
     const { driver, revision, context } = workspaceSetupFixture(false);
     revision.configuration = structuredClone(revision.configuration);
     revision.configuration.gateway.auth.password = password;
-    await assert.rejects(driver.prepareRevision(revision, context), {
-      message: KUBERNETES_GATEWAY_PASSWORD_REFUSAL,
-    });
+    await assert.rejects(driver.prepareRevision(revision, context), { message });
   }
 });
 
@@ -9977,7 +10315,7 @@ test("credential-source authentication renders no model Secret and requires the 
         {},
         sourceType,
       ),
-    /Agent setting harnessAuth\.method must be api_key for embedded OpenClaw on Kubernetes Compute: change harnessAuth or executionMode\./,
+    { message: EMBEDDED_API_KEY_REQUIRED },
   );
 });
 
@@ -10176,7 +10514,7 @@ test("dedicated OpenClaw renders an enrolled Harness without exposing model cred
         revision.harnessAuth,
         revision.configuration,
       ),
-    /requires a provisioning SandboxDriver with networking, filesystem, and process containment/,
+    { message: DEDICATED_OPENCLAW_SANDBOX_REQUIRED },
   );
   // Agent save (null bindings) leaves the Installation's Sandbox Driver to deployment. Node
   // enrollment keeps the placement rule, which save also applies, satisfied.
@@ -11058,7 +11396,7 @@ test("native channel providers require Secret bindings and project them only to 
         diagnostics: { otel: { logs: false } },
       },
     }),
-    /Configuration setting channels\.discord is not a supported channel: use slack or msteams, or set its enabled to false\./,
+    { message: unsupportedChannelRefusal("channels.discord") },
   );
   assert.throws(
     () =>
@@ -12815,10 +13153,10 @@ test("every model selection uses the Harness binding's provider (finding 1291)",
         },
       },
     },
-    refused(
-      "models.providers.anthropic.apiKey",
-      "must be unset: Dedicated Codex receives model credentials from the Agent's Harness authentication binding",
-    ),
+    {
+      name: "ConfigurationHarnessError",
+      message: codexApiKeyRefusal("models.providers.anthropic.apiKey"),
+    },
     "C: unselected provider key",
   );
   // OpenClaw accepts an apiKey only on the binding's provider: a bare model name can still reach
@@ -15287,7 +15625,7 @@ test("revision lifecycle rejects invalid ownership and unsupported workloads bef
       ...accessTokenRevision,
       harness: { id: "openclaw", version: "1.0.0", mode: "embedded" },
     }),
-    /Agent setting harnessAuth\.method must be api_key for embedded OpenClaw on Kubernetes Compute: change harnessAuth or executionMode\./,
+    { message: EMBEDDED_API_KEY_REQUIRED },
   );
   for (const secretRef of [
     { ...serviceAccount.credential.secretRef, name: "service-account-another" },

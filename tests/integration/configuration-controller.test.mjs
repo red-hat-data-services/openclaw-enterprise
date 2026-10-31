@@ -31,6 +31,9 @@ import {
   referenceFormRefusal,
   dedicatedCodexVariableRefusal,
   unboundPluginSecretRefusal,
+  unreadablePluginSecretRefusal,
+  appServerUnreadablePluginSecretRefusal,
+  unreadableGatewayPasswordRefusal,
   unboundReferenceRefusal,
   unreadableSlackTokenRefusal,
   unsubstitutedFallbackRefusal,
@@ -39,10 +42,12 @@ import {
   codexRuntimeOffProvider,
   KUBERNETES_GATEWAY_PASSWORD_REFUSAL,
   keepRuntime,
+  OPENCLAW_ONLY,
   runtimeIdRequired,
   runtimeIdUnsupported,
   runtimePoliciesConflict,
   selectableModelOffProvider,
+  unsupportedChannelRefusal,
 } from "../helpers/refusal-text.mjs";
 import { temporaryDirectory } from "../helpers/temporary-directory.mjs";
 import { servedAs } from "../helpers/agent-identity.mjs";
@@ -1154,7 +1159,9 @@ test("Configuration save refuses a model policy whose settings conflict, with de
         keepRuntime("openclaw", "codex"),
       ),
     ],
-    // The openai provider takes Codex only with the Codex plugin's WebSocket app server.
+    // The openai provider takes Codex only with the Codex plugin's WebSocket app server. Save
+    // serves any Agent and offers both steps; this embedded Agent's deploy, where Codex runs only
+    // dedicated, offers only openclaw (finding 3058).
     [
       "a Codex runtime on the openai provider",
       {
@@ -1163,6 +1170,7 @@ test("Configuration save refuses a model policy whose settings conflict, with de
         },
       },
       codexRuntimeOffProvider(defaultPolicy),
+      { message: codexRuntimeOffProvider(defaultPolicy, OPENCLAW_ONLY) },
     ],
     [
       "a runtime id that no Harness implements",
@@ -1964,6 +1972,7 @@ test("Configuration save and Kubernetes deployment admission refuse settings pre
 
   // Topology-independent rules: the save refuses with a 400 naming the setting; an existing row
   // still reads, and deployment refuses it before any revision is admitted.
+  const generated = { source: "env", provider: "default", id: "OPENCLAW_GATEWAY_PASSWORD" };
   for (const [values, message, deployMessage = message] of [
     [approvalPolicy("always"), policyEnum],
     [approvalPolicy("untrusted"), policyRetired],
@@ -1974,7 +1983,84 @@ test("Configuration save and Kubernetes deployment admission refuse settings pre
       message: deployMessage,
     });
   }
+  // A password object OpenClaw cannot read stops the Gateway at every start on every Compute
+  // (findings 3057, 3061, 3062, 3063): one its schema refuses (no provider, a null provider, other
+  // keys; exit 78) and one on a provider or allowlist that cannot serve it. Deploy admission's
+  // stored-values rules refuse it with the save's text, before any Compute rule (a 400).
+  for (const [values, message] of [
+    [
+      password({ source: "env", id: "OPENCLAW_GATEWAY_PASSWORD" }),
+      unreadableGatewayPasswordRefusal("providerless"),
+    ],
+    [password({ ...generated, provider: null }), unreadableGatewayPasswordRefusal("providerless")],
+    [password({ ...generated, note: "generated" }), unreadableGatewayPasswordRefusal("keys")],
+    [
+      password({ ...generated, provider: "vault" }),
+      unreadableGatewayPasswordRefusal("provider", "vault"),
+    ],
+    [
+      {
+        ...password({ source: "env", id: "OPENCLAW_GATEWAY_PASSWORD" }),
+        secrets: { defaults: { env: "custom" } },
+      },
+      unreadableGatewayPasswordRefusal("providerless", "env", "custom"),
+    ],
+    [
+      {
+        ...password(generated),
+        secrets: { providers: { default: { source: "env", allowlist: ["OTHER"] } } },
+      },
+      unreadableGatewayPasswordRefusal("allowlist", "OPENCLAW_GATEWAY_PASSWORD"),
+    ],
+  ]) {
+    await refusedAtSaveAndDeploy(context, agent, values, message);
+  }
   assert.equal(configurationDriver.storedConfigurations().length, 1);
+  // A stored Configuration the password rule now refuses still reads and deletes.
+  const unused = await request(context.app, "POST", context.collection, {
+    body: { kind: "agent", values: valid },
+  });
+  assert.equal(unused.status, 201, JSON.stringify(unused.body));
+  await writePastOcc(
+    configurationDriver,
+    unused.body.data.id,
+    password({ source: "env", id: "OPENCLAW_GATEWAY_PASSWORD" }),
+  );
+  const unusedItem = `${context.collection}/${unused.body.data.id}`;
+  assert.equal((await request(context.app, "GET", unusedItem)).status, 200);
+  assert.equal((await request(context.app, "DELETE", unusedItem)).status, 204);
+  assert.equal(configurationDriver.storedConfigurations().length, 1);
+  // A Preset whose password provider waits on a variable is checked once filled; a default fills
+  // it at Preset save.
+  const waitingProvider = password({ ...generated, provider: "{{ vars.alias }}" });
+  assertRefused(
+    await savePreset(context, {
+      variables: { alias: { type: "string", default: "vault" } },
+      configuration: { values: waitingProvider },
+    }),
+    unreadableGatewayPasswordRefusal("provider", "vault"),
+  );
+  const deferredProvider = await savePreset(
+    context,
+    { variables: { alias: { type: "string" } }, configuration: { values: waitingProvider } },
+    "Password-provider-deferred",
+  );
+  assert.equal(deferredProvider.status, 201, JSON.stringify(deferredProvider.body));
+  // The default env alias waits on a variable too: the alias the password names may be it.
+  const deferredAlias = await savePreset(
+    context,
+    {
+      variables: { alias: { type: "string" } },
+      configuration: {
+        values: {
+          ...password({ ...generated, provider: "custom" }),
+          secrets: { defaults: { env: "{{ vars.alias }}" } },
+        },
+      },
+    },
+    "Password-alias-deferred",
+  );
+  assert.equal(deferredAlias.status, 201, JSON.stringify(deferredAlias.body));
 
   // Rules that depend on the Compute Driver or the topology save, and deployment refuses them.
   for (const [values, deployStatus, deployMessage] of [
@@ -2026,6 +2112,88 @@ test("Configuration save and Kubernetes deployment admission refuse settings pre
       400,
       unboundSearchHeader("X-Goog-User-Project"),
     ],
+    // A SecretRef OpenClaw cannot read at all stops the Gateway whatever the bindings, while its
+    // configuration still validates (finding 3056): one without a provider, an env id OpenClaw
+    // refuses, and a provider no secrets.providers entry configures, at an input with a runtime
+    // owner (beam, enabled) too. Save accepts each.
+    [
+      withPluginEntries(valid, {
+        codex: { config: { appServer: { authToken: { source: "env", id: "RELAY_TOKEN" } } } },
+      }),
+      400,
+      unreadablePluginSecretRefusal(
+        "plugins.entries.codex.config.appServer.authToken",
+        "codex",
+        "providerless",
+      ),
+    ],
+    [
+      withPluginEntries(
+        valid,
+        searchHeader("X-Goog-User-Project", {
+          source: "env",
+          provider: "default",
+          id: "search_header",
+        }),
+      ),
+      400,
+      unreadablePluginSecretRefusal(
+        "plugins.entries.google.config.webSearch.headers.X-Goog-User-Project",
+        "google",
+        "id",
+        "search_header",
+      ),
+    ],
+    [
+      withPluginEntries(valid, {
+        beam: {
+          enabled: true,
+          config: {
+            mirror: {
+              endpoint: "https://beam.example.test/mirror",
+              catalogs: ["main"],
+              token: { source: "env", provider: "vault", id: "BEAM_TOKEN" },
+            },
+          },
+        },
+      }),
+      400,
+      unreadablePluginSecretRefusal(
+        "plugins.entries.beam.config.mirror.token",
+        "beam",
+        "provider",
+        "vault",
+      ),
+    ],
+    // An APP_SERVER_ name at an enabled Beam is never set on this embedded Agent, and the
+    // allowlist's denial of the SecretRef OpenClaw then keeps stops the Gateway (finding 3060).
+    [
+      {
+        ...withPluginEntries(valid, {
+          beam: {
+            enabled: true,
+            config: {
+              mirror: {
+                endpoint: "https://beam.example.test/mirror",
+                catalogs: ["main"],
+                token: "${APP_SERVER_TOKEN}",
+              },
+            },
+          },
+        }),
+        secrets: {
+          providers: { default: { source: "env", allowlist: ["OPENCLAW_GATEWAY_PASSWORD"] } },
+        },
+      },
+      400,
+      appServerUnreadablePluginSecretRefusal(
+        "plugins.entries.beam.config.mirror.token",
+        "beam",
+        "an embedded",
+        "allowlist",
+        "APP_SERVER_TOKEN",
+      ),
+    ],
   ]) {
     const label = JSON.stringify(values);
     const saved = await request(context.app, "PATCH", item, { body: { values } });
@@ -2059,6 +2227,27 @@ test("Configuration save and Kubernetes deployment admission refuse settings pre
   );
   const codexRevisions = await request(context.app, "GET", `${codexAgent.agentPath}/revisions`);
   assert.deepEqual(codexRevisions.body.data, []);
+  // A Dedicated Codex Agent whose env provider allowlist omits APP_SERVER_TOKEN (it keeps the
+  // Gateway password read on that alias) saves and deploys: OpenClaw substitutes its own entry's
+  // `${APP_SERVER_TOKEN}`, which Kubernetes Compute sets, before it reads SecretRefs, so the
+  // allowlist never applies to it (finding 3056 review).
+  const allowlistedCodex = await deployableAgent(context, context.namespace, {
+    values: {
+      ...createHarnessConfiguration("codex", "gpt-5"),
+      secrets: {
+        providers: { default: { source: "env", allowlist: ["OPENCLAW_GATEWAY_PASSWORD"] } },
+      },
+    },
+    name: "Dedicated Codex allowlist consumer",
+    secretName: "codex-allowlist-key",
+    executionMode: "dedicated",
+  });
+  const allowlistedDeploy = await request(
+    context.app,
+    "POST",
+    `${allowlistedCodex.agentPath}/deploy`,
+  );
+  assert.equal(allowlistedDeploy.status, 202, JSON.stringify(allowlistedDeploy.body));
 
   // Values every Gateway accepts still save.
   for (const values of [
@@ -2143,10 +2332,7 @@ test("Configuration save and Kubernetes deployment refuse caller-owned credentia
   for (const [values, message] of [
     [
       { ...valid, channels: { discord: { enabled: true } } },
-      setting(
-        "channels.discord",
-        "is not a supported channel: use slack or msteams, or set its enabled to false",
-      ),
+      unsupportedChannelRefusal("channels.discord"),
     ],
     [
       {

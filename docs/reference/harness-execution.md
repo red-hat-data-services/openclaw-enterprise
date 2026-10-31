@@ -211,7 +211,21 @@ secret input reads an unset variable: Codex `appServer.authToken` or
 Agent save refuse them for other Agents. Deployment also refuses another
 variable that no Configuration Secret binding sets, unless an Installation
 Driver adds launch variables. Bind a Secret to it, or remove or disable the
-plugin entry.
+plugin entry. Deployment and Agent save also refuse a reference OpenClaw cannot
+read in any active plugin's secret input, including an enabled Beam or IMAP
+entry: a SecretRef without a provider, a provider that `secrets.providers` does
+not configure (the default env alias needs no entry), an env id that does not
+start with a letter and use only `A-Z`, `0-9` and `_` (at most 128 characters),
+or an id that the env provider's `allowlist` omits. The allowlist applies to
+`$NAME` and SecretRef objects. OpenClaw substitutes a set `${NAME}` first, so the
+allowlist applies to it only when the variable is unset. Deployment then refuses an
+unbound `${NAME}` that the allowlist omits at an enabled Beam or IMAP entry.
+Deployment and Agent save refuse such a `${APP_SERVER_*}` there for Agents other
+than dedicated Codex, because it is always unset on them. On every Compute,
+Configuration save, Agent save and deployment apply the same provider and
+allowlist rules to a `gateway.auth.password` SecretRef. They also refuse one
+with keys other than `source`, `provider` and `id`, because OpenClaw's
+configuration check then fails.
 
 Configuration writes run these rules in deployment's order. They refuse settings
 that conflict, with deployment's message: an entry primary that differs, selectable
@@ -232,7 +246,9 @@ Installation does not list dedicated OpenClaw, the refusal offers only `codex` w
 accepts the model. Deployment of an embedded Agent, where the Installation approves Codex only
 for dedicated execution, offers only `openclaw`. For a `codex/<model>` model, embedded OpenClaw
 cannot run it either, so the refusal tells you to set `codex` on a dedicated Agent or to select
-a model of another provider. Configuration save can serve any Agent, so it offers both values.
+a model of another provider. For Codex on another provider, the refusal offers only the step that
+the Agent can take: a `codex/<model>` model or `openclaw`. Configuration save can serve any
+Agent, so it offers both values.
 A Preset is checked when a launch creates its Configuration.
 
 ## Limits

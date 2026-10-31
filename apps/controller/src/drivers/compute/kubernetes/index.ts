@@ -173,6 +173,7 @@ import {
   ServiceAccountCredentialSecretExistsError,
   TransientDependencyError,
   validRuntimeLogFrontierTime,
+  waitsOnVariable,
 } from "@openclaw-enterprise/occ";
 import {
   createKubernetesClientConfiguration,
@@ -2865,30 +2866,6 @@ function requireProviderApiKeys(
       );
     }
   }
-}
-
-// Whether a Preset variable without a value fills any text (a string or an object key) in `value`,
-// which sits at `path` in the Configuration document.
-function waitsOnVariable(
-  value: unknown,
-  path: readonly (string | number)[],
-  options: ConfigurationValidationOptions | undefined,
-): boolean {
-  const unresolved = options?.unresolved;
-  if (unresolved === undefined) {
-    return false;
-  }
-  if (typeof value === "string") {
-    return unresolved(path) !== undefined;
-  }
-  const entries = Array.isArray(value)
-    ? [...value.entries()]
-    : Object.entries(asRecord(value) ?? {});
-  return entries.some(
-    ([key, child]) =>
-      (typeof key === "string" && unresolved([...path, key], true) !== undefined) ||
-      waitsOnVariable(child, [...path, key], options),
-  );
 }
 
 // A `${NAME}` or SecretRef-shaped value, as the Configuration Driver admits in a credential field
@@ -13071,6 +13048,7 @@ chmodSync(${JSON.stringify(nodeStatePath)}, 0o700);`;
     const nativeConfiguration = this.kubernetesGatewayConfigurationDocument(revision.configuration);
     const usesGatewayPasswordEnv = usesGatewayPasswordEnvironment(
       asRecord(asRecord(nativeConfiguration.gateway)?.auth) ?? {},
+      asRecord(nativeConfiguration.secrets),
       (setting, requirement) => new GatewaySettingFailure(setting, requirement),
     );
     return {
@@ -13307,6 +13285,7 @@ chmodSync(${JSON.stringify(nodeStatePath)}, 0o700);`;
     }
     usesGatewayPasswordEnvironment(
       auth,
+      asRecord(configuration.secrets),
       (setting, requirement) => new GatewaySettingFailure(setting, requirement),
     );
     if (gateway.trustedProxies !== undefined) {
