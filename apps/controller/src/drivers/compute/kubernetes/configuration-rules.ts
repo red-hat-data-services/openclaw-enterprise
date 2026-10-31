@@ -129,20 +129,21 @@ const GATEWAY_REQUIRED_PLUGIN_SECRET_INPUTS: Readonly<
   google: [["webSearch", "headers", "*"]],
 };
 
-// Variables an embedded Gateway may receive without a binding that a Secret binding may also name:
-// the Pod's HOSTNAME, the image's YARN_VERSION, Compute's repository broker GIT_SSL_CAINFO and
-// Kubernetes service links.
+// Variables a Gateway may receive without a binding that a Secret binding may also name: the
+// Pod's HOSTNAME, the image's YARN_VERSION, Compute's repository broker GIT_SSL_CAINFO (embedded
+// only) and Kubernetes service links.
 const RUNTIME_VARIABLE =
   /^(?:HOSTNAME|YARN_VERSION|GIT_SSL_CAINFO)$|_SERVICE_(?:HOST|PORT)(?:_|$)|_PORT(?:_|$)/;
 
 // The variable a secret-input value reads as an environment SecretRef, if any: a whole `${NAME}`
-// with no fallback, the `$NAME` shorthand or an env SecretRef object. OpenClaw keeps a reference
+// with no fallback, the `$NAME` shorthand or an env SecretRef object. OpenClaw trims the value
+// first (`parseEnvTemplateSecretRef`), so a padded `${NAME}` counts too. It keeps a reference
 // inside other text as written, and a fallback replaces an unset name, so neither stops it.
 function secretInputVariable(value: unknown): string | undefined {
   const reference = asRecord(value);
   const name =
     typeof value === "string"
-      ? (wholeEnvironmentReferenceName(value) ?? secretInputShorthandName(value))
+      ? (wholeEnvironmentReferenceName(value.trim()) ?? secretInputShorthandName(value))
       : reference?.source === "env"
         ? reference.id
         : undefined;
@@ -169,18 +170,20 @@ function settingValues(
 }
 
 /**
- * An embedded Gateway starts only if every Gateway-required secret input of an active plugin
+ * A Gateway starts only if every Gateway-required secret input of an active plugin
  * (`GATEWAY_REQUIRED_PLUGIN_SECRET_INPUTS`) resolves; otherwise it exits at every start and the
- * deployment waits for its convergence deadline (findings 3040, 3041). Refuses the first such
- * reference to a variable the Gateway would lack: an APP_SERVER_ variable, which only a Dedicated
- * Codex Gateway receives, and, when `bound` is given, a name a Secret binding could set but
- * `bound` says nothing sets. `bound` answers for the Configuration's bindings and what the
- * Installation adds at launch; Agent save, which knows neither, passes none. Other reserved names
- * pass: Compute or the image may set them. OpenClaw skips the secret inputs of an entry whose
- * `enabled` is false, of a denied plugin and of `plugins.enabled: false`, and so does this rule.
+ * deployment waits for its convergence deadline (findings 3040, 3041, 3042). Every topology's
+ * Gateway keeps the caller's plugin entries. Refuses the first such reference to a variable the
+ * Gateway would lack: an APP_SERVER_ variable, which only a Dedicated Codex Gateway receives,
+ * and, when `bound` is given, a name a Secret binding could set but `bound` says nothing sets.
+ * `bound` answers for the Configuration's bindings and what the Installation adds at launch;
+ * Agent save, which knows neither, passes none. Other reserved names pass: Compute or the image
+ * may set them. OpenClaw skips the secret inputs of an entry whose `enabled` is false, of a
+ * denied plugin and of `plugins.enabled: false`, and so does this rule.
  */
-export function requireEmbeddedPluginSecretInputs(
+export function requirePluginSecretInputs(
   configuration: Readonly<OpenClawConfigurationDocument>,
+  topology: KubernetesHarnessTopology,
   bound: ((name: string) => boolean) | undefined,
   createError: SettingError,
 ): void {
@@ -214,10 +217,11 @@ export function requireEmbeddedPluginSecretInputs(
         continue;
       }
       const shown = /^[A-Za-z0-9_]{1,32}$/.test(name) ? name : quotedSettingKey(name, 32);
-      if (CODEX_APP_SERVER_VARIABLE.test(name)) {
+      if (topology !== "Dedicated Codex" && CODEX_APP_SERVER_VARIABLE.test(name)) {
+        const agent = topology === "embedded OpenClaw" ? "an embedded" : "a Dedicated OpenClaw";
         throw createError(
           setting,
-          `references ${shown}, which only a Dedicated Codex Agent receives: on an embedded Agent, ${disable}`,
+          `references ${shown}, which only a Dedicated Codex Agent receives: on ${agent} Agent, ${disable}`,
         );
       }
       if (

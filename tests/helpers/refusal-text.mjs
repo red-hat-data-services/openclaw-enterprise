@@ -329,6 +329,10 @@ export const EMBEDDED_API_KEY_REQUIRED =
   "Agent setting harnessAuth.method must be api_key for embedded OpenClaw on Kubernetes Compute: change harnessAuth or executionMode.";
 export const codexApiKeyRefusal = (setting) =>
   `Configuration setting ${setting} must be unset: Dedicated Codex receives model credentials from the Agent's Harness authentication binding.`;
+// Kubernetes Compute generates the Gateway password, so gateway.auth.password may only reference it.
+export const KUBERNETES_GATEWAY_PASSWORD_REQUIREMENT =
+  'must be the environment reference {source: "env", id: "OPENCLAW_GATEWAY_PASSWORD"}, whose value Kubernetes Compute generates';
+export const KUBERNETES_GATEWAY_PASSWORD_REFUSAL = `Configuration setting gateway.auth.password ${KUBERNETES_GATEWAY_PASSWORD_REQUIREMENT}.`;
 // Deploy and Agent provisioning of dedicated OpenClaw where the Installation selects no
 // provisioning SandboxDriver with all three containment facets (409 RESOURCE_CONFLICT). It names
 // the next step: codex for the selected models when Codex runs them (`codexRuns`), else a Codex
@@ -545,11 +549,17 @@ export const referenceFormRefusal = (setting, form) =>
 // (packages/occ/src/channel-secret-bindings.ts).
 export const unboundReferenceRefusal = (setting, name) =>
   `Configuration setting ${setting} references ${name} without a Configuration Secret binding: bind ${name} in secretBindings to an environment-backed Secret, or remove the reference.`;
-// Kubernetes Compute admission of an embedded Agent's plugin secret input whose unset variable stops
-// its Gateway at startup (findings 3040, 3041): an APP_SERVER_ variable at Agent save and
-// deployment, any other unbound name a binding could set at deployment.
-export const dedicatedCodexVariableRefusal = (setting, name, plugin = "codex") =>
-  `Configuration setting ${setting} references ${name}, which only a Dedicated Codex Agent receives: on an embedded Agent, remove plugins.entries.${plugin} or set its enabled to false.`;
+// Kubernetes Compute admission of an Agent's plugin secret input whose unset variable stops its
+// Gateway at startup (findings 3040, 3041, 3042): an APP_SERVER_ variable on an embedded or
+// Dedicated OpenClaw Agent at Agent save and deployment, any other unbound name a binding could
+// set at deployment.
+export const dedicatedCodexVariableRefusal = (
+  setting,
+  name,
+  plugin = "codex",
+  agent = "an embedded",
+) =>
+  `Configuration setting ${setting} references ${name}, which only a Dedicated Codex Agent receives: on ${agent} Agent, remove plugins.entries.${plugin} or set its enabled to false.`;
 export const unboundPluginSecretRefusal = (setting, name, plugin) =>
   `Configuration setting ${setting} references ${name} without a Configuration Secret binding: bind ${name} in secretBindings, or remove plugins.entries.${plugin} or set its enabled to false.`;
 const USE_UPPERCASE =
