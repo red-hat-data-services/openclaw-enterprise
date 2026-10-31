@@ -55,6 +55,12 @@ const SLACK_OTHER_KEYS_HINT =
 // (finding 2554).
 const SLACK_EXTRA_KEYS_HINT =
   "The Slack settings also read the other keys listed above: bind them through the Configuration API.";
+// Slack is off, but the Configuration still binds Secrets the Agent has no confirmed access to:
+// Deploy checks each bound Secret, so the tab lists them with Retry Secret access (finding 3018).
+const SLACK_OFF_BOUND_HINT =
+  "Slack is off, but this Configuration still binds the Secrets listed below. Deploying checks this Agent's access to each of them.";
+// A Retry with Slack off grants the Agent access to those Secrets; it saves nothing about Slack.
+const SLACK_OFF_RETRY_GRANTED = "Secret access granted. This Agent can use its bound Secrets.";
 function channelPolicy(values: unknown, provider: string) {
   return responseFields(responseFields(values).channels)[provider];
 }
@@ -505,8 +511,10 @@ function boundSecrets(secretBindings: SecretBindings | undefined) {
 // other bound key, such as SLACK_APP_TOKEN left bound after a switch to HTTP mode. Deploy checks
 // those Secrets' grants too, so their warning and Retry need a row (finding 2558).
 function slackBindingRows(state: ChannelState) {
-  const form = slackFormBindings(state.values) ?? [];
-  const listed = slackBindingKeys(state.values)
+  // With Slack off, no Slack setting reads a bound key (finding 3018).
+  const slackOn = channelEnabled(state.values, "slack");
+  const form = (slackOn ? slackFormBindings(state.values) : null) ?? [];
+  const listed = (slackOn ? slackBindingKeys(state.values) : [])
     .filter((key) => !form.some((binding) => binding.key === key))
     .map((key) => ({ key, label: key, unused: false }));
   const shown = new Set([...form, ...listed].map(({ key }) => key));
@@ -765,8 +773,21 @@ export function createChannelSecretsPanel({
       !state.saving &&
       !state.outcomeUnknown &&
       !state.reloadRequired &&
-      channelEnabled(state.values, "slack") &&
+      (channelEnabled(state.values, "slack") || retryOnly()) &&
       servicePrincipalId(state.agent) !== null
+    );
+  }
+
+  // Slack is off, but bound Secrets still wait for the Agent's grant, or a Retry for them has an
+  // outcome to show. Deploy checks every bound Secret, so the section lists them and offers only
+  // Retry Secret access (finding 3018).
+  function retryOnly() {
+    return (
+      !channelEnabled(state.values, "slack") &&
+      (pendingSecretGrants().length > 0 ||
+        state.saving ||
+        Boolean(state.saveMessage) ||
+        Boolean(state.saveError))
     );
   }
 
@@ -947,9 +968,13 @@ export function createChannelSecretsPanel({
   // Secret waits for its grant: the read that follows may yet hold Deploy (#3686 review).
   function saveOutcomeText(retry: boolean) {
     lastSaveRetry = retry;
-    const saved = retry
-      ? "This Agent can use its saved Slack Secrets."
-      : "Channel Secret bindings saved.";
+    let saved = "Channel Secret bindings saved.";
+    if (retry) {
+      // With Slack off, Retry saved nothing about Slack: it granted the bound Secrets' access.
+      saved = channelEnabled(state.values, "slack")
+        ? "This Agent can use its saved Slack Secrets."
+        : SLACK_OFF_RETRY_GRANTED;
+    }
     return grantRecheck || state.checkingGrants || pendingSecretGrants().length
       ? saved
       : `${saved}${DELIVER_ON_DEPLOY}`;
@@ -960,18 +985,24 @@ export function createChannelSecretsPanel({
     shown.status = null;
     shown.updateControls = null;
     state.unsavedSecrets = false;
-    if (!channelEnabled(state.values, "slack")) {
+    const slackOn = channelEnabled(state.values, "slack");
+    if (!slackOn && !retryOnly()) {
       return null;
     }
     // Keys the form has no pickers for are listed only; the form then keeps just Retry Secret
-    // access for their outstanding grants.
-    const listOnly = slackFormBindings(state.values) === null;
-    const formBindings = slackFormBindings(state.values) ?? [];
-    const extraKeys = slackBindingKeys(state.values).some(
-      (key) => !formBindings.some((binding) => binding.key === key),
-    );
+    // access for their outstanding grants. With Slack off, every bound key is listed only.
+    const listOnly = !slackOn || slackFormBindings(state.values) === null;
+    const formBindings = (slackOn ? slackFormBindings(state.values) : null) ?? [];
+    const extraKeys =
+      slackOn &&
+      slackBindingKeys(state.values).some(
+        (key) => !formBindings.some((binding) => binding.key === key),
+      );
     let hintText = extraKeys ? SLACK_EXTRA_KEYS_HINT : null;
-    if (listOnly) {
+    if (!slackOn) {
+      // The section's introduction says why these Secrets are listed.
+      hintText = null;
+    } else if (listOnly) {
       hintText = usesNamedSlackAccounts(state.values)
         ? "Named Slack accounts use their own token keys. Bind them through the Configuration API."
         : SLACK_OTHER_KEYS_HINT;
@@ -1148,14 +1179,18 @@ export function createChannelSecretsPanel({
       let configurationSaved = false;
       let failedRead: "Agent" | "Configuration" | undefined;
       // A conflict keeps these choices for Reload draft instead of dropping them (finding 1512).
+      // A Retry makes no choices, so Reload draft has none to reapply or to name as not
+      // reapplied: it says only that the draft reloaded (finding 3021).
       const carryChoices = () => {
         state.reloadRequired = true;
         state.draftSeed = structuredClone(draft);
-        state.carried = {
-          configurationId: state.configuration.id,
-          initialSecretBindings: structuredClone(state.configuration.secretBindings ?? {}),
-          ...structuredClone(draft),
-        };
+        state.carried = retry
+          ? null
+          : {
+              configurationId: state.configuration.id,
+              initialSecretBindings: structuredClone(state.configuration.secretBindings ?? {}),
+              ...structuredClone(draft),
+            };
       };
       try {
         const configurationPath = `${namespacePath(context.namespaceId)}/configurations/${encodeURIComponent(state.configuration.id)}`;
@@ -1388,12 +1423,20 @@ export function createChannelSecretsPanel({
     shown.outcome = state.saveError
       ? error
       : (reloadMessage ?? (shown.status?.textContent ? shown.status : null));
-    if (!channelEnabled(state.values, "slack") && state.carriedNote) {
-      // Shown only to say carried Secret choices were not reapplied (finding 1525).
-      section.replaceChildren(
-        element("h2", {}, "Channel Secrets"),
-        element("p", { className: "hint", role: "status" }, state.carriedNote),
-      );
+    const slackOn = channelEnabled(state.values, "slack");
+    section.hidden = false;
+    if (!slackOn && !retryOnly()) {
+      if (state.carriedNote) {
+        // Shown only to say carried Secret choices were not reapplied (finding 1525).
+        section.replaceChildren(
+          element("h2", {}, "Channel Secrets"),
+          element("p", { className: "hint", role: "status" }, state.carriedNote),
+        );
+      } else {
+        // Bound Secrets whose grants are confirmed: nothing to show with Slack off.
+        section.replaceChildren();
+        section.hidden = true;
+      }
       return;
     }
     section.replaceChildren(
@@ -1402,7 +1445,9 @@ export function createChannelSecretsPanel({
         element(
           "p",
           { className: "muted" },
-          "Save Slack tokens as Secrets, then deploy a new version to apply them. Saved bindings do not confirm live channel readiness.",
+          slackOn
+            ? "Save Slack tokens as Secrets, then deploy a new version to apply them. Saved bindings do not confirm live channel readiness."
+            : SLACK_OFF_BOUND_HINT,
         ),
         bindings,
         error,
@@ -1488,6 +1533,16 @@ export function createChannelSecretsPanel({
       return;
     }
     updateGrantWarning();
+    if (!channelEnabled(state.values, "slack")) {
+      // No pickers hold choices with Slack off: show or hide the section (finding 3018). A
+      // rebuilt Retry Secret access keeps the focus the replaced one had (finding 3021).
+      const refocus = Boolean(shown.save) && document.activeElement === shown.save;
+      render();
+      if (refocus && shown.save?.isConnected && document.activeElement === document.body) {
+        shown.save.focus();
+      }
+      return;
+    }
     // Update in place: a rebuilt form would drop Secret choices made meanwhile and the focus.
     const bindings = renderSlackBindings(state);
     shown.bindings?.replaceWith(bindings);
@@ -1500,13 +1555,19 @@ export function createChannelSecretsPanel({
 
   updateGrantWarning();
   render();
-  if (checkGrants && channelEnabled(values, "slack")) {
+  // Deploy checks every bound Secret, with Slack on or off (finding 3018).
+  if (checkGrants) {
     void checkBoundSecretGrants();
   }
   return {
     // What the Channels tab says while saved Slack Secrets wait for the Agent's grant.
     grantWarning: () => (state.saving || !pendingSecretGrants().length ? "" : slackGrantWarning()),
-    section: channelEnabled(values, "slack") || state.carriedNote ? section : null,
+    section:
+      channelEnabled(values, "slack") ||
+      state.carriedNote ||
+      boundSecrets(configuration.secretBindings).length
+        ? section
+        : null,
     canDeploy,
     credentialsReady,
     deployGateMessage,
