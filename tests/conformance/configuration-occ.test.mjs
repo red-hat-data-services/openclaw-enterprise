@@ -29,7 +29,25 @@ import {
 } from "../helpers/development.mjs";
 import { bindRole, grantRole, principalIAMState } from "../helpers/iam-grants.mjs";
 import { refusedAnswer } from "../helpers/refusal-answers.mjs";
-import { GATEWAY_MANAGED_MODE_DENIED } from "../helpers/refusal-text.mjs";
+import {
+  catalogRowNoModel,
+  catalogRowUnselected,
+  codexRuntimeOffProvider,
+  BOTH_RUNTIMES,
+  GATEWAY_MANAGED_MODE_DENIED,
+  keepRuntime,
+  runtimeIdRequired,
+  runtimeOfEntries,
+  runtimeOfListedModels,
+  runtimeOfOtherModels,
+  runtimeOfPrimaryElsewhere,
+  runtimeIdUnsupported,
+  runtimePoliciesConflict,
+  selectableModelOffProvider,
+  selectableModelRuntimeMismatch,
+  selectableModelsNotObject,
+  selectablePrimaryRuntimeRequired,
+} from "../helpers/refusal-text.mjs";
 import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs";
 import { createTestKubernetesComputeDriver } from "../helpers/kubernetes-compute.mjs";
 import { servedAs } from "../helpers/agent-identity.mjs";
@@ -1503,7 +1521,15 @@ test("Harness resolution stays in step with the size of the model selections and
   };
   assert.throws(
     () => resolveConfiguredHarnessId(values),
-    new ConfigurationHarnessError("The selected model has conflicting Harness runtime policies."),
+    new ConfigurationHarnessError(
+      runtimePoliciesConflict(
+        `agents.entries.a${count - 1}.models["openai/m0"]`,
+        "codex",
+        "models.providers.openai",
+        "openclaw",
+        keepRuntime("openclaw", "codex"),
+      ),
+    ),
   );
 });
 
@@ -1556,6 +1582,275 @@ function configurationRefusal(values) {
   assert.fail(`${JSON.stringify(values)} was admitted`);
 }
 
+// Each case is [values, refusal, values with the refusal's offer applied]. The offer names only a
+// value and a setting that the next deployment accepts: codex only where Codex runs the model, the
+// runtime another policy, an entry or an earlier selected model already selects, and a setting
+// where the runtime keeps the selectable rule.
+test("model policy refusals offer only what the next deployment accepts", () => {
+  const runtime = (id) => ({ agentRuntime: { id } });
+  for (const [values, message, fixed] of [
+    // The listed models use codex: openclaw for the primary would refuse them next.
+    [
+      {
+        agents: {
+          defaults: {
+            model: "codex/gpt-5.1",
+            models: { "codex/gpt-5.1": {}, "codex/gpt-5.1-mini": runtime("codex") },
+          },
+        },
+      },
+      selectablePrimaryRuntimeRequired(
+        'agents.defaults.models["codex/gpt-5.1"]',
+        runtimeOfListedModels("codex"),
+      ),
+      {
+        agents: {
+          defaults: {
+            model: "codex/gpt-5.1",
+            models: { "codex/gpt-5.1": runtime("codex"), "codex/gpt-5.1-mini": runtime("codex") },
+          },
+        },
+      },
+    ],
+    // The defaults' policy already sets the primary's runtime: another value in the entry's
+    // policy would conflict with it.
+    [
+      {
+        agents: {
+          defaults: { model: "codex/gpt-5.1", models: { "codex/gpt-5.1": runtime("codex") } },
+          entries: {
+            main: { models: { "codex/gpt-5.1": {}, "codex/gpt-5.1-mini": runtime("codex") } },
+          },
+        },
+      },
+      selectablePrimaryRuntimeRequired(
+        'agents.entries.main.models["codex/gpt-5.1"]',
+        runtimeOfPrimaryElsewhere("codex"),
+      ),
+      {
+        agents: {
+          defaults: { model: "codex/gpt-5.1", models: { "codex/gpt-5.1": runtime("codex") } },
+          entries: {
+            main: {
+              models: { "codex/gpt-5.1": runtime("codex"), "codex/gpt-5.1-mini": runtime("codex") },
+            },
+          },
+        },
+      },
+    ],
+    // The primary selected codex first, so both policies of its fallback must too.
+    [
+      {
+        agents: {
+          defaults: {
+            model: { primary: "codex/gpt-5.1", fallbacks: ["codex/gpt-5.1-mini"] },
+            models: { "codex/gpt-5.1": runtime("codex"), "codex/gpt-5.1-mini": runtime("codex") },
+          },
+        },
+        models: {
+          providers: { codex: { models: [{ id: "gpt-5.1-mini", ...runtime("openclaw") }] } },
+        },
+      },
+      runtimePoliciesConflict(
+        'agents.defaults.models["codex/gpt-5.1-mini"]',
+        "codex",
+        "models.providers.codex.models[0]",
+        "openclaw",
+        keepRuntime("codex", "openclaw"),
+      ),
+      {
+        agents: {
+          defaults: {
+            model: { primary: "codex/gpt-5.1", fallbacks: ["codex/gpt-5.1-mini"] },
+            models: { "codex/gpt-5.1": runtime("codex"), "codex/gpt-5.1-mini": runtime("codex") },
+          },
+        },
+        models: { providers: { codex: { models: [{ id: "gpt-5.1-mini", ...runtime("codex") }] } } },
+      },
+    ],
+    // Codex runs a codex model and nothing else selects a runtime: either value is accepted.
+    [
+      {
+        agents: {
+          defaults: { model: "codex/gpt-5.1", models: { "codex/gpt-5.1": runtime("openclaw") } },
+        },
+        models: { providers: { codex: runtime("codex") } },
+      },
+      runtimePoliciesConflict(
+        'agents.defaults.models["codex/gpt-5.1"]',
+        "openclaw",
+        "models.providers.codex",
+        "codex",
+        BOTH_RUNTIMES,
+      ),
+      {
+        agents: {
+          defaults: { model: "codex/gpt-5.1", models: { "codex/gpt-5.1": runtime("codex") } },
+        },
+        models: { providers: { codex: runtime("codex") } },
+      },
+    ],
+    // An entry's policy selects codex for the model, so the defaults' must too.
+    [
+      {
+        agents: {
+          defaults: { model: "codex/gpt-5.1", models: { "codex/gpt-5.1": runtime("openclaw") } },
+          entries: { main: { models: { "codex/gpt-5.1": runtime("codex") } } },
+        },
+        models: { providers: { codex: runtime("codex") } },
+      },
+      runtimePoliciesConflict(
+        'agents.defaults.models["codex/gpt-5.1"]',
+        "openclaw",
+        "models.providers.codex",
+        "codex",
+        keepRuntime("codex", "openclaw"),
+      ),
+      {
+        agents: {
+          defaults: { model: "codex/gpt-5.1", models: { "codex/gpt-5.1": runtime("codex") } },
+          entries: { main: { models: { "codex/gpt-5.1": runtime("codex") } } },
+        },
+        models: { providers: { codex: runtime("codex") } },
+      },
+    ],
+    // A third policy the refusal does not name, the provider's, selects codex.
+    [
+      {
+        agents: {
+          defaults: { model: "codex/gpt-5.1", models: { "codex/gpt-5.1": runtime("openclaw") } },
+        },
+        models: {
+          providers: {
+            codex: { ...runtime("codex"), models: [{ id: "gpt-5.1", ...runtime("codex") }] },
+          },
+        },
+      },
+      runtimePoliciesConflict(
+        'agents.defaults.models["codex/gpt-5.1"]',
+        "openclaw",
+        "models.providers.codex.models[0]",
+        "codex",
+        keepRuntime("codex", "openclaw"),
+      ),
+      {
+        agents: {
+          defaults: { model: "codex/gpt-5.1", models: { "codex/gpt-5.1": runtime("codex") } },
+        },
+        models: {
+          providers: {
+            codex: { ...runtime("codex"), models: [{ id: "gpt-5.1", ...runtime("codex") }] },
+          },
+        },
+      },
+    ],
+    // The primary's runtime comes from its catalog row, so its fallback's goes in its own row: in
+    // agents.defaults.models it would need the primary listed there too.
+    [
+      {
+        agents: {
+          defaults: { model: { primary: "openai/gpt-4.1", fallbacks: ["openai/gpt-4.1-mini"] } },
+        },
+        models: {
+          providers: {
+            openai: { models: [{ id: "gpt-4.1", ...runtime("openclaw") }, { id: "gpt-4.1-mini" }] },
+          },
+        },
+      },
+      runtimeIdRequired("models.providers.openai.models[1]", runtimeOfOtherModels("openclaw")),
+      {
+        agents: {
+          defaults: { model: { primary: "openai/gpt-4.1", fallbacks: ["openai/gpt-4.1-mini"] } },
+        },
+        models: {
+          providers: {
+            openai: {
+              models: [
+                { id: "gpt-4.1", ...runtime("openclaw") },
+                { id: "gpt-4.1-mini", ...runtime("openclaw") },
+              ],
+            },
+          },
+        },
+      },
+    ],
+    // Without a catalog row of its own, the fallback's runtime goes on the provider.
+    [
+      {
+        agents: {
+          defaults: { model: { primary: "openai/gpt-4.1", fallbacks: ["openai/gpt-4.1-mini"] } },
+        },
+        models: { providers: { openai: { models: [{ id: "gpt-4.1", ...runtime("openclaw") }] } } },
+      },
+      runtimeIdRequired("models.providers.openai", runtimeOfOtherModels("openclaw")),
+      {
+        agents: {
+          defaults: { model: { primary: "openai/gpt-4.1", fallbacks: ["openai/gpt-4.1-mini"] } },
+        },
+        models: {
+          providers: {
+            openai: { ...runtime("openclaw"), models: [{ id: "gpt-4.1", ...runtime("openclaw") }] },
+          },
+        },
+      },
+    ],
+    // An entry's policy selects codex for the primary: openclaw in the defaults' would conflict.
+    [
+      {
+        agents: {
+          defaults: { model: "codex/gpt-5.1" },
+          entries: { main: { models: { "codex/gpt-5.1": runtime("codex") } } },
+        },
+      },
+      runtimeIdRequired('agents.defaults.models["codex/gpt-5.1"]', runtimeOfEntries("codex")),
+      {
+        agents: {
+          defaults: { model: "codex/gpt-5.1", models: { "codex/gpt-5.1": runtime("codex") } },
+          entries: { main: { models: { "codex/gpt-5.1": runtime("codex") } } },
+        },
+      },
+    ],
+    // The entry lists its primary without a runtime, so its fallback's goes beside the primary's
+    // runtime in agents.defaults.models; in the entry's policy it would break the selectable rule.
+    [
+      {
+        agents: {
+          defaults: { models: { "openai/gpt-4.1": runtime("openclaw") } },
+          entries: {
+            main: {
+              model: { primary: "openai/gpt-4.1", fallbacks: ["openai/gpt-4.1-mini"] },
+              models: { "openai/gpt-4.1": {} },
+            },
+          },
+        },
+      },
+      runtimeIdRequired(
+        'agents.defaults.models["openai/gpt-4.1-mini"]',
+        runtimeOfOtherModels("openclaw"),
+      ),
+      {
+        agents: {
+          defaults: {
+            models: {
+              "openai/gpt-4.1": runtime("openclaw"),
+              "openai/gpt-4.1-mini": runtime("openclaw"),
+            },
+          },
+          entries: {
+            main: {
+              model: { primary: "openai/gpt-4.1", fallbacks: ["openai/gpt-4.1-mini"] },
+              models: { "openai/gpt-4.1": {} },
+            },
+          },
+        },
+      },
+    ],
+  ]) {
+    assert.equal(configurationRefusal(values), message, JSON.stringify(values));
+    assert.doesNotThrow(() => resolveConfiguredHarnessId(fixed), JSON.stringify(fixed));
+  }
+});
+
 test("Agent roster refusals name the setting and the fix", () => {
   const listRefusal =
     "Configuration setting agents.list is unsupported: remove it and configure each Agent under agents.entries, keyed by its Agent ID.";
@@ -1593,10 +1888,8 @@ test("Agent roster refusals name the setting and the fix", () => {
 
 test("model policy refusals name the Configuration setting", () => {
   const catalog = { providers: { openai: { models: [{ id: "gpt-4.1" }] } } };
-  const selectableRule =
-    "must be an object keyed by model ref: a model other than the primary needs the primary's provider and the same agentRuntime, set on both.";
-  const catalogRule =
-    "Configuration setting models.providers.openai.models may list only entries whose id names a primary or fallback model set in agents.defaults.model or agents.entries.";
+  const runtime = (id) => ({ agentRuntime: { id } });
+  const catalogRule = catalogRowUnselected("models.providers.openai");
   for (const [values, message] of [
     // Finding 888: a non-object agents read as an empty roster, so the provider catalog check
     // refused it first with text about selectable provider models.
@@ -1616,6 +1909,10 @@ test("model policy refusals name the Configuration setting", () => {
       { agents: { entries: { main: {} } } },
       "Configuration setting agents.entries.main.model is required when agents.defaults.model is unset: set either one.",
     ],
+    // With no model selected at all, a catalog row names the model setting to set, not the row
+    // rule no row could meet.
+    [{ models: catalog }, catalogRowNoModel("models.providers.openai")],
+    [{ agents: { defaults: {} }, models: catalog }, catalogRowNoModel("models.providers.openai")],
     [
       {
         agents: {
@@ -1632,11 +1929,170 @@ test("model policy refusals name the Configuration setting", () => {
           entries: { main: { models: { "openai/gpt-4.1-mini": {} } } },
         },
       },
-      `Configuration setting agents.entries.main.models ${selectableRule}`,
+      selectablePrimaryRuntimeRequired('agents.entries.main.models["openai/gpt-4.1"]', "openclaw"),
     ],
     [
       { agents: { defaults: { model: "openai/gpt-4.1", models: "x" } } },
-      `Configuration setting agents.defaults.models ${selectableRule}`,
+      selectableModelsNotObject("agents.defaults.models"),
+    ],
+    [
+      { agents: { defaults: { model: "openai/gpt-4.1" }, entries: { "a.b": { models: [] } } } },
+      selectableModelsNotObject('agents.entries["a.b"].models'),
+    ],
+    // The selectable rule names the first listed model that breaks it, in document order.
+    [
+      {
+        agents: {
+          defaults: {
+            model: "openai/gpt-4.1",
+            models: {
+              "openai/gpt-4.1": runtime("openclaw"),
+              "openai/gpt-4.1-mini": runtime("codex"),
+              "gateway/model-x": runtime("openclaw"),
+            },
+          },
+        },
+      },
+      selectableModelRuntimeMismatch('agents.defaults.models["openai/gpt-4.1-mini"]', "openclaw"),
+    ],
+    [
+      {
+        agents: {
+          defaults: {
+            model: "openai/gpt-4.1",
+            models: {
+              "openai/gpt-4.1": runtime("codex"),
+              "gateway/model-x": runtime("codex"),
+              "openai/gpt-4.1-mini": runtime("openclaw"),
+            },
+          },
+        },
+      },
+      selectableModelOffProvider('agents.defaults.models["gateway/model-x"]', "openai"),
+    ],
+    // Each runtime refusal names the policy that sets the runtime: an entry's, the defaults', a
+    // provider catalog row or the provider.
+    [
+      {
+        agents: {
+          defaults: { model: "openai/gpt-4.1", models: { "openai/gpt-4.1": runtime("pi") } },
+        },
+      },
+      runtimeIdUnsupported('agents.defaults.models["openai/gpt-4.1"]'),
+    ],
+    [
+      {
+        agents: { defaults: { model: "openai/gpt-4.1" } },
+        models: {
+          providers: { openai: { models: [{ id: "gpt-4.1", agentRuntime: "codex" }] } },
+        },
+      },
+      runtimeIdUnsupported("models.providers.openai.models[0]"),
+    ],
+    [
+      {
+        agents: {
+          defaults: { model: { primary: "openai/gpt-4.1", fallbacks: ["openai/gpt-4.1-mini"] } },
+        },
+        models: {
+          providers: {
+            openai: {
+              models: [{ id: "gpt-4.1" }, { id: "gpt-4.1-mini", ...runtime("codex") }],
+              ...runtime("openclaw"),
+            },
+          },
+        },
+      },
+      runtimePoliciesConflict(
+        "models.providers.openai.models[1]",
+        "codex",
+        "models.providers.openai",
+        "openclaw",
+        keepRuntime("openclaw", "codex"),
+      ),
+    ],
+    [
+      {
+        agents: {
+          defaults: { model: "openai/gpt-4.1", models: { "openai/gpt-4.1": runtime("openclaw") } },
+          entries: { main: { models: { "openai/gpt-4.1": runtime("codex") } } },
+        },
+      },
+      runtimePoliciesConflict(
+        'agents.entries.main.models["openai/gpt-4.1"]',
+        "codex",
+        'agents.defaults.models["openai/gpt-4.1"]',
+        "openclaw",
+        keepRuntime("openclaw", "codex"),
+      ),
+    ],
+    [
+      {
+        agents: { defaults: { model: "custom/model" } },
+        models: { providers: { custom: runtime("codex") } },
+      },
+      codexRuntimeOffProvider("models.providers.custom"),
+    ],
+    // A missing runtime names the entry's policy when the entry lists the model.
+    [
+      {
+        agents: {
+          entries: { main: { model: "openai/gpt-4.1", models: { "openai/gpt-4.1": {} } } },
+        },
+      },
+      runtimeIdRequired('agents.entries.main.models["openai/gpt-4.1"]', "openclaw"),
+    ],
+    [
+      { agents: { entries: { main: { model: "openai/gpt-4.1" } } } },
+      runtimeIdRequired('agents.defaults.models["openai/gpt-4.1"]', "openclaw"),
+    ],
+    // A missing runtime offers only values deployment then accepts. Codex runs a codex model, or
+    // an openai model through the Codex plugin's WebSocket app server.
+    [
+      { agents: { defaults: { model: "codex/gpt-5.1" } } },
+      runtimeIdRequired('agents.defaults.models["codex/gpt-5.1"]', "openclaw or codex"),
+    ],
+    [
+      {
+        agents: { defaults: { model: "openai/gpt-4.1" } },
+        plugins: {
+          entries: { codex: { enabled: true, config: { appServer: { transport: "websocket" } } } },
+        },
+      },
+      runtimeIdRequired('agents.defaults.models["openai/gpt-4.1"]', "openclaw or codex"),
+    ],
+    // A fallback must select its primary's runtime.
+    [
+      {
+        agents: {
+          defaults: {
+            model: { primary: "codex/gpt-5.1", fallbacks: ["codex/gpt-5.1-mini"] },
+            models: { "codex/gpt-5.1": runtime("codex") },
+          },
+        },
+      },
+      runtimeIdRequired(
+        'agents.defaults.models["codex/gpt-5.1-mini"]',
+        runtimeOfOtherModels("codex"),
+      ),
+    ],
+    // An entry whose own policy sets its primary's runtime gets its fallback's there: in the
+    // defaults' policy it would need the primary's runtime too.
+    [
+      {
+        agents: {
+          entries: {
+            main: {
+              model: { primary: "openai/gpt-4.1", fallbacks: ["openai/gpt-4.1-mini"] },
+              models: { "openai/gpt-4.1": runtime("openclaw") },
+            },
+          },
+        },
+      },
+      runtimeIdRequired(
+        'agents.entries.main.models["openai/gpt-4.1-mini"]',
+        runtimeOfOtherModels("openclaw"),
+      ),
     ],
     [
       { agents: { defaults: { models: {} } } },
@@ -1686,6 +2142,21 @@ test("model policy refusals name the Configuration setting", () => {
     configurationRefusal({ models: { providers: { [long]: false } } }).endsWith(
       "… must be an object.",
     ),
+  );
+  // A conflict names two settings: a long entry key shortens the longer path only, so the
+  // message keeps the cap and the short provider path whole.
+  const conflict = configurationRefusal({
+    agents: {
+      entries: { [long]: { model: "openai/m", models: { "openai/m": runtime("codex") } } },
+    },
+    models: { providers: { openai: runtime("openclaw") } },
+  });
+  assert.equal(Array.from(conflict).length, 256, conflict);
+  assert.ok(
+    conflict.endsWith(
+      `… (codex) and models.providers.openai.agentRuntime.id (openclaw) conflict: ${keepRuntime("openclaw", "codex")}.`,
+    ),
+    conflict,
   );
 });
 
@@ -1884,9 +2355,7 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
     model,
     models: { [model]: { agentRuntime: { id: runtimeId } } },
   });
-  const selectableRule =
-    "must be an object keyed by model ref: a model other than the primary needs the primary's provider and the same agentRuntime, set on both.";
-  const conflictingPolicies = "The selected model has conflicting Harness runtime policies.";
+  const defaultPolicy = 'agents.defaults.models["openai/gpt-4.1"]';
   const scenarios = [
     // Every deployment refuses these too, so save refuses them first with its text (finding 1828).
     ...[null, "openai/gpt-4.1-mini", [42], ["/missing-provider"]].map((fallbacks) => ({
@@ -1925,7 +2394,7 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
       [
         "same-provider fallback cannot select a different Harness",
         { id: "openclaw" },
-        `Configuration setting agents.defaults.models ${selectableRule}`,
+        selectableModelRuntimeMismatch('agents.defaults.models["openai/gpt-4.1-mini"]', "codex"),
       ],
       // A draft without a required runtime policy saves; deployment refuses it.
       ["same-provider fallback cannot omit its required runtime policy", undefined, undefined],
@@ -1981,7 +2450,7 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
     {
       name: "the selectable model catalog cannot offer a conflicting runtime",
       executionMode: "embedded",
-      saveRefusal: `Configuration setting agents.defaults.models ${selectableRule}`,
+      saveRefusal: selectableModelOffProvider('agents.defaults.models["codex/gpt-4.1"]', "openai"),
       values: {
         agents: {
           defaults: {
@@ -2013,7 +2482,10 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
     {
       name: "per-agent selectable models cannot offer a conflicting runtime",
       executionMode: "embedded",
-      saveRefusal: `Configuration setting agents.entries.primary.models ${selectableRule}`,
+      saveRefusal: selectableModelOffProvider(
+        'agents.entries.primary.models["codex/gpt-4.1"]',
+        "openai",
+      ),
       values: {
         agents: {
           defaults: selectedModelDefaults("openai/gpt-4.1", "openclaw"),
@@ -2031,8 +2503,7 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
     {
       name: "provider model catalogs cannot expose alternate runtime overrides",
       executionMode: "embedded",
-      saveRefusal:
-        "Configuration setting models.providers.openai.models may list only entries whose id names a primary or fallback model set in agents.defaults.model or agents.entries.",
+      saveRefusal: catalogRowUnselected("models.providers.openai"),
       values: {
         agents: {
           defaults: selectedModelDefaults("openai/gpt-4.1", "openclaw"),
@@ -2052,7 +2523,13 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
     {
       name: "selected model policy cannot mask a conflicting provider runtime",
       executionMode: "embedded",
-      saveRefusal: conflictingPolicies,
+      saveRefusal: runtimePoliciesConflict(
+        defaultPolicy,
+        "openclaw",
+        "models.providers.openai",
+        "codex",
+        keepRuntime("openclaw", "codex"),
+      ),
       values: {
         agents: {
           defaults: selectedModelDefaults("openai/gpt-4.1", "openclaw"),
@@ -2063,7 +2540,13 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
     {
       name: "selected model policy cannot mask a conflicting provider-model runtime",
       executionMode: "embedded",
-      saveRefusal: conflictingPolicies,
+      saveRefusal: runtimePoliciesConflict(
+        defaultPolicy,
+        "openclaw",
+        "models.providers.openai.models[0]",
+        "codex",
+        keepRuntime("openclaw", "codex"),
+      ),
       values: {
         agents: {
           defaults: selectedModelDefaults("openai/gpt-4.1", "openclaw"),
@@ -2079,7 +2562,13 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
       // The nested catalog entry must still be found, or its conflicting runtime would go unseen.
       name: "selected model policy cannot mask a conflicting nested-slash provider-model runtime",
       executionMode: "embedded",
-      saveRefusal: conflictingPolicies,
+      saveRefusal: runtimePoliciesConflict(
+        'agents.defaults.models["openai/vendor/model"]',
+        "openclaw",
+        "models.providers.openai.models[0]",
+        "codex",
+        keepRuntime("openclaw", "codex"),
+      ),
       values: {
         agents: {
           defaults: selectedModelDefaults("openai/vendor/model", "openclaw"),
@@ -2094,7 +2583,13 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
     {
       name: "per-agent model policy cannot mask a conflicting default runtime",
       executionMode: "embedded",
-      saveRefusal: conflictingPolicies,
+      saveRefusal: runtimePoliciesConflict(
+        'agents.entries.primary.models["openai/gpt-4.1"]',
+        "codex",
+        defaultPolicy,
+        "openclaw",
+        keepRuntime("openclaw", "codex"),
+      ),
       values: {
         agents: {
           defaults: selectedModelDefaults("openai/gpt-4.1", "openclaw"),
@@ -2109,7 +2604,7 @@ test("OCC rejects alternate selectable runtimes and unsupported Codex providers 
     {
       name: "dedicated Codex cannot use the OpenAI gateway provider",
       executionMode: "dedicated",
-      saveRefusal: "The Codex Harness requires the native codex model provider.",
+      saveRefusal: codexRuntimeOffProvider(defaultPolicy),
       values: {
         agents: {
           defaults: selectedModelDefaults("openai/gpt-4.1", "codex"),

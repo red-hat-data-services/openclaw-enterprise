@@ -329,6 +329,48 @@ export const EMBEDDED_API_KEY_REQUIRED =
   "Agent setting harnessAuth.method must be api_key for embedded OpenClaw on Kubernetes Compute: change harnessAuth or executionMode.";
 export const codexApiKeyRefusal = (setting) =>
   `Configuration setting ${setting} must be unset: Dedicated Codex receives model credentials from the Agent's Harness authentication binding.`;
+// Model policy refusals at Configuration save and deploy (packages/occ/src/configured-harness.ts).
+// `policy` is the setting path of the object that holds agentRuntime, such as
+// agents.defaults.models["openai/gpt-4.1"] or models.providers.openai.models[0]; `parent` is
+// agents.defaults.models or agents.entries.<id>.models.
+export const runtimeIdUnsupported = (policy) =>
+  `Configuration setting ${policy}.agentRuntime.id must be openclaw or codex.`;
+// `offer` lists only values deployment then accepts: "openclaw", "openclaw or codex" where Codex
+// runs the model, or the runtime the other selected models use.
+export const runtimeIdRequired = (policy, offer) =>
+  `Configuration setting ${policy}.agentRuntime.id is required for the selected model: set it to ${offer}.`;
+export const runtimeOfOtherModels = (runtime) =>
+  `${runtime}, the runtime the other selected models use`;
+// `remedy` offers only values deployment then accepts: BOTH_RUNTIMES, or keepRuntime(...) when
+// only one runtime is accepted (Codex does not run the model, or another policy or an earlier
+// selected model already selects it).
+export const runtimePoliciesConflict = (first, firstId, second, secondId, remedy) =>
+  `Configuration settings ${first}.agentRuntime.id (${firstId}) and ${second}.agentRuntime.id (${secondId}) conflict: ${remedy}.`;
+export const BOTH_RUNTIMES = "set both to openclaw or both to codex, or remove one";
+export const keepRuntime = (runtime, other) =>
+  `set both to ${runtime}, or remove the one set to ${other}`;
+export const codexRuntimeOffProvider = (policy) =>
+  `Configuration setting ${policy}.agentRuntime.id selects codex for a model outside the codex provider: select a codex/<model> model, or set it to openclaw.`;
+export const selectableModelsNotObject = (parent) =>
+  `Configuration setting ${parent} must be an object keyed by model ref, such as {"openai/gpt-5.1": {"agentRuntime": {"id": "openclaw"}}}.`;
+// `offer` as for runtimeIdRequired, or the runtime other settings or the listed models select.
+export const selectablePrimaryRuntimeRequired = (primaryPolicy, offer) =>
+  `Configuration setting ${primaryPolicy}.agentRuntime.id is required when other models are listed beside the primary model: set it to ${offer}.`;
+export const runtimeOfPrimaryElsewhere = (runtime) =>
+  `${runtime}, the runtime other settings select for the primary model`;
+export const runtimeOfListedModels = (runtime) => `${runtime}, the runtime the listed models use`;
+export const runtimeOfEntries = (runtime) =>
+  `${runtime}, the runtime agents.entries select for the model`;
+export const selectableModelOffProvider = (policy, provider) =>
+  `Configuration setting ${policy} is not on the primary model's provider, "${provider}": remove it, or list a model of that provider.`;
+export const selectableModelRuntimeMismatch = (policy, runtime) =>
+  `Configuration setting ${policy}.agentRuntime.id must be ${runtime}, the primary model's runtime: set it, or remove the model.`;
+// A provider catalog row (`provider` such as models.providers.openai) that names no selected
+// model; with no model selected at all, the refusal names the model setting instead.
+export const catalogRowUnselected = (provider) =>
+  `Configuration setting ${provider}.models may list only entries whose id names a primary or fallback model set in agents.defaults.model or agents.entries.`;
+export const catalogRowNoModel = (provider) =>
+  `Configuration setting ${provider}.models lists models, but no model is selected: set agents.defaults.model or an agents.entries model.`;
 // Deploy refused because the cluster denied the controller the RoleBindings for this Agent's
 // runtime credentials (RUNTIME_CREDENTIALS_CLUSTER_RBAC; agents/detail.mts).
 export const DEPLOY_CLUSTER_RBAC_REFUSED =
