@@ -329,6 +329,19 @@ export const EMBEDDED_API_KEY_REQUIRED =
   "Agent setting harnessAuth.method must be api_key for embedded OpenClaw on Kubernetes Compute: change harnessAuth or executionMode.";
 export const codexApiKeyRefusal = (setting) =>
   `Configuration setting ${setting} must be unset: Dedicated Codex receives model credentials from the Agent's Harness authentication binding.`;
+// Deploy and Agent provisioning of dedicated OpenClaw where the Installation selects no
+// provisioning SandboxDriver with all three containment facets (409 RESOURCE_CONFLICT). It names
+// the next step: codex for the selected models when Codex runs them (`codexRuns`), else a Codex
+// model (finding 3036), within the API's 256-character message cap. Stored provisioning work keeps
+// the first sentence alone, as a 503.
+export const DEDICATED_OPENCLAW_SANDBOX_REQUIRED =
+  "Dedicated OpenClaw requires a provisioning SandboxDriver with networking, filesystem, and process containment.";
+export const dedicatedOpenClawSandboxRefusal = (codexRuns) =>
+  `${DEDICATED_OPENCLAW_SANDBOX_REQUIRED} ${
+    codexRuns
+      ? "Set agentRuntime.id to codex for the selected models"
+      : "Select a codex/<model> model with agentRuntime.id codex"
+  }, or ask an Installation administrator for such a SandboxDriver.`;
 // Model policy refusals at Configuration save and deploy (packages/occ/src/configured-harness.ts).
 // `policy` is the setting path of the object that holds agentRuntime, such as
 // agents.defaults.models["openai/gpt-4.1"] or models.providers.openai.models[0]; `parent` is
@@ -336,14 +349,31 @@ export const codexApiKeyRefusal = (setting) =>
 export const runtimeIdUnsupported = (policy) =>
   `Configuration setting ${policy}.agentRuntime.id must be openclaw or codex.`;
 // `offer` lists only values deployment then accepts: "openclaw", "openclaw or codex" where Codex
-// runs the model, or the runtime the other selected models use.
+// runs the model ("codex" alone for a dedicated Agent on an Installation that cannot run
+// dedicated OpenClaw, finding 3036; "openclaw" alone for an embedded Agent where the Installation
+// approves Codex only for dedicated execution, finding 3037), or the runtime the other selected
+// models use.
 export const runtimeIdRequired = (policy, offer) =>
   `Configuration setting ${policy}.agentRuntime.id is required for the selected model: set it to ${offer}.`;
+// Where the deploying Agent runs neither runtime for the model (an embedded Agent with a
+// codex/<model> model, where the Installation approves Codex only for dedicated execution and
+// embedded OpenClaw runs no codex/<model> model), deploy names this next step instead of an offer
+// (finding 3037). `target` is "it" for one setting, or "both" for two that conflict.
+export const noRunnableRuntime = (target) =>
+  `set ${target} to codex on a dedicated Agent, or select a model of another provider`;
+export const runtimeIdRequiredNextStep = (policy) =>
+  `Configuration setting ${policy}.agentRuntime.id is required for the selected model: ${noRunnableRuntime("it")}.`;
+// Deploy, and Agent save given the deploy route's Harness resolver, of an embedded Agent whose
+// Configuration selects the Codex Harness, which the Installation approves only for dedicated
+// execution.
+export const CODEX_NEEDS_DEDICATED =
+  "The Configuration selects the Codex Harness, which needs dedicated execution; this Agent uses embedded execution. Change the Agent's execution mode or its Configuration.";
 export const runtimeOfOtherModels = (runtime) =>
   `${runtime}, the runtime the other selected models use`;
 // `remedy` offers only values deployment then accepts: BOTH_RUNTIMES, or keepRuntime(...) when
-// only one runtime is accepted (Codex does not run the model, or another policy or an earlier
-// selected model already selects it).
+// only one runtime is accepted (Codex does not run the model, another policy or an earlier
+// selected model already selects it, or the deploying Agent cannot run the other one), or
+// noRunnableRuntime("both") where the deploying Agent runs neither (finding 3037).
 export const runtimePoliciesConflict = (first, firstId, second, secondId, remedy) =>
   `Configuration settings ${first}.agentRuntime.id (${firstId}) and ${second}.agentRuntime.id (${secondId}) conflict: ${remedy}.`;
 export const BOTH_RUNTIMES = "set both to openclaw or both to codex, or remove one";
@@ -356,6 +386,8 @@ export const selectableModelsNotObject = (parent) =>
 // `offer` as for runtimeIdRequired, or the runtime other settings or the listed models select.
 export const selectablePrimaryRuntimeRequired = (primaryPolicy, offer) =>
   `Configuration setting ${primaryPolicy}.agentRuntime.id is required when other models are listed beside the primary model: set it to ${offer}.`;
+export const selectablePrimaryRuntimeNextStep = (primaryPolicy) =>
+  `Configuration setting ${primaryPolicy}.agentRuntime.id is required when other models are listed beside the primary model: ${noRunnableRuntime("it")}.`;
 export const runtimeOfPrimaryElsewhere = (runtime) =>
   `${runtime}, the runtime other settings select for the primary model`;
 export const runtimeOfListedModels = (runtime) => `${runtime}, the runtime the listed models use`;
@@ -513,6 +545,13 @@ export const referenceFormRefusal = (setting, form) =>
 // (packages/occ/src/channel-secret-bindings.ts).
 export const unboundReferenceRefusal = (setting, name) =>
   `Configuration setting ${setting} references ${name} without a Configuration Secret binding: bind ${name} in secretBindings to an environment-backed Secret, or remove the reference.`;
+// Kubernetes Compute admission of an embedded Agent's plugin secret input whose unset variable stops
+// its Gateway at startup (findings 3040, 3041): an APP_SERVER_ variable at Agent save and
+// deployment, any other unbound name a binding could set at deployment.
+export const dedicatedCodexVariableRefusal = (setting, name, plugin = "codex") =>
+  `Configuration setting ${setting} references ${name}, which only a Dedicated Codex Agent receives: on an embedded Agent, remove plugins.entries.${plugin} or set its enabled to false.`;
+export const unboundPluginSecretRefusal = (setting, name, plugin) =>
+  `Configuration setting ${setting} references ${name} without a Configuration Secret binding: bind ${name} in secretBindings, or remove plugins.entries.${plugin} or set its enabled to false.`;
 const USE_UPPERCASE =
   "use an uppercase ${NAME} bound to a Secret in secretBindings, or escape literal text as $${NAME}";
 export const unsubstitutedReferenceRefusal = (setting, shown) =>
@@ -791,3 +830,16 @@ export const secretGrantDeployReason = (
     : "Open Credentials and select Retry Secret access.";
   return `${problem} ${step}`;
 };
+
+// Channel Secrets outcomes once the Agent can use its bound Secrets (agents/credentials.mts). With
+// Slack on they name the saved Slack Secrets. With Slack off a Retry saved nothing about Slack, so
+// they name the bound Secrets (finding 3021). A grant read that finds the grant a lost Retry made
+// says access is confirmed (finding 3030).
+const SLACK_SECRETS_USABLE =
+  "This Agent can use its saved Slack Secrets. Deploy the new version to deliver them.";
+const BOUND_SECRETS_USABLE =
+  "This Agent can use its bound Secrets. Deploy the new version to deliver them.";
+export const SLACK_RETRY_GRANTED = SLACK_SECRETS_USABLE;
+export const SLACK_OFF_RETRY_GRANTED = `Secret access granted. ${BOUND_SECRETS_USABLE}`;
+export const secretAccessConfirmed = (slackOn) =>
+  `Secret access confirmed. ${slackOn ? SLACK_SECRETS_USABLE : BOUND_SECRETS_USABLE}`;

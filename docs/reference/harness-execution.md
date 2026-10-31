@@ -204,6 +204,13 @@ When no model is selected at all, that refusal says so and names
 `agents.defaults.model` or an `agents.entries` model as the setting to set.
 Codex accepts its native `codex` provider, or `openai` with the
 Codex plugin explicitly enabled for WebSocket app-server transport.
+An embedded Gateway cannot start when an active plugin's startup secret input
+reads an unset variable: Codex `appServer.authToken` or `appServer.headers`, or
+Google `webSearch.headers`. Kubernetes sets the `APP_SERVER_` variables only for
+dedicated Codex, so deployment and Agent save refuse them there. Deployment also
+refuses another variable that no Configuration Secret binding sets, unless an
+Installation Driver adds launch variables. Bind a Secret to it, or remove or
+disable the plugin entry.
 
 Configuration writes run these rules in deployment's order. They refuse settings
 that conflict, with deployment's message: an entry primary that differs, selectable
@@ -219,6 +226,12 @@ it lists the model or sets the primary's runtime, or the model's provider catalo
 provider when the primary's runtime comes from there. A missing or conflicting runtime offers
 only values that deployment accepts: `codex` only where Codex accepts the model, and the
 runtime that the other selected models, the listed models, or another policy already select.
+Deployment and Agent provisioning also check the Agent: if the Agent is dedicated and the
+Installation does not list dedicated OpenClaw, the refusal offers only `codex` where Codex
+accepts the model. Deployment of an embedded Agent, where the Installation approves Codex only
+for dedicated execution, offers only `openclaw`. For a `codex/<model>` model, embedded OpenClaw
+cannot run it either, so the refusal tells you to set `codex` on a dedicated Agent or to select
+a model of another provider. Configuration save can serve any Agent, so it offers both values.
 A Preset is checked when a launch creates its Configuration.
 
 ## Limits
@@ -241,13 +254,13 @@ A Preset is checked when a launch creates its Configuration.
 
 ## Troubleshooting
 
-| Symptom                                                       | Check                                                                                                                                                                                                              | Recovery and expected result                                                                                                                               |
-| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Deployment returns `400 INVALID_REQUEST`                      | Check the primary model, explicit runtime policies, execution mode, and native worker support.                                                                                                                     | Choose a supported pair or configure a qualifying native image. Verify the mode appears in the Installation response.                                      |
-| Dedicated native OpenClaw returns `409 RESOURCE_CONFLICT`     | Check whether the Installation has a Sandbox that supports the mode, provisions the Harness, and enforces the required facets.                                                                                     | Configure a qualifying Sandbox or choose an advertised mode, then retry deployment.                                                                        |
-| Agent save or deployment returns `503 DEPENDENCY_UNAVAILABLE` | Check `GET /installation` for `sandboxDriverUnavailable: true`. OCC reports an empty list of OpenClaw execution modes while the selected Driver is unavailable.                                                    | Restore the selected Sandbox. Verify that the mode appears again, then retry the request. Queued provisioning can resume when the Driver returns.          |
-| A model probe holds a workload unready                        | Check the [deployment failure cause](agents/deployment.md#model-check-failure-cause). `AUTHENTICATION_FAILED` indicates rejected credentials; `MODEL_PROBE_TIMEOUT` indicates the probe exhausted its time budget. | Correct the binding, provider endpoint, or connectivity and redeploy. Readiness polling does not start another model call. Check that deployment succeeds. |
-| Gateway reports `Waiting for Harness plugin runtime status`   | Inspect Harness login, model probe, and plugin status first.                                                                                                                                                       | Restore the Harness dependency. Check both the gateway endpoint and the AgentRevision's deployment status before sending a turn.                           |
+| Symptom                                                       | Check                                                                                                                                                                                                              | Recovery and expected result                                                                                                                                                              |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Deployment returns `400 INVALID_REQUEST`                      | Check the primary model, explicit runtime policies, execution mode, and native worker support.                                                                                                                     | Choose a supported pair or configure a qualifying native image. Verify the mode appears in the Installation response.                                                                     |
+| Dedicated native OpenClaw returns `409 RESOURCE_CONFLICT`     | Check whether the Installation has a Sandbox that supports the mode, provisions the Harness, and enforces the required facets.                                                                                     | Do the step that the message names: set `agentRuntime.id` to `codex` for models that Codex accepts, or ask an Installation administrator for a qualifying Sandbox. Then retry deployment. |
+| Agent save or deployment returns `503 DEPENDENCY_UNAVAILABLE` | Check `GET /installation` for `sandboxDriverUnavailable: true`. OCC reports an empty list of OpenClaw execution modes while the selected Driver is unavailable.                                                    | Restore the selected Sandbox. Verify that the mode appears again, then retry the request. Queued provisioning can resume when the Driver returns.                                         |
+| A model probe holds a workload unready                        | Check the [deployment failure cause](agents/deployment.md#model-check-failure-cause). `AUTHENTICATION_FAILED` indicates rejected credentials; `MODEL_PROBE_TIMEOUT` indicates the probe exhausted its time budget. | Correct the binding, provider endpoint, or connectivity and redeploy. Readiness polling does not start another model call. Check that deployment succeeds.                                |
+| Gateway reports `Waiting for Harness plugin runtime status`   | Inspect Harness login, model probe, and plugin status first.                                                                                                                                                       | Restore the Harness dependency. Check both the gateway endpoint and the AgentRevision's deployment status before sending a turn.                                                          |
 
 ## Implementations
 

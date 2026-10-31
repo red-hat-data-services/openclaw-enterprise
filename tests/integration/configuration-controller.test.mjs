@@ -29,6 +29,8 @@ import {
   catalogRowNoModel,
   catalogRowUnselected,
   referenceFormRefusal,
+  dedicatedCodexVariableRefusal,
+  unboundPluginSecretRefusal,
   unboundReferenceRefusal,
   unreadableSlackTokenRefusal,
   unsubstitutedFallbackRefusal,
@@ -914,16 +916,10 @@ test("Configuration save checks the shared content rules before a Compute Driver
 
 // One shape per rule. Every topology's OpenClaw Gateway rejects each (finding 874).
 const rosterRefusals = [
-  [{ agents: "x" }, "Configuration setting agents must be an object."],
-  [{ agents: { defaults: [] } }, "Configuration setting agents.defaults must be an object."],
-  [
-    withAgents({ entries: [] }),
-    "Configuration setting agents.entries must be an object keyed by Agent ID.",
-  ],
-  [
-    withAgents({ entries: { main: null } }),
-    "Configuration setting agents.entries.main must be an object.",
-  ],
+  [{ agents: "x" }, setting("agents", "must be an object")],
+  [{ agents: { defaults: [] } }, setting("agents.defaults", "must be an object")],
+  [withAgents({ entries: [] }), setting("agents.entries", "must be an object keyed by Agent ID")],
+  [withAgents({ entries: { main: null } }), setting("agents.entries.main", "must be an object")],
   [
     withAgents({ list: [{ id: "main" }] }),
     "Configuration setting agents.list is unsupported: remove it and configure each Agent under agents.entries, keyed by its Agent ID.",
@@ -1981,6 +1977,51 @@ test("Configuration save and Kubernetes deployment admission refuse settings pre
       400,
       setting("channels.slack", "is enabled, but channels require a dedicated Agent workload"),
     ],
+    // A dedicated Codex plugin entry on this embedded Agent: its Gateway would exit at every start
+    // on the unset APP_SERVER_TOKEN and the deployment wait for the convergence deadline.
+    [
+      {
+        ...valid,
+        plugins: {
+          entries: {
+            codex: {
+              enabled: true,
+              config: {
+                appServer: {
+                  transport: "websocket",
+                  url: "${APP_SERVER_URL}",
+                  authToken: "${APP_SERVER_TOKEN}",
+                },
+              },
+            },
+          },
+        },
+      },
+      400,
+      dedicatedCodexVariableRefusal(
+        "plugins.entries.codex.config.appServer.authToken",
+        "APP_SERVER_TOKEN",
+      ),
+    ],
+    // Any other variable a plugin secret input reads stops the embedded Gateway the same way
+    // unless a Configuration Secret binding sets it (finding 3041). The save cannot know the
+    // Agent's bindings; deployment names the binding to add or the entry to disable.
+    [
+      {
+        ...valid,
+        plugins: {
+          entries: {
+            google: { config: { webSearch: { headers: { "X-Key": "${SEARCH_HEADER}" } } } },
+          },
+        },
+      },
+      400,
+      unboundPluginSecretRefusal(
+        "plugins.entries.google.config.webSearch.headers.X-Key",
+        "SEARCH_HEADER",
+        "google",
+      ),
+    ],
   ]) {
     const label = JSON.stringify(values);
     const saved = await request(context.app, "PATCH", item, { body: { values } });
@@ -2073,7 +2114,6 @@ test("Configuration save and Kubernetes deployment refuse caller-owned credentia
   const binding = "model credentials come from the Agent's Harness authentication binding";
   const credentialHeader = (name) =>
     `must not set the credential header "${name}" (its name marks a credential)`;
-  const setting = (path, requirement) => `Configuration setting ${path} ${requirement}.`;
 
   for (const [values, message] of [
     [

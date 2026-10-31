@@ -79,6 +79,8 @@ import { createOccLogger, emitOccLogEvent } from "../../apps/controller/src/logg
 import { harnessTlsFixture } from "../helpers/harness-tls.mjs";
 import { conformanceKubeconfig } from "../helpers/kubernetes-compute.mjs";
 import {
+  dedicatedCodexVariableRefusal,
+  unboundPluginSecretRefusal,
   unboundReferenceRefusal,
   unreadableSlackTokenRefusal,
   unsubstitutedFallbackRefusal,
@@ -9540,6 +9542,157 @@ test("deployment admission refuses Gateway breakers before a dedicated deploymen
     unrouted.validateHarnessAuth(codex, apiKeyAuth, { ...base, channels });
     unrouted.validateHarnessAuth(embedded, apiKeyAuth, { ...embeddedBase, channels });
   }
+});
+
+test("embedded admission refuses a plugin secret input whose unset variable stops the Gateway", () => {
+  // OpenClaw resolves an active plugin's Gateway-required secret inputs (no ownerKind in the
+  // manifest: codex appServer.authToken and appServer.headers.*, google webSearch.headers.*) at
+  // startup and exits when a referenced variable is unset ("required secrets are unavailable"), so
+  // such an embedded Agent was admitted and its Gateway restarted until the 15-minute convergence
+  // deadline (findings 3040, 3041). Kubernetes Compute sets the APP_SERVER_ variables only in a
+  // Dedicated Codex Gateway; any other name a Secret binding could set is set only by a binding.
+  const driver = new KubernetesComputeDriver(options());
+  const embedded = { id: "openclaw", version: "1.0.0", mode: "embedded" };
+  const codex = { id: "codex", version: "1.0.0", mode: "dedicated" };
+  const appServer = {
+    transport: "websocket",
+    url: "${APP_SERVER_URL}",
+    authToken: "${APP_SERVER_TOKEN}",
+  };
+  const withPlugin = (id, entry, plugins = {}) => ({
+    agents: { defaults: { model: "openai/gpt-5" } },
+    plugins: { ...plugins, entries: { [id]: entry } },
+  });
+  const withCodex = (entry, plugins) => withPlugin("codex", entry, plugins);
+  const withSearchHeader = (value, entry = {}, plugins) =>
+    withPlugin(
+      "google",
+      { ...entry, config: { webSearch: { headers: { "X-Key": value } } } },
+      plugins,
+    );
+  const authToken = "plugins.entries.codex.config.appServer.authToken";
+  const searchHeader = "plugins.entries.google.config.webSearch.headers.X-Key";
+  const refusal = (message) => ({ name: "ConfigurationHarnessError", message });
+  const envRef = (id) => ({ source: "env", provider: "default", id });
+  const longName = `APP_SERVER_${"X".repeat(30)}`;
+  const source = { kind: "secret", namespaceId: tenant.id, id: "sec_relay" };
+  // The r70 case and every APP_SERVER_ form: Agent save (null bindings) refuses it too, since the
+  // Agent's execution mode alone decides it.
+  for (const [configuration, setting, name] of [
+    [withCodex({ enabled: true, config: { appServer } }), authToken, "APP_SERVER_TOKEN"],
+    // An entry without enabled is active, even beside an allowlist that does not list it.
+    [withCodex({ config: { appServer } }, { allow: ["browser"] }), authToken, "APP_SERVER_TOKEN"],
+    [
+      withCodex({ config: { appServer: { authToken: "$APP_SERVER_TOKEN" } } }),
+      authToken,
+      "APP_SERVER_TOKEN",
+    ],
+    [
+      withCodex({ config: { appServer: { authToken: envRef("app_server_token") } } }),
+      authToken,
+      "app_server_token",
+    ],
+    [
+      withCodex({ config: { appServer: { headers: { "X-Relay": "${APP_SERVER_RELAY}" } } } }),
+      "plugins.entries.codex.config.appServer.headers.X-Relay",
+      "APP_SERVER_RELAY",
+    ],
+    // A long name is cut, so the message keeps its cap.
+    [
+      withCodex({ config: { appServer: { authToken: envRef(longName) } } }),
+      authToken,
+      `"${longName.slice(0, 31)}…"`,
+    ],
+  ]) {
+    const expected = refusal(dedicatedCodexVariableRefusal(setting, name));
+    assert.throws(() => driver.validateHarnessAuth(embedded, apiKeyAuth, configuration), expected);
+    assert.throws(
+      () => driver.validateHarnessAuth(embedded, apiKeyAuth, configuration, null),
+      expected,
+    );
+  }
+  // Any other unbound name: deployment refuses it, naming the binding to add or the entry to
+  // disable. Agent save does not know the Configuration's bindings, so it leaves it to deployment.
+  for (const [configuration, setting, name, plugin] of [
+    [
+      withCodex({ enabled: true, config: { appServer: { authToken: "${RELAY_TOKEN}" } } }),
+      authToken,
+      "RELAY_TOKEN",
+      "codex",
+    ],
+    [
+      withCodex({ config: { appServer: { headers: { "X-Relay": "$RELAY_TOKEN" } } } }),
+      "plugins.entries.codex.config.appServer.headers.X-Relay",
+      "RELAY_TOKEN",
+      "codex",
+    ],
+    [withSearchHeader("${RELAY_TOKEN}"), searchHeader, "RELAY_TOKEN", "google"],
+    [
+      withSearchHeader(envRef("relay_token"), { enabled: true }),
+      searchHeader,
+      "relay_token",
+      "google",
+    ],
+  ]) {
+    const expected = refusal(unboundPluginSecretRefusal(setting, name, plugin));
+    assert.throws(() => driver.validateHarnessAuth(embedded, apiKeyAuth, configuration), expected);
+    assert.throws(
+      () => driver.validateHarnessAuth(embedded, apiKeyAuth, configuration, {}),
+      expected,
+    );
+    // Bound, the variable is set in the Gateway, which starts.
+    driver.validateHarnessAuth(embedded, apiKeyAuth, configuration, {
+      [name]: { source },
+    });
+    driver.validateHarnessAuth(embedded, apiKeyAuth, configuration, null);
+  }
+  // Each of these embedded Gateways starts: OpenClaw skips an inactive plugin's secret inputs, a
+  // fallback replaces the unset name, a reference inside other text and the URL are not read as
+  // secrets, a name no binding may set is left to Compute and the image, and a plugin input with
+  // a runtime owner (beam) or of a plugin the image does not ship only disables that plugin.
+  for (const configuration of [
+    withCodex({ enabled: false, config: { appServer } }),
+    withCodex({ enabled: true, config: { appServer } }, { enabled: false }),
+    withCodex({ enabled: true, config: { appServer } }, { deny: ["codex"] }),
+    withSearchHeader("${RELAY_TOKEN}", { enabled: false }),
+    withSearchHeader("${RELAY_TOKEN}", {}, { deny: [" Google"] }),
+    withCodex({ config: { appServer: { authToken: "${APP_SERVER_TOKEN:-unset}" } } }),
+    withCodex({ config: { appServer: { headers: { "X-Relay": "Bearer ${APP_SERVER_TOKEN}" } } } }),
+    withCodex({ config: { appServer: { url: "${APP_SERVER_URL}" } } }),
+    withSearchHeader("${RELAY_TOKEN:-}"),
+    withSearchHeader("${OPENAI_API_KEY}"),
+    withSearchHeader("${HOSTNAME}"),
+    withPlugin("beam", { enabled: true, config: { mirror: { token: "${RELAY_TOKEN}" } } }),
+    withPlugin("voice-call", {
+      enabled: true,
+      config: { twilio: { authToken: "${RELAY_TOKEN}" } },
+    }),
+  ]) {
+    driver.validateHarnessAuth(embedded, apiKeyAuth, configuration, {});
+  }
+  // A Driver the Installation selects may add launch variables whose names deployment cannot
+  // know, so an unbound name is left to the Gateway; the APP_SERVER_ rule still holds.
+  const launch = new KubernetesComputeDriver(options(), {
+    lifecycleDrivers: [
+      {
+        id: "launch-environment",
+        capability: "configuration",
+        implementation: "local-launch",
+        computeLifecycleHooks: { async beforeWorkloadStart() {} },
+      },
+    ],
+  });
+  launch.validateHarnessAuth(embedded, apiKeyAuth, withSearchHeader("${RELAY_TOKEN}"), {});
+  assert.throws(
+    () =>
+      launch.validateHarnessAuth(embedded, apiKeyAuth, withCodex({ config: { appServer } }), {}),
+    refusal(dedicatedCodexVariableRefusal(authToken, "APP_SERVER_TOKEN")),
+  );
+  // A Dedicated Codex Gateway receives the variables.
+  driver.validateHarnessAuth(codex, apiKeyAuth, {
+    agents: { defaults: { model: "codex/gpt-5" } },
+    plugins: { allow: ["codex"], entries: { codex: { enabled: true, config: { appServer } } } },
+  });
 });
 
 test("preparation still refuses a gateway password Compute does not generate", async () => {
