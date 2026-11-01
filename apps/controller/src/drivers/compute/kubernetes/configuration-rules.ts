@@ -4,6 +4,7 @@ import {
   type OpenClawConfigurationDocument,
 } from "@openclaw-enterprise/contracts";
 import {
+  activePluginSecretInputs,
   enabledChannelEntries,
   gatewayPasswordRequirement,
   generatedGatewayPasswordReference,
@@ -11,10 +12,13 @@ import {
   isAdmittedHeaderName,
   isCredentialHeaderName,
   keyedSettingPath,
+  pluginSecretInputReference,
   PROVIDER_MODELS_LIST,
   quotedSettingKey,
-  secretInputReference,
+  type SecretInputReference,
   shownSecretName,
+  unreadablePluginSecretInput,
+  waitsOnVariable,
 } from "@openclaw-enterprise/occ";
 import { asRecord, splitModelRef } from "@openclaw-enterprise/utils";
 import type { HarnessAuthMethodRule } from "../harness-auth-method.ts";
@@ -121,79 +125,43 @@ export function requireChannelTopology(
 // Secret binding cannot target them (a reserved prefix).
 const CODEX_APP_SERVER_VARIABLE = /^APP_SERVER_/i;
 
-/**
- * The plugin secret inputs of each plugin the runtime image ships with any: the
- * `configContracts.secretInputs` paths in `extensions/<id>/openclaw.plugin.json` at the commit in
- * `deploy/runtime/openclaw-source.json` (`*` matches each key). OpenClaw resolves those of an
- * active plugin at startup, and a reference it cannot read at all ends startup with "required
- * secrets are unavailable" (`secretInputReference`). `required`: the inputs without an
- * `ownerKind`, whose unset variable also ends startup; one with an `ownerKind` (beam, imap) then
- * only makes its owner unavailable. `enabledByDefault: false` (the manifest's
- * `bundledDefaultEnabled`): the plugin is active only when its entry sets `enabled: true`. The
- * Gateway skips an entry for a plugin the image does not ship. Update this list when that pin or
- * the image's plugins change.
- */
-const PLUGIN_SECRET_INPUTS: Readonly<
-  Record<
-    string,
-    {
-      readonly paths: readonly (readonly string[])[];
-      readonly required: boolean;
-      readonly enabledByDefault: boolean;
-    }
-  >
-> = {
-  beam: { paths: [["mirror", "token"]], required: false, enabledByDefault: false },
-  codex: {
-    paths: [
-      ["appServer", "authToken"],
-      ["appServer", "headers", "*"],
-    ],
-    required: true,
-    enabledByDefault: true,
-  },
-  google: { paths: [["webSearch", "headers", "*"]], required: true, enabledByDefault: true },
-  imap: { paths: [["accounts", "*", "password"]], required: false, enabledByDefault: false },
-};
-
 // Variables a Gateway may receive without a binding that a Secret binding may also name: the
 // Pod's HOSTNAME, the image's YARN_VERSION, Compute's repository broker GIT_SSL_CAINFO (embedded
 // only) and Kubernetes service links.
 const RUNTIME_VARIABLE =
   /^(?:HOSTNAME|YARN_VERSION|GIT_SSL_CAINFO)$|_SERVICE_(?:HOST|PORT)(?:_|$)|_PORT(?:_|$)/;
 
-// Each value at `keys` below `value`, with its setting path; `*` matches every key of an object.
-function settingValues(
+type PluginSecretVariable = Extract<SecretInputReference, { readonly variable: string }>;
+
+// Refuses a plugin secret input OpenClaw cannot read at all, whatever the topology and bindings,
+// with the step that fixes it (`pluginSecretInputReference`); else the variable it reads, if any.
+function readablePluginSecretInput(
+  setting: string,
   value: unknown,
-  keys: readonly string[],
-  path: string,
-): (readonly [string, unknown])[] {
-  if (keys.length === 0) {
-    return [[path, value]];
+  disable: string,
+  secrets: unknown,
+  createError: SettingError,
+): PluginSecretVariable | undefined {
+  const reference = pluginSecretInputReference(value, disable, secrets);
+  if (reference !== undefined && "requirement" in reference) {
+    throw createError(setting, reference.requirement);
   }
-  const record = asRecord(value);
-  const [key, ...rest] = keys;
-  if (record === undefined) {
-    return [];
-  }
-  return (key === "*" ? Object.keys(record) : [key!])
-    .filter((name) => Object.hasOwn(record, name))
-    .flatMap((name) => settingValues(record[name], rest, keyedSettingPath(path, name)));
+  return reference;
 }
 
 /**
  * A Gateway starts only if OpenClaw can read every secret input of an active plugin
- * (`PLUGIN_SECRET_INPUTS`) and every required one resolves; otherwise it exits at every start,
+ * (`activePluginSecretInputs`) and every required one resolves; otherwise it exits at every start,
  * its configuration still validates, and the deployment waits for its convergence deadline
  * (findings 3040, 3041, 3042, 3056). Every topology's Gateway keeps the caller's plugin entries.
  * Refuses the first reference OpenClaw cannot read (`secretInputReference`), then the first
  * required one to a variable the Gateway would lack: an APP_SERVER_ variable, which only a
  * Dedicated Codex Gateway receives, and, when `bound` is given, a name a Secret binding could set
  * but `bound` says nothing sets. At an input with an owner, it refuses such an unset name only
- * when OpenClaw cannot read the `${NAME}` it then keeps. `bound` answers for the Configuration's bindings and what the
- * Installation adds at launch; Agent save, which knows neither, passes none. Other reserved names
- * pass: Compute or the image may set them. OpenClaw skips the secret inputs of an entry whose
- * `enabled` is false, of a denied plugin and of `plugins.enabled: false`, and so does this rule.
+ * when OpenClaw cannot read the `${NAME}` it then keeps. `bound` answers for the Configuration's
+ * bindings and what the Installation adds at launch; Agent save, which knows neither, passes none.
+ * Other reserved names pass: Compute or the image may set them. Configuration save applies the
+ * first refusal (refuseUnreadablePluginSecretInputs).
  */
 export function requirePluginSecretInputs(
   configuration: Readonly<OpenClawConfigurationDocument>,
@@ -201,82 +169,77 @@ export function requirePluginSecretInputs(
   bound: ((name: string) => boolean) | undefined,
   createError: SettingError,
 ): void {
-  const plugins = asRecord(configuration.plugins);
-  const entries = asRecord(plugins?.entries);
-  if (plugins?.enabled === false || entries === undefined) {
-    return;
-  }
-  // OpenClaw matches plugin IDs in entries and deny trimmed and lowercased.
-  const policyId = (name: unknown): string | undefined =>
-    typeof name === "string" ? name.trim().toLowerCase() : undefined;
-  const denied = Array.isArray(plugins?.deny) ? plugins.deny.map(policyId) : [];
   const secrets = asRecord(configuration.secrets);
-  for (const [key, value] of Object.entries(entries)) {
-    const id = policyId(key)!;
-    const entry = asRecord(value);
-    const inputs = Object.hasOwn(PLUGIN_SECRET_INPUTS, id) ? PLUGIN_SECRET_INPUTS[id] : undefined;
-    if (
-      inputs === undefined ||
-      entry === undefined ||
-      (inputs.enabledByDefault ? entry.enabled === false : entry.enabled !== true) ||
-      denied.includes(id)
-    ) {
+  for (const { setting, value, required, disable } of activePluginSecretInputs(configuration)) {
+    const reference = readablePluginSecretInput(setting, value, disable, secrets, createError);
+    if (reference === undefined) {
       continue;
     }
-    const path = keyedSettingPath("plugins.entries", key);
-    const disable = `remove ${path} or set its enabled to false`;
-    for (const [setting, value] of inputs.paths.flatMap((keys) =>
-      settingValues(entry.config, keys, `${path}.config`),
-    )) {
-      const reference = secretInputReference(value, secrets);
-      if (reference !== undefined && "requirement" in reference) {
-        throw createError(setting, `${reference.requirement}, or ${disable}`);
-      }
-      if (reference === undefined) {
-        continue;
-      }
-      const name = reference.variable;
-      const shown = shownSecretName(name);
-      const unbound =
-        bound !== undefined &&
-        isAllowedSecretBindingDestination(name) &&
-        !RUNTIME_VARIABLE.test(name) &&
-        !bound(name);
-      // An APP_SERVER_ variable is never set outside a Dedicated Codex Gateway, whatever binds.
-      const appServerUnset = topology !== "Dedicated Codex" && CODEX_APP_SERVER_VARIABLE.test(name);
-      const agent = topology === "embedded OpenClaw" ? "an embedded" : "a Dedicated OpenClaw";
-      if (!inputs.required) {
-        // An unset variable here only makes the input's owner unavailable, unless OpenClaw cannot
-        // read the `${NAME}` it then keeps: that failure (an allowlist's policy denial) is not one
-        // it isolates to the owner (`assertOwnerCanBeIsolated`), so it ends startup (finding 3060
-        // for an APP_SERVER_ name, which no binding can set).
-        if (reference.unset !== undefined && appServerUnset) {
-          throw createError(
-            setting,
-            `${reference.unset}, and it is never set on ${agent} Agent: ${disable}`,
-          );
-        }
-        if (reference.unset !== undefined && unbound) {
-          throw createError(
-            setting,
-            `${reference.unset}: bind ${shown} in secretBindings, or ${disable}`,
-          );
-        }
-        continue;
-      }
-      if (appServerUnset) {
+    const name = reference.variable;
+    const shown = shownSecretName(name);
+    const unbound =
+      bound !== undefined &&
+      isAllowedSecretBindingDestination(name) &&
+      !RUNTIME_VARIABLE.test(name) &&
+      !bound(name);
+    // An APP_SERVER_ variable is never set outside a Dedicated Codex Gateway, whatever binds.
+    const appServerUnset = topology !== "Dedicated Codex" && CODEX_APP_SERVER_VARIABLE.test(name);
+    const agent = topology === "embedded OpenClaw" ? "an embedded" : "a Dedicated OpenClaw";
+    if (!required) {
+      // An unset variable here only makes the input's owner unavailable, unless OpenClaw cannot
+      // read the `${NAME}` it then keeps: that failure (an allowlist's policy denial) is not one
+      // it isolates to the owner (`assertOwnerCanBeIsolated`), so it ends startup (finding 3060
+      // for an APP_SERVER_ name, which no binding can set).
+      if (reference.unset !== undefined && appServerUnset) {
         throw createError(
           setting,
-          `references ${shown}, which only a Dedicated Codex Agent receives: on ${agent} Agent, ${disable}`,
+          `${reference.unset}, and it is never set on ${agent} Agent: ${disable}`,
         );
       }
-      if (unbound) {
+      if (reference.unset !== undefined && unbound) {
         throw createError(
           setting,
-          `references ${shown} without a Configuration Secret binding: bind ${shown} in secretBindings, or ${disable}`,
+          `${reference.unset}: bind ${shown} in secretBindings, or ${disable}`,
         );
       }
+      continue;
     }
+    if (appServerUnset) {
+      throw createError(
+        setting,
+        `references ${shown}, which only a Dedicated Codex Agent receives: on ${agent} Agent, ${disable}`,
+      );
+    }
+    if (unbound) {
+      throw createError(
+        setting,
+        `references ${shown} without a Configuration Secret binding: bind ${shown} in secretBindings, or ${disable}`,
+      );
+    }
+  }
+}
+
+/**
+ * The part of requirePluginSecretInputs that holds on every topology and whatever the bindings: a
+ * plugin secret input OpenClaw cannot read at all. Configuration save, provisioning and Preset
+ * save refuse it with deployment's text (finding 3069); a stored one still reads, and an edit that
+ * keeps it gets the same refusal. On a Preset save, plugins or `secrets` that wait on a variable
+ * are checked once filled.
+ */
+export function refuseUnreadablePluginSecretInputs(
+  configuration: Readonly<OpenClawConfigurationDocument>,
+  createError: SettingError,
+  options?: ConfigurationValidationOptions,
+): void {
+  if (
+    waitsOnVariable(configuration.plugins, ["plugins"], options) ||
+    waitsOnVariable(configuration.secrets, ["secrets"], options)
+  ) {
+    return;
+  }
+  const unreadable = unreadablePluginSecretInput(configuration);
+  if (unreadable !== undefined) {
+    throw createError(unreadable.setting, unreadable.requirement);
   }
 }
 

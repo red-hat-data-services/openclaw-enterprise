@@ -211,12 +211,14 @@ secret input reads an unset variable: Codex `appServer.authToken` or
 Agent save refuse them for other Agents. Deployment also refuses another
 variable that no Configuration Secret binding sets, unless an Installation
 Driver adds launch variables. Bind a Secret to it, or remove or disable the
-plugin entry. Deployment and Agent save also refuse a reference OpenClaw cannot
-read in any active plugin's secret input, including an enabled Beam or IMAP
-entry: a SecretRef without a provider, a provider that `secrets.providers` does
-not configure (the default env alias needs no entry), an env id that does not
-start with a letter and use only `A-Z`, `0-9` and `_` (at most 128 characters),
-or an id that the env provider's `allowlist` omits. The allowlist applies to
+plugin entry. OpenClaw reads these inputs only in an entry keyed by the exact
+plugin ID, such as `google`, not `Google`. On Kubernetes, Configuration save, Agent save and deployment
+also refuse a reference OpenClaw cannot read in any active plugin's secret
+input, including an enabled Beam or IMAP entry: a SecretRef without a
+provider, a provider that `secrets.providers` does not configure (the default
+env alias needs no entry), an env id that does not start with a letter and use
+only `A-Z`, `0-9` and `_` (at most 128 characters), or an id that the env
+provider's `allowlist` omits. The allowlist applies to
 `$NAME` and SecretRef objects. OpenClaw substitutes a set `${NAME}` first, so the
 allowlist applies to it only when the variable is unset. Deployment then refuses an
 unbound `${NAME}` that the allowlist omits at an enabled Beam or IMAP entry.
@@ -225,7 +227,15 @@ than dedicated Codex, because it is always unset on them. On every Compute,
 Configuration save, Agent save and deployment apply the same provider and
 allowlist rules to a `gateway.auth.password` SecretRef. They also refuse one
 with keys other than `source`, `provider` and `id`, because OpenClaw's
-configuration check then fails.
+configuration check then fails. The same check fails on a `secrets.defaults` that
+is not an object, that holds a key other than `env`, `file`, `exec` or `store`,
+or that holds an alias outside OpenClaw's alias grammar, such as `" custom "` or
+`"BAD"`, so the same steps refuse these too. OpenClaw substitutes an alias written
+as `${NAME}` or `${NAME:-fallback}` before that check, so OCE leaves such an alias,
+and any SecretRef rule that depends on it, to OpenClaw. Configuration save, Agent
+save and deployment refuse another spelling of a `codex` or `acpx` key in
+`plugins.entries`, such as `Codex`: OpenClaw merges it into that plugin's entry,
+which OCE checks only at the exact key.
 
 Configuration writes run these rules in deployment's order. They refuse settings
 that conflict, with deployment's message: an entry primary that differs, selectable

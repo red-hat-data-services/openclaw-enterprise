@@ -34,15 +34,18 @@ import {
   unreadablePluginSecretRefusal,
   appServerUnreadablePluginSecretRefusal,
   unreadableGatewayPasswordRefusal,
+  invalidSecretProviderDefaultsRefusal,
   unboundReferenceRefusal,
   unreadableSlackTokenRefusal,
   unsubstitutedFallbackRefusal,
   unsubstitutedReferenceRefusal,
   codexApiKeyRefusal,
   codexRuntimeOffProvider,
+  configIncludeRefusal,
   KUBERNETES_GATEWAY_PASSWORD_REFUSAL,
   keepRuntime,
   OPENCLAW_ONLY,
+  pluginEntryKeyVariantRefusal,
   runtimeIdRequired,
   runtimeIdUnsupported,
   runtimePoliciesConflict,
@@ -1658,6 +1661,123 @@ test("Configuration save and deployment refuse settings the pinned OpenClaw reti
   });
 });
 
+test("Configuration save and deployment refuse another spelling of the codex or acpx plugin entry key", async () => {
+  // Finding 3073. The pinned OpenClaw merges plugins.entries keys that match trimmed and
+  // lowercased, and the last entry with a `config` replaces the plugin's whole config. OCE checks
+  // codex and acpx settings, and Compute renders codex settings, only at the exact key, so a later
+  // `Codex` entry would replace what OCE checked: every save path, Agent save and deployment
+  // refuse such a key, whatever it holds.
+  const configurationDriver = createConfigurationBackend();
+  const context = await fixture({
+    configurationDriver,
+    computeDriver: kubernetesRules("compute-plugin-key-integration", ...configurationRules),
+  });
+  const agent = await storedRowAgent(context, configurationDriver, runtimeSelected, {
+    name: "Plugin entry key consumer",
+    secretName: "plugin-key",
+  });
+  const sentinel = `synthetic-url-userinfo-${randomUUID()}`;
+  const proxy = `http://u:${sentinel}@proxy.example:3128`;
+  const codex = { config: { appServer: { approvalPolicy: "on-request" } } };
+  const withEntries = (entries) => ({ ...runtimeSelected, plugins: { entries } });
+  // Each variant holds a value OCE refuses at the exact key: a retired approval policy, a proxy
+  // URL with userinfo, an MCP server environment proxy with userinfo.
+  for (const [entries, path, id] of [
+    [
+      { codex, Codex: { config: { appServer: { approvalPolicy: "untrusted" } } } },
+      "plugins.entries.Codex",
+      "codex",
+    ],
+    [
+      { " codex": { config: { appServer: { networkProxy: { proxyUrl: proxy } } } } },
+      'plugins.entries[" codex"]',
+      "codex",
+    ],
+    [
+      {
+        acpx: { config: {} },
+        ACPX: {
+          config: { mcpServers: { docs: { command: "docs-mcp", env: { HTTPS_PROXY: proxy } } } },
+        },
+      },
+      "plugins.entries.ACPX",
+      "acpx",
+    ],
+  ]) {
+    const values = withEntries(entries);
+    const message = pluginEntryKeyVariantRefusal(path, id);
+    await refusedAtSaveAndDeploy(context, agent, values, message);
+    await refusedOnSave(context, values, message, { sentinel });
+  }
+  // Agent save refuses a stored row the same way, before any deployment.
+  await writePastOcc(
+    configurationDriver,
+    agent.configurationId,
+    withEntries({ codex, CODEX: { config: {} } }),
+  );
+  assertRefused(
+    await request(context.app, "PATCH", agent.agentPath, {
+      body: { configurationId: agent.configurationId },
+    }),
+    pluginEntryKeyVariantRefusal("plugins.entries.CODEX", "codex"),
+    { label: "Agent save" },
+  );
+  // The exact keys deploy, and other plugins' keys in another spelling still save (finding 3072).
+  const exact = withEntries({ codex, acpx: { config: {} } });
+  await writePastOcc(configurationDriver, agent.configurationId, exact);
+  const deployed = await request(context.app, "POST", `${agent.agentPath}/deploy`);
+  assert.equal(deployed.status, 202, JSON.stringify(deployed.body));
+  await acceptedOnSave(
+    context,
+    withEntries({ ...exact.plugins.entries, Google: { enabled: false } }),
+  );
+});
+
+test("Configuration save and deployment refuse OpenClaw's $include directive", async () => {
+  // Finding 3078. The pinned OpenClaw replaces an object holding $include with the named files'
+  // settings, merged under its other keys with arrays concatenated, and re-reads them when they
+  // change. Configuration rules and Compute read the document as written, so an include would add
+  // settings no rule checked, such as a gateway.auth.mode Kubernetes Compute refuses, from a file
+  // in the Gateway's config directory. Every save path, Agent save and deployment refuse it at any
+  // depth; configuration-occ.test.mjs proves the paths the refusal names.
+  const configurationDriver = createConfigurationBackend();
+  const context = await fixture({
+    configurationDriver,
+    computeDriver: kubernetesRules("compute-include-integration", ...configurationRules),
+  });
+  const agent = await storedRowAgent(context, configurationDriver, runtimeSelected, {
+    name: "Config include consumer",
+    secretName: "config-include",
+  });
+  for (const [values, path] of [
+    [{ $include: "./extra.json", ...runtimeSelected }, "$include"],
+    [
+      { ...runtimeSelected, gateway: { auth: { $include: "./auth.json" } } },
+      "gateway.auth.$include",
+    ],
+  ]) {
+    const message = configIncludeRefusal(path);
+    await refusedAtSaveAndDeploy(context, agent, values, message);
+    await refusedOnSave(context, values, message);
+  }
+  // Agent save refuses a stored row the same way, before any deployment.
+  await writePastOcc(configurationDriver, agent.configurationId, {
+    ...runtimeSelected,
+    tools: { $include: "./tools.json" },
+  });
+  assertRefused(
+    await request(context.app, "PATCH", agent.agentPath, {
+      body: { configurationId: agent.configurationId },
+    }),
+    configIncludeRefusal("tools.$include"),
+    { label: "Agent save" },
+  );
+  // Without the directive the same Agent deploys.
+  await writePastOcc(configurationDriver, agent.configurationId, runtimeSelected);
+  const deployed = await request(context.app, "POST", `${agent.agentPath}/deploy`);
+  assert.equal(deployed.status, 202, JSON.stringify(deployed.body));
+});
+
 test("Configuration save and deployment refuse OpenClaw's sandbox, which the OCE runtime cannot run", async () => {
   // Finding 2767. The pinned OpenClaw runs sandboxed tools in Docker, which the OCE runtime does
   // not have: a Configuration that turned the sandbox on saved and deployed, then failed every
@@ -1963,6 +2083,7 @@ test("Configuration save and Kubernetes deployment admission refuse settings pre
   const searchHeader = (header, value) => ({
     google: { config: { webSearch: { headers: { [header]: value } } } },
   });
+  const withPluginAllow = (base, allow) => ({ ...base, plugins: { ...base.plugins, allow } });
   const unboundSearchHeader = (header) =>
     unboundPluginSecretRefusal(
       `plugins.entries.google.config.webSearch.headers.${header}`,
@@ -2005,6 +2126,15 @@ test("Configuration save and Kubernetes deployment admission refuse settings pre
       },
       unreadableGatewayPasswordRefusal("providerless", "env", "custom"),
     ],
+    // An alias written as an environment reference is known only to the runtime, so the refusal
+    // names the setting instead of an alias.
+    [
+      {
+        ...password({ source: "env", id: "OPENCLAW_GATEWAY_PASSWORD" }),
+        secrets: { defaults: { env: "${ALIAS:-custom}" } },
+      },
+      unreadableGatewayPasswordRefusal("substitutedAlias"),
+    ],
     [
       {
         ...password(generated),
@@ -2012,8 +2142,62 @@ test("Configuration save and Kubernetes deployment admission refuse settings pre
       },
       unreadableGatewayPasswordRefusal("allowlist", "OPENCLAW_GATEWAY_PASSWORD"),
     ],
+    // A secrets.defaults OpenClaw's configuration check refuses stops the Gateway at every start
+    // whatever it references (exit 78, finding 3064): a padded or upper-case alias, one that is
+    // not text, another key, or no object. The alias rule runs first, so with a password on
+    // provider default the refusal names the alias, not the provider.
+    [
+      { ...password(generated), secrets: { defaults: { env: " custom " } } },
+      invalidSecretProviderDefaultsRefusal("alias", "env", '" custom "', "custom"),
+    ],
+    [
+      { ...password(generated), secrets: { defaults: { env: "BAD" } } },
+      invalidSecretProviderDefaultsRefusal("alias", "env", "BAD", "bad"),
+    ],
+    [
+      { ...valid, secrets: { defaults: { file: "Vault" } } },
+      invalidSecretProviderDefaultsRefusal("alias", "file", "Vault", "vault"),
+    ],
+    [
+      { ...valid, secrets: { defaults: { env: 7 } } },
+      invalidSecretProviderDefaultsRefusal("alias", "env"),
+    ],
+    // A null reads as the text "null", which the grammar admits: the type check must refuse it.
+    [
+      { ...valid, secrets: { defaults: { env: null } } },
+      invalidSecretProviderDefaultsRefusal("alias", "env"),
+    ],
+    [
+      { ...valid, secrets: { defaults: { envv: "custom" } } },
+      invalidSecretProviderDefaultsRefusal("key", '"envv"'),
+    ],
+    [{ ...valid, secrets: { defaults: "custom" } }, invalidSecretProviderDefaultsRefusal("shape")],
+    // `$${NAME}` is an escape the runtime renders as the literal `${NAME}`, so it is checked as
+    // written.
+    [
+      { ...valid, secrets: { defaults: { env: "$${ALIAS}" } } },
+      invalidSecretProviderDefaultsRefusal("alias", "env", '"$${ALIAS}"'),
+    ],
   ]) {
     await refusedAtSaveAndDeploy(context, agent, values, message);
+  }
+  assert.equal(configurationDriver.storedConfigurations().length, 1);
+  // OpenClaw substitutes `${VAR}` and `${VAR:-fallback}` in an alias before its configuration check
+  // and before it reads SecretRefs on that alias, so the alias rule and the password reader leave
+  // such an alias to the runtime: a password on provider default or on another provider saves.
+  for (const values of [
+    { ...password(generated), secrets: { defaults: { env: "${ALIAS:-custom}" } } },
+    {
+      ...password({ ...generated, provider: "custom" }),
+      secrets: { defaults: { env: "${ALIAS:-custom}", file: "${FILE_ALIAS}" } },
+    },
+  ]) {
+    const saved = await request(context.app, "POST", context.collection, {
+      body: { kind: "agent", values },
+    });
+    assert.equal(saved.status, 201, JSON.stringify(saved.body));
+    const savedItem = `${context.collection}/${saved.body.data.id}`;
+    assert.equal((await request(context.app, "DELETE", savedItem)).status, 204);
   }
   assert.equal(configurationDriver.storedConfigurations().length, 1);
   // A stored Configuration the password rule now refuses still reads and deletes.
@@ -2061,6 +2245,159 @@ test("Configuration save and Kubernetes deployment admission refuse settings pre
     "Password-alias-deferred",
   );
   assert.equal(deferredAlias.status, 201, JSON.stringify(deferredAlias.body));
+  // A variable default fills the alias at Preset save, where the alias rule checks it.
+  assertRefused(
+    await savePreset(context, {
+      variables: { alias: { type: "string", default: "BAD" } },
+      configuration: {
+        values: {
+          ...password({ ...generated, provider: "custom" }),
+          secrets: { defaults: { env: "{{ vars.alias }}" } },
+        },
+      },
+    }),
+    invalidSecretProviderDefaultsRefusal("alias", "env", "BAD", "bad"),
+  );
+
+  // A plugin secret input OpenClaw cannot read at all stops the Gateway whatever the topology and
+  // the bindings, while its configuration still validates (finding 3056): one without a provider,
+  // an env id OpenClaw refuses, a provider no secrets.providers entry configures (at an input with
+  // a runtime owner, beam enabled, too) and an id the env provider's allowlist omits. Kubernetes
+  // Compute's save rules refuse each with deployment's text (finding 3069): before, the save
+  // accepted it and only deployment refused it. A stored row still reads, deployment refuses it,
+  // and an edit that keeps it gets the same refusal, which names the step.
+  const unreadablePluginInputs = [
+    [
+      withPluginEntries(valid, {
+        codex: { config: { appServer: { authToken: { source: "env", id: "RELAY_TOKEN" } } } },
+      }),
+      unreadablePluginSecretRefusal(
+        "plugins.entries.codex.config.appServer.authToken",
+        "codex",
+        "providerless",
+      ),
+    ],
+    [
+      withPluginEntries(
+        valid,
+        searchHeader("X-Goog-User-Project", {
+          source: "env",
+          provider: "default",
+          id: "search_header",
+        }),
+      ),
+      unreadablePluginSecretRefusal(
+        "plugins.entries.google.config.webSearch.headers.X-Goog-User-Project",
+        "google",
+        "id",
+        "search_header",
+        "SEARCH_HEADER",
+      ),
+    ],
+    [
+      withPluginEntries(valid, {
+        beam: {
+          enabled: true,
+          config: {
+            mirror: {
+              endpoint: "https://beam.example.test/mirror",
+              catalogs: ["main"],
+              token: { source: "env", provider: "vault", id: "BEAM_TOKEN" },
+            },
+          },
+        },
+      }),
+      unreadablePluginSecretRefusal(
+        "plugins.entries.beam.config.mirror.token",
+        "beam",
+        "provider",
+        "vault",
+      ),
+    ],
+    [
+      {
+        ...withPluginEntries(valid, searchHeader("X-Key", "$SEARCH_HEADER")),
+        secrets: {
+          providers: { default: { source: "env", allowlist: ["OPENCLAW_GATEWAY_PASSWORD"] } },
+        },
+      },
+      unreadablePluginSecretRefusal(
+        "plugins.entries.google.config.webSearch.headers.X-Key",
+        "google",
+        "allowlist",
+        "SEARCH_HEADER",
+      ),
+    ],
+    // A plugins.allow that omits google does not make its entry inactive: at startup OpenClaw adds
+    // every known plugin entry with config to a non-empty plugins.allow, then resolves its inputs.
+    [
+      withPluginAllow(
+        withPluginEntries(
+          valid,
+          searchHeader("X-Key", { source: "env", provider: "vault", id: "SEARCH_HEADER" }),
+        ),
+        ["codex"],
+      ),
+      unreadablePluginSecretRefusal(
+        "plugins.entries.google.config.webSearch.headers.X-Key",
+        "google",
+        "provider",
+        "vault",
+      ),
+    ],
+  ];
+  for (const [values, message] of unreadablePluginInputs) {
+    await refusedAtSaveAndDeploy(context, agent, values, message);
+  }
+  // A Preset save refuses it too, unless the plugins or secrets wait on a variable: then it is
+  // checked once filled.
+  const [[unreadableValues, unreadableMessage]] = unreadablePluginInputs;
+  assertRefused(
+    await savePreset(context, { configuration: { values: unreadableValues } }),
+    unreadableMessage,
+  );
+  const waitingPluginInput = await savePreset(
+    context,
+    {
+      variables: { provider: { type: "string" } },
+      configuration: {
+        values: withPluginEntries(
+          valid,
+          searchHeader("X-Key", { source: "env", provider: "{{ vars.provider }}", id: "SEARCH" }),
+        ),
+      },
+    },
+    "Plugin-input-deferred",
+  );
+  assert.equal(waitingPluginInput.status, 201, JSON.stringify(waitingPluginInput.body));
+  // A stored unreadable row does not strand its Configuration: save checks only the new values,
+  // so an edit to a document without the reference saves.
+  await writePastOcc(configurationDriver, agent.configurationId, unreadableValues);
+  const fixed = await request(context.app, "PATCH", item, { body: { values: valid } });
+  assert.equal(fixed.status, 200, JSON.stringify(fixed.body));
+  // References OpenClaw reads still save: an env SecretRef on the default alias, the same id on a
+  // configured env provider whose allowlist lists it, and the `$NAME` shorthand there.
+  for (const value of [
+    { source: "env", provider: "default", id: "SEARCH_HEADER" },
+    { source: "env", provider: "listed", id: "SEARCH_HEADER" },
+    "$SEARCH_HEADER",
+  ]) {
+    const values = {
+      ...withPluginEntries(valid, searchHeader("X-Key", value)),
+      secrets: {
+        providers: {
+          default: { source: "env", allowlist: ["OPENCLAW_GATEWAY_PASSWORD", "SEARCH_HEADER"] },
+          listed: { source: "env", allowlist: ["SEARCH_HEADER"] },
+        },
+      },
+    };
+    const saved = await request(context.app, "PATCH", item, { body: { values } });
+    assert.equal(saved.status, 200, `${JSON.stringify(value)}: ${JSON.stringify(saved.body)}`);
+  }
+  assert.equal(
+    (await request(context.app, "PATCH", item, { body: { values: valid } })).status,
+    200,
+  );
 
   // Rules that depend on the Compute Driver or the topology save, and deployment refuses them.
   for (const [values, deployStatus, deployMessage] of [
@@ -2112,58 +2449,14 @@ test("Configuration save and Kubernetes deployment admission refuse settings pre
       400,
       unboundSearchHeader("X-Goog-User-Project"),
     ],
-    // A SecretRef OpenClaw cannot read at all stops the Gateway whatever the bindings, while its
-    // configuration still validates (finding 3056): one without a provider, an env id OpenClaw
-    // refuses, and a provider no secrets.providers entry configures, at an input with a runtime
-    // owner (beam, enabled) too. Save accepts each.
+    // OpenClaw adds the google entry to a plugins.allow that omits it, so the unbound variable
+    // still stops the Gateway.
     [
-      withPluginEntries(valid, {
-        codex: { config: { appServer: { authToken: { source: "env", id: "RELAY_TOKEN" } } } },
-      }),
-      400,
-      unreadablePluginSecretRefusal(
-        "plugins.entries.codex.config.appServer.authToken",
+      withPluginAllow(withPluginEntries(valid, searchHeader("X-Key", "${SEARCH_HEADER}")), [
         "codex",
-        "providerless",
-      ),
-    ],
-    [
-      withPluginEntries(
-        valid,
-        searchHeader("X-Goog-User-Project", {
-          source: "env",
-          provider: "default",
-          id: "search_header",
-        }),
-      ),
+      ]),
       400,
-      unreadablePluginSecretRefusal(
-        "plugins.entries.google.config.webSearch.headers.X-Goog-User-Project",
-        "google",
-        "id",
-        "search_header",
-      ),
-    ],
-    [
-      withPluginEntries(valid, {
-        beam: {
-          enabled: true,
-          config: {
-            mirror: {
-              endpoint: "https://beam.example.test/mirror",
-              catalogs: ["main"],
-              token: { source: "env", provider: "vault", id: "BEAM_TOKEN" },
-            },
-          },
-        },
-      }),
-      400,
-      unreadablePluginSecretRefusal(
-        "plugins.entries.beam.config.mirror.token",
-        "beam",
-        "provider",
-        "vault",
-      ),
+      unboundSearchHeader("X-Key"),
     ],
     // An APP_SERVER_ name at an enabled Beam is never set on this embedded Agent, and the
     // allowlist's denial of the SecretRef OpenClaw then keeps stops the Gateway (finding 3060).
@@ -2248,6 +2541,26 @@ test("Configuration save and Kubernetes deployment admission refuse settings pre
     `${allowlistedCodex.agentPath}/deploy`,
   );
   assert.equal(allowlistedDeploy.status, 202, JSON.stringify(allowlistedDeploy.body));
+
+  // OpenClaw reads plugin secret inputs only in the entry keyed by the plugin's exact ID, so it
+  // reads no reference in a `Google` entry and its Gateway starts (finding 3072): an unreadable
+  // reference there saves, and an unbound variable there deploys.
+  const caseVariant = (value) => ({ Google: searchHeader("X-Key", value).google });
+  const unreadableVariant = withPluginEntries(
+    valid,
+    caseVariant({ source: "env", provider: "vault", id: "SEARCH_HEADER" }),
+  );
+  const variantSaved = await request(context.app, "PATCH", item, {
+    body: { values: unreadableVariant },
+  });
+  assert.equal(variantSaved.status, 200, JSON.stringify(variantSaved.body));
+  const variantAgent = await deployableAgent(context, context.namespace, {
+    values: withPluginEntries(valid, caseVariant("${SEARCH_HEADER}")),
+    name: "Plugin key variant consumer",
+    secretName: "plugin-variant-key",
+  });
+  const variantDeploy = await request(context.app, "POST", `${variantAgent.agentPath}/deploy`);
+  assert.equal(variantDeploy.status, 202, JSON.stringify(variantDeploy.body));
 
   // Values every Gateway accepts still save.
   for (const values of [

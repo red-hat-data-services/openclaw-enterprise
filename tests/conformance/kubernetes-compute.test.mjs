@@ -9552,7 +9552,7 @@ test("deployment admission refuses Gateway breakers before a dedicated deploymen
       "keys",
     ],
     [passwordRef("vault"), "provider", "vault"],
-    [passwordRef("default", { defaults: { env: "custom" } }), "provider", "default"],
+    [passwordRef("default", { defaults: { env: "custom" } }), "defaultAlias", "custom"],
     [passwordRef("vault", { providers: { vault: { source: "file" } } }), "provider", "vault"],
     [
       passwordRef("default", { providers: { default: envProvider(["OTHER"]) } }),
@@ -9692,13 +9692,16 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
     }
     admit(configuration, { [name]: { source } });
     admit(configuration, null);
+    // Configuration save knows neither the Agent nor its bindings, so it leaves it to deployment.
+    driver.validateConfiguration(configuration);
   };
   const embeddedAdmission = admission(driver, embedded);
 
   // Every form of an APP_SERVER_ reference, on an embedded Agent.
   for (const [configuration, setting, name] of [
     [withCodex({ enabled: true, config: { appServer } }), authToken, "APP_SERVER_TOKEN"],
-    // An entry without enabled is active, even beside an allowlist that does not list it.
+    // An entry without enabled is active, even beside an allowlist that does not list it: at
+    // startup OpenClaw adds every known plugin entry with config to a non-empty plugins.allow.
     [withCodex({ config: { appServer } }, { allow: ["browser"] }), authToken, "APP_SERVER_TOKEN"],
     [
       withCodex({ config: { appServer: { authToken: "$APP_SERVER_TOKEN" } } }),
@@ -9722,6 +9725,8 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
       configuration,
       refusal(dedicatedCodexVariableRefusal(setting, name)),
     );
+    // Configuration save knows no Agent, so the execution mode that refuses it is not known yet.
+    driver.validateConfiguration(configuration);
   }
   // The other forms of an unbound reference, on an embedded Agent.
   for (const [configuration, ...refused] of [
@@ -9734,13 +9739,20 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
     // OpenClaw trims a secret-input value before it reads `${NAME}`, so padding still stops the
     // Gateway (finding 3046).
     [withSearchHeader(" ${RELAY_TOKEN}\n"), searchHeader, "RELAY_TOKEN", "google"],
+    // OpenClaw adds the google entry to a plugins.allow that omits it, so its input is read.
+    [
+      withSearchHeader("${RELAY_TOKEN}", {}, { allow: ["codex"] }),
+      searchHeader,
+      "RELAY_TOKEN",
+      "google",
+    ],
   ]) {
     refusedUntilBound(embeddedAdmission, configuration, refused);
   }
   // References OpenClaw cannot read at all stop the Gateway whatever sets the variable, and its
   // configuration still validates, so the runtime hold does not catch them (finding 3056). That
   // holds for an input with a runtime owner too (beam, active only when enabled), so deployment,
-  // bound or not, and Agent save refuse them on every topology.
+  // bound or not, Agent save and Configuration save (finding 3069) refuse them on every topology.
   const beamToken = "plugins.entries.beam.config.mirror.token";
   const withBeam = (token, entry = { enabled: true }) =>
     withPlugin("beam", { ...entry, config: { mirror: { token } } });
@@ -9794,6 +9806,13 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
       "provider",
       "vault",
     ],
+    [
+      withSearchHeader({ ...envRef("RELAY_TOKEN"), provider: "vault" }, {}, { allow: ["codex"] }),
+      searchHeader,
+      "google",
+      "provider",
+      "vault",
+    ],
     // An alias outside OpenClaw's provider grammar, even a configured one.
     [
       {
@@ -9802,7 +9821,7 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
       },
       searchHeader,
       "google",
-      "provider",
+      "providerAlias",
       "Vault",
     ],
     // The default alias moves with secrets.defaults.env.
@@ -9810,19 +9829,36 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
       { ...withSearchHeader(envRef("RELAY_TOKEN")), secrets: { defaults: { env: "custom" } } },
       searchHeader,
       "google",
-      "provider",
-      "default",
+      "defaultAlias",
+      "custom",
     ],
-    [withSearchHeader(envRef("relay_token")), searchHeader, "google", "id", "relay_token"],
+    // The step offers the id upper-cased, with other characters as _, when that is one OpenClaw
+    // reads.
+    [
+      withSearchHeader(envRef("relay_token")),
+      searchHeader,
+      "google",
+      "id",
+      "relay_token",
+      "RELAY_TOKEN",
+    ],
     [withSearchHeader(envRef("_RELAY")), searchHeader, "google", "id", "_RELAY"],
-    [withSearchHeader(envRef(" RELAY_TOKEN ")), searchHeader, "google", "id", '" RELAY_TOKEN "'],
-    [withBeam(envRef("relay-token")), beamToken, "beam", "id", '"relay-token"'],
+    [
+      withSearchHeader(envRef(" RELAY_TOKEN ")),
+      searchHeader,
+      "google",
+      "id",
+      '" RELAY_TOKEN "',
+      "RELAY_TOKEN",
+    ],
+    [withBeam(envRef("relay-token")), beamToken, "beam", "id", '"relay-token"', "RELAY_TOKEN"],
     [
       withCodex({ config: { appServer: { authToken: envRef("app_server_token") } } }),
       authToken,
       "codex",
       "id",
       "app_server_token",
+      "APP_SERVER_TOKEN",
     ],
     [
       { ...withSearchHeader("$RELAY_TOKEN"), ...allowlist(["OTHER"]) },
@@ -9842,6 +9878,7 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
     const expected = refusal(unreadablePluginSecretRefusal(setting, plugin, held, ...shown));
     const label = JSON.stringify(configuration);
     refusedByMode(embeddedAdmission, configuration, expected, label);
+    assert.throws(() => driver.validateConfiguration(configuration), expected, label);
     assert.throws(
       () => embeddedAdmission(configuration, { RELAY_TOKEN: { source } }),
       expected,
@@ -9857,6 +9894,48 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
       };
       refusedByMode(codexDriverAdmission, dedicated, expected, label);
     }
+  }
+  // With the longest names (a 64-character provider and default alias, a 128-character id), each
+  // refusal keeps its whole next step within the 256-character cap; the setting path is cut
+  // instead (finding 3067).
+  const longAlias = `a${"-b".repeat(31)}c`;
+  const longProvider = `p${"q".repeat(63)}`;
+  const cut = (name) => `"${name.slice(0, 31)}…"`;
+  const withLongNames = (reference, secrets) => ({
+    ...withSearchHeader({ ...envRef("RELAY_TOKEN"), ...reference }),
+    secrets: { defaults: { env: longAlias }, ...secrets },
+  });
+  for (const [configuration, held, ...shown] of [
+    [withLongNames({ provider: longProvider }), "provider", cut(longProvider), "env", null],
+    [withLongNames({}), "defaultAlias", cut(longAlias), "env", null],
+    [withLongNames({ provider: "P".repeat(64) }), "providerAlias", cut("P".repeat(64)), null],
+    [
+      withLongNames({ provider: longAlias, id: `i${"d".repeat(127)}` }),
+      "id",
+      cut(`i${"d".repeat(127)}`),
+    ],
+    [
+      withLongNames(
+        { provider: longProvider, id: `I${"D".repeat(127)}` },
+        { providers: { [longProvider]: { source: "env", allowlist: [] } } },
+      ),
+      "allowlist",
+      cut(`I${"D".repeat(127)}`),
+      cut(longProvider),
+    ],
+  ]) {
+    const [, expected] = unreadablePluginSecretRefusal("<path>", "google", held, ...shown).split(
+      "<path>",
+    );
+    assert.throws(
+      () => embeddedAdmission(configuration, null),
+      (error) =>
+        error.name === "ConfigurationHarnessError" &&
+        Array.from(error.message).length <= 256 &&
+        error.message.startsWith("Configuration setting plugins.") &&
+        error.message.endsWith(expected),
+      held,
+    );
   }
   // OpenClaw reads each of these, so the binding alone decides: an env SecretRef on the default
   // alias secrets.defaults.env names, one on a configured env provider whose allowlist lists it,
@@ -9880,6 +9959,15 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
       },
     ],
     [{ ...withSearchHeader("$RELAY_TOKEN"), secrets: { defaults: { env: "custom" } } }],
+    // OpenClaw substitutes an alias written as an environment reference before it reads the ref,
+    // so the alias, and whether the ref's provider is the built-in one, is left to it.
+    [{ ...withSearchHeader("$RELAY_TOKEN"), secrets: { defaults: { env: "${ALIAS:-custom}" } } }],
+    [
+      {
+        ...withSearchHeader(envRef("RELAY_TOKEN")),
+        secrets: { defaults: { env: "${ALIAS:-custom}" } },
+      },
+    ],
     [withSearchHeader("${_RELAY}"), "_RELAY"],
   ]) {
     refusedUntilBound(embeddedAdmission, configuration, [searchHeader, name, "google"]);
@@ -9954,6 +10042,7 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
       refusal(appServerUnreadablePluginSecretRefusal(setting, plugin, agent, "allowlist", name)),
       JSON.stringify(configuration),
     );
+    driver.validateConfiguration(configuration);
   }
   for (const [admit, configuration] of [
     [embeddedAdmission, { ...withBeam("${APP_SERVER_TOKEN}"), ...allowlist(["APP_SERVER_TOKEN"]) }],
@@ -10022,6 +10111,42 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
     }),
   ]) {
     embeddedAdmission(configuration, {});
+  }
+  // OpenClaw reads plugin secret inputs only in the entry keyed by the plugin's exact ID, so a
+  // case or padding variant of `google` has none and its Gateway starts (finding 3072). Its deny
+  // list and each entry's `enabled` match a trimmed, lowercased ID with aliases resolved
+  // (google-gemini-cli is google). Configuration save accepts these too.
+  const unreadableHeader = { ...envRef("RELAY_TOKEN"), provider: "vault" };
+  const variant = (id, value, plugins) => withPlugin(id, searchHeaderEntry(value).google, plugins);
+  for (const configuration of [
+    variant("Google", "${RELAY_TOKEN}"),
+    variant(" google", "${RELAY_TOKEN}"),
+    variant("GOOGLE", "${RELAY_TOKEN}", { allow: ["codex"] }),
+    variant("Google", unreadableHeader),
+    withSearchHeader("${RELAY_TOKEN}", {}, { deny: ["GOOGLE"] }),
+    withSearchHeader(unreadableHeader, {}, { deny: [" google "] }),
+    withSearchHeader("${RELAY_TOKEN}", {}, { deny: ["google-gemini-cli"] }),
+    // A later entry for the same plugin with enabled: false disables it.
+    withEntries(withSearchHeader("${RELAY_TOKEN}"), { GOOGLE: { enabled: false } }),
+  ]) {
+    embeddedAdmission(configuration, {});
+    driver.validateConfiguration(configuration);
+  }
+  // A later `enabled: true` for the same plugin enables a disabled google entry. Startup
+  // auto-enable sets `enabled: true` on a google entry that leaves it unset, so an earlier
+  // `enabled: false` for the same plugin does not disable it.
+  for (const configuration of [
+    withEntries(withSearchHeader("${RELAY_TOKEN}", { enabled: false }), {
+      GOOGLE: { enabled: true },
+    }),
+    {
+      ...embeddedBase,
+      plugins: {
+        entries: { GOOGLE: { enabled: false }, ...searchHeaderEntry("${RELAY_TOKEN}") },
+      },
+    },
+  ]) {
+    refusedUntilBound(embeddedAdmission, configuration, [searchHeader, "RELAY_TOKEN", "google"]);
   }
   // A Driver the Installation selects may add launch variables whose names deployment cannot
   // know, so an unbound name is left to the Gateway; the APP_SERVER_ rule still holds.
