@@ -89,6 +89,8 @@ import {
   KUBERNETES_GATEWAY_PASSWORD_REQUIREMENT,
   kubernetesGatewayPasswordRequirement,
   dedicatedCodexVariableRefusal,
+  pluginEntryKeyVariantRefusal,
+  workspaceNodePluginRefusal,
   unboundPluginSecretRefusal,
   unreadablePluginSecretRefusal,
   unboundUnreadablePluginSecretRefusal,
@@ -9440,19 +9442,28 @@ test("deployment admission refuses Gateway breakers before a dedicated deploymen
   ];
 
   // f1112: the entrypoint exits at every start without the file-transfer plugin.
-  const workspaceNode = "the Agent's workspace node requires the file-transfer plugin";
-  for (const [plugins, setting, requirement] of [
-    [{ deny: ["file-transfer"] }, "plugins.deny", `must not list file-transfer: ${workspaceNode}`],
+  for (const [plugins, setting, rule] of [
+    [{ deny: ["file-transfer"] }, "plugins.deny", "must not list file-transfer"],
+    // OpenClaw matches deny entries trimmed and lowercased (finding 3077).
+    [{ deny: [1, " File-Transfer"] }, "plugins.deny", "must not list file-transfer"],
     [
       { entries: { "file-transfer": { enabled: false } } },
       "plugins.entries.file-transfer.enabled",
-      `must not be false: ${workspaceNode}`,
+      "must not be false",
     ],
+    // OpenClaw turns off every plugin, file-transfer included (finding 3083).
+    [{ enabled: false }, "plugins.enabled", "must not be false"],
   ]) {
+    const refused = { message: workspaceNodePluginRefusal(setting, rule) };
     for (const harness of [codex, provisioning]) {
       assert.throws(
         () => routed.validateHarnessAuth(harness, apiKeyAuth, { ...base, plugins }),
-        named(setting, requirement),
+        refused,
+      );
+      // Agent save (no bindings yet) refuses it too, before any deployment.
+      assert.throws(
+        () => routed.validateHarnessAuth(harness, apiKeyAuth, { ...base, plugins }, null),
+        refused,
       );
     }
     assert.throws(
@@ -9462,18 +9473,24 @@ test("deployment admission refuses Gateway breakers before a dedicated deploymen
           apiKeyAuth,
           { ...createHarnessConfiguration("openclaw", "gpt-4o-mini"), plugins },
         ),
-      named(setting, requirement),
+      refused,
     );
     // A Gateway without a workspace node does not need the plugin.
     for (const driver of withoutNode) {
       driver.validateHarnessAuth(codex, apiKeyAuth, { ...base, plugins });
+      driver.validateHarnessAuth(codex, apiKeyAuth, { ...base, plugins }, null);
     }
     routed.validateHarnessAuth(embedded, apiKeyAuth, { ...embeddedBase, plugins });
+    routed.validateHarnessAuth(embedded, apiKeyAuth, { ...embeddedBase, plugins }, null);
   }
-  routed.validateHarnessAuth(codex, apiKeyAuth, {
-    ...base,
-    plugins: { deny: ["other"], entries: { "file-transfer": { enabled: true } } },
-  });
+  for (const plugins of [
+    { deny: ["other"], entries: { "file-transfer": { enabled: true } } },
+    { enabled: true },
+    // The entrypoint adds file-transfer to a non-empty allowlist.
+    { allow: ["other"] },
+  ]) {
+    routed.validateHarnessAuth(codex, apiKeyAuth, { ...base, plugins });
+  }
 
   // f1113 and f1114: gateway settings preparation refused, now refused by deployment admission
   // (validateGatewaySettings) and provisioning (validateAgentProvisioning) with the same text.
@@ -9630,6 +9647,50 @@ test("deployment admission refuses Gateway breakers before a dedicated deploymen
   }
 });
 
+test("Kubernetes Compute refuses another spelling of a plugin entry key it renders", () => {
+  // Finding 3077. OpenClaw merges plugins.entries keys that match trimmed and lowercased. The
+  // Gateway entrypoint enables and configures file-transfer for a workspace node, and renders the
+  // managed catalog plugin diffs for the Agent's plugin selection, both only at the exact key, so a
+  // later `File-Transfer` entry could turn the workspace node's plugin off and a `Diffs` entry
+  // could replace the managed one. Configuration save, Preset save and deploy admission refuse it;
+  // configuration-controller.test.mjs proves a Preset key that waits on a variable.
+  const driver = new KubernetesComputeDriver(options());
+  const codex = { id: "codex", version: "1.0.0", mode: "dedicated" };
+  const base = { agents: { defaults: { model: "codex/gpt-5" } } };
+  const withEntries = (entries) => ({ ...base, plugins: { entries } });
+  for (const [entries, path, id] of [
+    [
+      { "file-transfer": {}, "File-Transfer": { enabled: false } },
+      "plugins.entries.File-Transfer",
+      "file-transfer",
+    ],
+    [
+      { " file-transfer": { enabled: false } },
+      'plugins.entries[" file-transfer"]',
+      "file-transfer",
+    ],
+    [{ diffs: { enabled: true }, Diffs: { config: {} } }, "plugins.entries.Diffs", "diffs"],
+  ]) {
+    const expected = {
+      name: "ConfigurationHarnessError",
+      message: pluginEntryKeyVariantRefusal(path, id),
+    };
+    assert.throws(() => driver.validateConfiguration(withEntries(entries)), expected);
+    assert.throws(
+      () => driver.validateHarnessAuth(codex, apiKeyAuth, withEntries(entries), {}),
+      expected,
+    );
+  }
+  // The exact keys, and other plugins' keys in another spelling, are accepted.
+  for (const entries of [
+    { "file-transfer": { enabled: true }, diffs: { enabled: true } },
+    { "File-Transfers": {}, Slack: { enabled: false } },
+  ]) {
+    driver.validateConfiguration(withEntries(entries));
+    driver.validateHarnessAuth(codex, apiKeyAuth, withEntries(entries), {});
+  }
+});
+
 test("admission refuses a plugin secret input whose unset variable stops any Gateway", () => {
   // OpenClaw resolves an active plugin's Gateway-required secret inputs (no ownerKind in the
   // manifest: codex appServer.authToken and appServer.headers.*, google webSearch.headers.*) at
@@ -9685,8 +9746,8 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
   // Any other unbound name: deployment refuses it, naming the binding to add or the entry to
   // disable; bound, the variable is set in the Gateway, which starts. Agent save does not know
   // the Configuration's bindings, so it leaves it to deployment.
-  const refusedUntilBound = (admit, configuration, [setting, name, plugin], label) => {
-    const expected = refusal(unboundPluginSecretRefusal(setting, name, plugin));
+  const refusedUntilBound = (admit, configuration, [setting, name, plugin, enabledBy], label) => {
+    const expected = refusal(unboundPluginSecretRefusal(setting, name, plugin, enabledBy));
     for (const bindings of [undefined, {}]) {
       assert.throws(() => admit(configuration, bindings), expected, label);
     }
@@ -10126,27 +10187,140 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
     withSearchHeader("${RELAY_TOKEN}", {}, { deny: ["GOOGLE"] }),
     withSearchHeader(unreadableHeader, {}, { deny: [" google "] }),
     withSearchHeader("${RELAY_TOKEN}", {}, { deny: ["google-gemini-cli"] }),
-    // A later entry for the same plugin with enabled: false disables it.
-    withEntries(withSearchHeader("${RELAY_TOKEN}"), { GOOGLE: { enabled: false } }),
+    // A later entry for the same plugin with enabled: false disables it. It must come later in
+    // the order written and in the stored order the Gateway receives (keys by length, then byte;
+    // finding 3092), so it is a longer key here.
+    withEntries(withSearchHeader("${RELAY_TOKEN}"), { "google ": { enabled: false } }),
+    // A later value that is not an object replaces the merged entry with {}, which leaves google
+    // inactive: auto-enable set `enabled: true` only on the exact entry (finding 3074).
+    withEntries(withSearchHeader("${RELAY_TOKEN}"), { "google ": null }),
+    withEntries(withSearchHeader("${RELAY_TOKEN}"), { " google": "off" }),
   ]) {
     embeddedAdmission(configuration, {});
     driver.validateConfiguration(configuration);
   }
-  // A later `enabled: true` for the same plugin enables a disabled google entry. Startup
-  // auto-enable sets `enabled: true` on a google entry that leaves it unset, so an earlier
-  // `enabled: false` for the same plugin does not disable it.
-  for (const configuration of [
-    withEntries(withSearchHeader("${RELAY_TOKEN}", { enabled: false }), {
-      GOOGLE: { enabled: true },
-    }),
-    {
-      ...embeddedBase,
-      plugins: {
-        entries: { GOOGLE: { enabled: false }, ...searchHeaderEntry("${RELAY_TOKEN}") },
+  // A later `enabled: true` for the same plugin enables a disabled google entry, so the step names
+  // that later entry (finding 3074). Startup auto-enable sets `enabled: true` on a google entry
+  // that leaves it unset, so an earlier `enabled: false`, or a value that is not an object, for
+  // the same plugin does not disable it. Each revision reaches the Gateway in PostgreSQL's jsonb
+  // key order, where `GOOGLE` comes before `google` whatever order the Configuration wrote, so
+  // `GOOGLE` written after the google entry does not disable it either (finding 3092).
+  for (const [configuration, enabledBy] of [
+    [withEntries(withSearchHeader("${RELAY_TOKEN}"), { GOOGLE: { enabled: false } }), undefined],
+    [withEntries(withSearchHeader("${RELAY_TOKEN}"), { GOOGLE: null }), undefined],
+    [
+      withEntries(withSearchHeader("${RELAY_TOKEN}", { enabled: false }), {
+        GOOGLE: { enabled: true },
+      }),
+      "GOOGLE",
+    ],
+    [
+      withEntries(withSearchHeader("${RELAY_TOKEN}", { enabled: false }), {
+        Google: { enabled: true },
+        GOOGLE: { config: {} },
+      }),
+      "Google",
+    ],
+    [
+      {
+        ...embeddedBase,
+        plugins: {
+          entries: { GOOGLE: { enabled: false }, ...searchHeaderEntry("${RELAY_TOKEN}") },
+        },
       },
-    },
+      undefined,
+    ],
+    [
+      {
+        ...embeddedBase,
+        plugins: { entries: { GOOGLE: null, ...searchHeaderEntry("${RELAY_TOKEN}") } },
+      },
+      undefined,
+    ],
   ]) {
-    refusedUntilBound(embeddedAdmission, configuration, [searchHeader, "RELAY_TOKEN", "google"]);
+    refusedUntilBound(embeddedAdmission, configuration, [
+      searchHeader,
+      "RELAY_TOKEN",
+      "google",
+      enabledBy,
+    ]);
+  }
+  // A memory or context engine slot set to the plugin's exact ID, trimmed, activates a plugin whose
+  // merged `enabled` is unset, so a cleared google entry still reads its header and a beam or imap
+  // entry that leaves `enabled` unset reads its secret (findings 3074 and 3081). The step names the
+  // entry that cleared it. Only `enabled: false` stops a slot, and a case variant selects nothing.
+  const withSlots = (configuration, slots) => ({
+    ...configuration,
+    plugins: { ...configuration.plugins, slots },
+  });
+  // The cleared entry comes after google in the order written and in the stored order (finding
+  // 3092): a longer key.
+  const clearedSearchHeader = withEntries(withSearchHeader("${RELAY_TOKEN}"), { "google ": null });
+  const clearedByVariant = withEntries(withSearchHeader("${RELAY_TOKEN}"), { GOOGLE: null });
+  for (const slots of [{ memory: "google" }, { contextEngine: " google " }]) {
+    refusedUntilBound(embeddedAdmission, withSlots(clearedByVariant, slots), [
+      searchHeader,
+      "RELAY_TOKEN",
+      "google",
+      "GOOGLE",
+    ]);
+  }
+  const unsetBeam = { ...withBeam("${RELAY_TOKEN}", {}), ...allowlist(["OTHER"]) };
+  const unsetImap = {
+    ...withPlugin("imap", { config: { accounts: { main: { password: "${RELAY_TOKEN}" } } } }),
+    ...allowlist([]),
+  };
+  for (const [configuration, setting, plugin] of [
+    [withSlots(unsetBeam, { memory: "beam" }), beamToken, "beam"],
+    [withSlots(unsetImap, { contextEngine: " imap" }), imapPassword, "imap"],
+  ]) {
+    const expected = refusal(
+      unboundUnreadablePluginSecretRefusal(
+        setting,
+        plugin,
+        "RELAY_TOKEN",
+        "allowlist",
+        "RELAY_TOKEN",
+      ),
+    );
+    for (const bindings of [undefined, {}]) {
+      assert.throws(() => embeddedAdmission(configuration, bindings), expected, plugin);
+    }
+  }
+  // Configuration save does not know the bindings, so the unset `${NAME}` above waits for
+  // deployment. A reference OpenClaw cannot read at all is refused at save too (finding 3069),
+  // and the slot activates the entry there as well: without the slot, save accepts it.
+  for (const [configuration, slots, setting, plugin] of [
+    [{ ...withBeam("$RELAY_TOKEN", {}), ...allowlist([]) }, { memory: "beam" }, beamToken, "beam"],
+    [
+      {
+        ...withPlugin("imap", { config: { accounts: { main: { password: "$RELAY_TOKEN" } } } }),
+        ...allowlist([]),
+      },
+      { contextEngine: " imap" },
+      imapPassword,
+      "imap",
+    ],
+  ]) {
+    driver.validateConfiguration(configuration);
+    assert.throws(
+      () => driver.validateConfiguration(withSlots(configuration, slots)),
+      refusal(unreadablePluginSecretRefusal(setting, plugin, "allowlist", "RELAY_TOKEN")),
+      plugin,
+    );
+  }
+  for (const configuration of [
+    clearedSearchHeader,
+    unsetBeam,
+    unsetImap,
+    withSlots(clearedSearchHeader, { memory: "Google" }),
+    withSlots(withSearchHeader("${RELAY_TOKEN}", { enabled: false }), { memory: "google" }),
+    withSlots(
+      { ...withBeam("${RELAY_TOKEN}", { enabled: false }), ...allowlist(["OTHER"]) },
+      { contextEngine: "beam" },
+    ),
+  ]) {
+    embeddedAdmission(configuration, {});
   }
   // A Driver the Installation selects may add launch variables whose names deployment cannot
   // know, so an unbound name is left to the Gateway; the APP_SERVER_ rule still holds.
@@ -23443,6 +23617,34 @@ test("Gateway tool policy is checked at Configuration save and at Agent admissio
       assert.doesNotThrow(() => driver.validateConfiguration(withPolicy(gatewayPolicy)), label);
     }
   }
+});
+
+test("an active revision whose workspace node lost file-transfer to plugins.enabled false keeps its maintenance passes", async () => {
+  // Finding 3083. Admission now refuses plugins.enabled false for an Agent whose Gateway hosts its
+  // workspace node. A revision admitted before that rule must keep its maintenance and recovery
+  // passes (preparation and activation of the active revision) until a redeploy, which admission
+  // refuses.
+  const { driver, revision, state, context } = workspaceSetupFixture(false);
+  revision.configuration = {
+    ...structuredClone(revision.configuration),
+    plugins: { enabled: false },
+  };
+  state.ready = true;
+  await prepareUntilReady(driver, revision, context);
+  await driver.activateRevision(revision, context);
+  assert.equal((await driver.prepareRevision(revision, context)).ready, true);
+  await driver.activateRevision(revision, context);
+  assert.throws(
+    () =>
+      driver.validateHarnessAuth(
+        revision.harness,
+        revision.harnessAuth,
+        revision.configuration,
+        revision.secretBindings,
+      ),
+    { message: workspaceNodePluginRefusal("plugins.enabled", "must not be false") },
+    "a new deployment",
+  );
 });
 
 test("an active embedded revision whose stored Gateway tool policy predates the rule keeps its maintenance passes", async () => {

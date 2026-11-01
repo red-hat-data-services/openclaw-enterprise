@@ -24,3 +24,11 @@ export declare function unreadablePluginSecretInput(
   values: unknown,
 ): { readonly setting: string; readonly requirement: string } | undefined;
 export declare function configurationSettingMessage(setting: string, requirement: string): string;
+export declare function pluginPolicyId(name: unknown): string | undefined;
+export declare function configIncludeProblem(
+  values: unknown,
+): { readonly setting: string; readonly requirement: string } | undefined;
+export declare function pluginEntryKeyVariantProblem(
+  values: unknown,
+  plugins?: readonly string[],
+): { readonly setting: string; readonly requirement: string } | undefined;

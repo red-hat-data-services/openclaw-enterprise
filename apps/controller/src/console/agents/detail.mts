@@ -17,9 +17,11 @@ import type { AgentRecheck, ConsolePageContext } from "../page-context.mjs";
 import { renderAgentDriverConfigurations } from "../driver-configurations.mjs";
 import { retiredOpenClawSettingMessage } from "../retired-openclaw-settings.mjs";
 import {
+  configIncludeProblem,
   configurationSettingMessage,
   gatewayPasswordRequirement,
   generatedGatewayPasswordReference,
+  pluginEntryKeyVariantProblem,
   secretProviderDefaultsProblem,
   unreadablePluginSecretInput,
 } from "../environment-references.mjs";
@@ -445,6 +447,9 @@ const ACCESS_TAB_NEEDS_ADMINISTRATION =
 const READ_ONLY_DRAFT_NOTICE =
   "Version draft · read-only with your access. The next deployment uses it as saved.";
 const CHECKING_CREDENTIAL_ACCESS_STEP = "Checking credential access…";
+const CHECKING_COMPUTE_CONFIGURATION =
+  "Checking the Configuration with this Installation's Compute before deploying.";
+const ENTRY_KEY_STEP = "Fix the plugin entry key";
 const CONFIGURATION_READ_ONLY = CONFIGURATION_UPDATE_DENIED;
 // Saving a Configuration also needs Secret operate on every Secret it binds (finding 2437).
 const CONFIGURATION_SECRETS_READ_ONLY = `Saving this Configuration needs Secret operate on each Secret it binds, which your access does not include. ${askForGrant("Secret operate on each of them")}`;
@@ -480,6 +485,19 @@ const DEPLOYMENT_OUTCOME_TONES: Partial<Record<DeploymentOutcome, string>> = {
 const failedVersions = new Set<string>();
 const failedVersionKey = (agentPath: string, revisionId: string) =>
   JSON.stringify([agentPath, revisionId]);
+// Versions whose deployment a newer version or a Stop ended, keyed like failedVersions. They did
+// not fail, but an unmarked one read as an ordinary historical version (r77 rows 21-22), so the
+// Versions list and the version's notice name the outcome. Such an ending is final too.
+type NeutralOutcome = NonNullable<ReturnType<typeof neutralDeploymentOutcome>>;
+const neutralVersions = new Map<string, NeutralOutcome>();
+// The record never names the newer version or says whether a runtime ran, so neither does the
+// notice.
+const NEUTRAL_VERSION_NOTICES: Record<NeutralOutcome, string> = {
+  superseded:
+    "Superseded version · read-only admitted snapshot. A newer version took over before its deployment finished.",
+  stopped:
+    "Stopped version · read-only admitted snapshot. The Agent was stopped before its deployment finished.",
+};
 // Versions this tab's own Deploy created, keyed like failedVersions, with their version numbers.
 // The API accepted each, so a deployer who cannot read one is told it exists and was accepted,
 // not that a link may name a version that does not exist (finding D751).
@@ -613,14 +631,17 @@ export async function renderAgentDetail(
     }
     for (const item of page.revisions) {
       // A version that a newer one or a Stop ended is listed as failed too, with the code that
-      // says so; it is not marked (finding 2422).
-      if (
-        item.deploymentStatus === "failed" &&
-        !neutralDeploymentOutcome({
-          status: item.deploymentStatus,
-          error: item.deploymentErrorCode === null ? null : { code: item.deploymentErrorCode },
-        })
-      ) {
+      // says so; it is marked with that outcome, not as failed (finding 2422).
+      if (item.deploymentStatus !== "failed") {
+        continue;
+      }
+      const neutral = neutralDeploymentOutcome({
+        status: item.deploymentStatus,
+        error: item.deploymentErrorCode === null ? null : { code: item.deploymentErrorCode },
+      });
+      if (neutral) {
+        neutralVersions.set(failedVersionKey(path, item.id), neutral);
+      } else {
         failedVersions.add(failedVersionKey(path, item.id));
       }
     }
@@ -1937,7 +1958,9 @@ export async function renderAgentDetail(
               // deployment it was the only version and was called "Historical" (finding 2403).
               failedVersions.has(failedVersionKey(path, selected))
               ? "Failed version · read-only admitted snapshot. Its deployment did not complete."
-              : "Historical version · read-only admitted snapshot. Browsing it does not change the current version.";
+              : neutralVersions.has(failedVersionKey(path, selected))
+                ? NEUTRAL_VERSION_NOTICES[neutralVersions.get(failedVersionKey(path, selected))!]
+                : "Historical version · read-only admitted snapshot. Browsing it does not change the current version.";
   }
 
   // The newest version while its deployment is queued or running and it is not yet current. Right
@@ -2108,6 +2131,11 @@ export async function renderAgentDetail(
         labels.push(outcomeLabel(latestDeploymentStatus));
       } else if (failedVersions.has(failedVersionKey(path, revision.id))) {
         labels.push("Failed");
+      } else {
+        const neutral = neutralVersions.get(failedVersionKey(path, revision.id));
+        if (neutral) {
+          labels.push(outcomeLabel(neutral));
+        }
       }
       setText(option, labels.join(" · "));
     }
@@ -2852,6 +2880,8 @@ export async function renderAgentDetail(
               latestDeploymentStatus = status;
               if (status === "failed") {
                 failedVersions.add(failedVersionKey(path, mostRecent.id));
+              } else if (status === "superseded" || status === "stopped") {
+                neutralVersions.set(failedVersionKey(path, mostRecent.id), status);
               }
               // A refused or missing record ends the wait, so it no longer labels the version.
               if (record || !transientFailure) {
@@ -3104,8 +3134,16 @@ export async function renderAgentDetail(
           // read "Historical" with no mark beside its own "Failed" record (finding 2407).
           onRecord: (record) => {
             const key = failedVersionKey(path, selected);
-            if (deploymentOutcome(record) === "failed" && !failedVersions.has(key)) {
+            const outcome = deploymentOutcome(record);
+            if (outcome === "failed" && !failedVersions.has(key)) {
               failedVersions.add(key);
+              renderVersionNotice();
+              markVersionOutcomes();
+            } else if (
+              (outcome === "superseded" || outcome === "stopped") &&
+              !neutralVersions.has(key)
+            ) {
+              neutralVersions.set(key, outcome);
               renderVersionNotice();
               markVersionOutcomes();
             }
@@ -3131,6 +3169,10 @@ export async function renderAgentDetail(
     const executionMode = agent.executionMode;
     let deployPending = false;
     let deployReloadMessage = "";
+    // Kubernetes Compute's refusal of a plugin entry key's spelling (checkComputeEntryKeys).
+    let computeEntryKeyRefusal: string | null = null;
+    let computeEntryKeyChecking = false;
+    let computeEntryKeyValues: unknown;
     const managedMode: DraftDetails["managedMode"] = {
       value: document.createTextNode(agent.gatewayManagedMode ? "On" : "Off"),
       action: null,
@@ -3204,6 +3246,7 @@ export async function renderAgentDetail(
             values = configuration.values;
             viewedSnapshot = configuration;
             renderDetailHeading();
+            void checkComputeEntryKeys();
             updateDeployControls();
             // The answer's denied binding names describe the bindings before this save. Read it
             // again, so the panel and the Channels drawer stop asking to replace a binding the
@@ -3396,17 +3439,50 @@ export async function renderAgentDetail(
         !agent.harnessAuth ||
         revisionResult.status !== "fulfilled" ||
         configurationRefusal() !== null ||
+        computeEntryKeyChecking ||
         (!runtimeAuth && !credentials?.canDeploy())
       );
     }
-    // OCC refuses to deploy a saved Configuration with a secrets.defaults alias OpenClaw refuses
-    // (finding 3064), a gateway password reference OpenClaw cannot read (finding 3063) or a setting
-    // the pinned OpenClaw retired (finding 2810), then Compute admission one with a plugin secret
-    // input OpenClaw cannot read (finding 3076), in that order and with this message, so the draft
-    // says it before Deploy, with the Configuration step. Only Kubernetes Compute refuses the
-    // plugin input, but the page does not know which Compute the next version runs on, and the
-    // Gateway exits on that input on any Compute that ships the plugin, so it holds Deploy on all.
+    // OCC refuses to deploy a saved Configuration with OpenClaw's $include (finding 3078), a
+    // secrets.defaults alias OpenClaw refuses (finding 3064), a gateway password reference OpenClaw
+    // cannot read (finding 3063), a setting the pinned OpenClaw retired (finding 2810) or another
+    // spelling of the codex or acpx plugin entry key (finding 3073), then Compute admission's
+    // refusals: Kubernetes Compute's of another spelling of file-transfer or a managed plugin key
+    // (finding 3077, computeEntryKeyRefusal below) and one of a plugin secret input OpenClaw cannot
+    // read (finding 3076), in that order and with this message, so the draft says it before
+    // Deploy, with the Configuration step (findings 3076, 3086, 3090). Only Kubernetes Compute
+    // refuses the plugin input, but the page does not know which Compute the next version runs
+    // on, and the Gateway exits on that input on any Compute that ships the plugin, so it holds
+    // Deploy on all. On SSH or Docker Compute that hold is stricter than OCC, whose deploy admits
+    // the input there.
     function configurationRefusal(): { readonly message: string; readonly step: string } | null {
+      const settings = configurationSettingsRefusal();
+      if (settings !== null) {
+        return settings;
+      }
+      if (computeEntryKeyRefusal !== null) {
+        return { message: computeEntryKeyRefusal, step: ENTRY_KEY_STEP };
+      }
+      const plugin = unreadablePluginSecretInput(values);
+      return plugin === undefined
+        ? null
+        : {
+            message: configurationSettingMessage(plugin.setting, plugin.requirement),
+            step: "Fix the plugin secret input",
+          };
+    }
+    // The refusals every Compute's deploy gives, before Compute admission.
+    function configurationSettingsRefusal(): {
+      readonly message: string;
+      readonly step: string;
+    } | null {
+      const include = configIncludeProblem(values);
+      if (include !== undefined) {
+        return {
+          message: configurationSettingMessage(include.setting, include.requirement),
+          step: "Remove the $include setting",
+        };
+      }
       const defaults = secretProviderDefaultsProblem(values.secrets);
       if (defaults !== undefined) {
         return {
@@ -3428,13 +3504,73 @@ export async function renderAgentDetail(
       if (retired !== null) {
         return { message: retired, step: "Remove the retired setting" };
       }
-      const plugin = unreadablePluginSecretInput(values);
-      return plugin === undefined
+      const entryKey = pluginEntryKeyVariantProblem(values);
+      return entryKey === undefined
         ? null
         : {
-            message: configurationSettingMessage(plugin.setting, plugin.requirement),
-            step: "Fix the plugin secret input",
+            message: configurationSettingMessage(entryKey.setting, entryKey.requirement),
+            step: ENTRY_KEY_STEP,
           };
+    }
+    // Kubernetes Compute alone also refuses another spelling of file-transfer or a managed catalog
+    // plugin key (finding 3077); other Computes merge it and run. The page does not know which
+    // Compute the next version runs on, so for a stored key in another spelling it asks Create
+    // Agent's preflight, which runs the selected Compute's Configuration rules, as Create Agent
+    // does for a Compute's refusal its capabilities do not report (finding 2427). Deploy holds
+    // only when that preflight refuses one of those keys with the text deploy gives, so it never
+    // holds a Configuration the Installation's Compute admits (finding 3090). A preflight that
+    // gives no answer (no Agent create permission, a failed request, another refusal first)
+    // holds nothing, and deploy stays the authority. The preflight needs Agent create, so a caller
+    // the page knows cannot deploy or create Agents here skips it: the API would audit a 403 on
+    // every load and save (finding 3094). An unknown answer still asks.
+    async function checkComputeEntryKeys() {
+      const checked = values;
+      computeEntryKeyValues = checked;
+      computeEntryKeyRefusal = null;
+      computeEntryKeyChecking = false;
+      const refusals = new Set<string>();
+      const entries = responseFields(responseFields(checked).plugins).entries;
+      for (const key of Object.keys(responseFields(entries))) {
+        const id = key.trim().toLowerCase();
+        const problem = key === id ? undefined : pluginEntryKeyVariantProblem(checked, [id]);
+        if (problem !== undefined) {
+          refusals.add(configurationSettingMessage(problem.setting, problem.requirement));
+        }
+      }
+      if (refusals.size === 0 || configurationSettingsRefusal() !== null) {
+        return;
+      }
+      computeEntryKeyChecking = true;
+      updateDeployControls();
+      const [permissions, agentsCreate] = await Promise.all([
+        latestPermissionsRead,
+        context.agentsCreateAllowed?.().catch(() => undefined),
+      ]);
+      if (!context.isCurrent() || computeEntryKeyValues !== checked) {
+        return;
+      }
+      if (permissions?.deploy === false || agentsCreate === false) {
+        computeEntryKeyChecking = false;
+        updateDeployControls();
+        return;
+      }
+      let refusal: string | undefined;
+      try {
+        await request(`${namespacePath(namespaceId)}/agents/validate`, {
+          method: "POST",
+          readOnly: true,
+          expectedStatus: 204,
+          body: { configuration: { kind: "agent", values: checked } },
+        });
+      } catch (error) {
+        refusal = requestFailure(error).serverMessage;
+      }
+      if (!context.isCurrent() || computeEntryKeyValues !== checked) {
+        return;
+      }
+      computeEntryKeyChecking = false;
+      computeEntryKeyRefusal = refusal !== undefined && refusals.has(refusal) ? refusal : null;
+      updateDeployControls();
     }
     function updateDeployControls() {
       authenticationForm?.toggleAttribute("inert", Boolean(credentials?.mutationPending()));
@@ -3522,6 +3658,9 @@ export async function renderAgentDetail(
           deployStatus.textContent = "";
         } else if (configurationRefusal() !== null) {
           deployStatus.textContent = configurationRefusal()?.message ?? "";
+        } else if (computeEntryKeyChecking) {
+          // A check that settles within 250 ms never shows this text, as for credential access.
+          setDelayedText(deployStatus, "", CHECKING_COMPUTE_CONFIGURATION);
         } else if (revisionResult.status !== "fulfilled") {
           deployStatus.textContent =
             "Version history is required before deploying this new version.";
@@ -3916,6 +4055,7 @@ export async function renderAgentDetail(
       managedMode.action = action;
       managedMode.control = control;
     }
+    void checkComputeEntryKeys();
     updateDeployControls();
     void readDeploySecretsDenied();
     const draftActions = element(

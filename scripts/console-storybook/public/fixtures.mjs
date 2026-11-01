@@ -89,6 +89,27 @@ function configurationValues(scenario) {
       },
     };
   }
+  if (scenario.pluginDeny !== undefined) {
+    values.plugins = { ...values.plugins, deny: structuredClone(scenario.pluginDeny) };
+  }
+  if (scenario.configInclude) {
+    // An OpenClaw $include an older release saved, which would merge settings OCE never checked.
+    values.agents.defaults.$include = "./defaults.json";
+  }
+  if (scenario.pluginEntryKeyVariant) {
+    // A Codex entry an older release saved beside codex, which OpenClaw merges into codex.
+    values.plugins = {
+      entries: {
+        codex: { config: { appServer: { approvalPolicy: "on-request" } } },
+        Codex: { enabled: true },
+      },
+    };
+  }
+  if (scenario.kubernetesEntryKeyVariant) {
+    // A File-Transfer entry saved before Kubernetes Compute refused it, which OpenClaw merges into
+    // file-transfer, the entry Kubernetes Compute enables for the workspace node.
+    values.plugins = { entries: { "File-Transfer": { enabled: true } } };
+  }
   if (scenario.gatewayPasswordAllowlistOmits) {
     // A default env alias on a configured env provider whose allowlist leaves out the generated
     // password, so OpenClaw cannot read the reference Enable gateway password access would write.
@@ -559,7 +580,8 @@ export function installFixture(scenario, evidence) {
           Date.parse(createdAt) - (scenario.revisionHistory - number) * 86_400_000,
         ).toISOString();
         revisions.set(older.id, older);
-        // An earlier version whose deployment failed before a later one succeeded.
+        // An earlier version whose deployment failed, or that a newer one superseded
+        // (earlierVersionError), before a later one succeeded.
         if (scenario.earlierFailedVersion === number) {
           deployments.set(older.id, {
             deploymentId: older.id,
@@ -568,7 +590,8 @@ export function installFixture(scenario, evidence) {
             status: "failed",
             cleanup: null,
             progress: null,
-            error: candidateDeploymentError(scenario, older.createdAt),
+            error:
+              scenario.earlierVersionError ?? candidateDeploymentError(scenario, older.createdAt),
             warnings: [],
           });
         }

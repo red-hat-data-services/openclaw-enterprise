@@ -1108,11 +1108,17 @@ revisionTest(
 );
 
 /** A newer exclusive version whose deployer lacks `deploy`: the worker refuses it before Compute. */
-async function refusedExclusiveVersion(fixture, driver, owner, number) {
+async function refusedExclusiveVersion(
+  fixture,
+  driver,
+  owner,
+  number,
+  shape = olderShapes.exclusive,
+) {
   const requester = `refused-exclusive-requester-${randomUUID()}`;
   await fixture.copyActorGrants(requester, { withoutActions: ["deploy"] });
   const refused = await fixture.revision(owner, number, {
-    ...olderShapes.exclusive,
+    ...shape,
     actorId: requester,
   });
   await assertWorkEnds(fixture, refused, "failed_permanent", "AUTHORIZATION_DENIED");
@@ -1158,7 +1164,7 @@ for (const { shape, stopFailures = 0 } of [
       const newer = await refusedExclusiveVersion(fixture, driver, owner, older.revision + 1);
       const olderPasses = driver.passes(older);
       await assertWorkEnds(fixture, older, "succeeded", "REVISION_SUPERSEDED");
-      assert.equal(driver.passes(older), olderPasses, "no preparation after the newer admission");
+      assert.equal(driver.passes(older), olderPasses, "no preparation after the newer refusal");
       // Nothing else stops the superseded version: it stopped its Harness and the Gateway it held.
       assert.equal(driver.stops(older), 1);
       assert.deepEqual([...driver.harnesses], []);
@@ -1187,6 +1193,72 @@ for (const { shape, stopFailures = 0 } of [
     },
   );
 }
+
+// Finding 3080 (review nit): the superseded version closes its repository credential sessions
+// before it stops its runtime, as a newer version's sweep does, so the stopped Harness is not
+// left the only holder of a live session. Superseding a version with repository credentials also
+// queues its runtime retirement (`repository_cleanup:retire:`), which runs its session cleanup
+// again (nothing is left to close) and repeats the stop once the version has ended superseded. Whether that second stop ran before
+// the superseded work was observed depended on timing (finding 3089), so the case waits for the
+// retirement and tells the stops apart by the state of the version's own work at each stop.
+test(
+  "an older exclusive version with repository credentials superseded by a refused newer exclusive version closes its sessions before its own stop",
+  requiresPostgres,
+  async (context) => {
+    const repository = repositoryBoundary();
+    const fixture = await setup(context, { repoDriver: repository.driver });
+    const driver = sharedGatewayCompute(fixture);
+    // Kubernetes admits repository credentials for a dedicated Codex Harness, which declares
+    // exclusive replacement, as well as for embedded OpenClaw.
+    driver.compute.validateRepositoryCredentials = (harness, sandboxDriverId) => {
+      assert.deepEqual([harness.id, harness.mode], ["codex", "dedicated"]);
+      assert.equal(sandboxDriverId, undefined);
+    };
+    const closes = () => repository.calls.filter(({ operation }) => operation === "close").length;
+    // Each stop records the closes made before it and the state of the version's own deployment
+    // work: "claimed" while its own pass runs, "succeeded" once it ended superseded.
+    const stopsAt = new Map();
+    const stop = driver.compute.stopRevision;
+    driver.compute.stopRevision = async (revision) => {
+      const closed = closes();
+      const own = await workState(fixture, {
+        idempotencyKey: `agent_revision:${revision.id}:reconcile`,
+      });
+      stopsAt.set(revision.id, [...(stopsAt.get(revision.id) ?? []), { closed, own }]);
+      return stop(revision);
+    };
+    await fixture.start(driver.compute);
+    const owner = await fixture.agent("exclusive-refused-successor-git", {
+      executionMode: "dedicated",
+    });
+    const codex = { harness: { ...fixture.productionHarness, mode: "dedicated" } };
+    const older = await fixture.revision(owner, 1, {
+      ...codex,
+      repositoryCredentials: repository.snapshot,
+    });
+    await waitFor("the older version's first preparation", async () =>
+      driver.passes(older) > 0 ? true : undefined,
+    );
+    assert.ok(repository.calls.some(({ operation }) => operation === "open"));
+    assert.equal(closes(), 0);
+    await refusedExclusiveVersion(fixture, driver, owner, 2, codex);
+    await assertWorkEnds(fixture, older, "succeeded", "REVISION_SUPERSEDED");
+    await waitFor("the superseded version's runtime retirement", async () => {
+      const retirement = await fixture.observerPool.query(
+        "SELECT state FROM occ.controller_work WHERE revision_id = $1 AND idempotency_key LIKE $2",
+        [older.id, `agent_revision:${older.id}:repository_cleanup:retire:%`],
+      );
+      return retirement.rows[0]?.state === "succeeded" ? true : undefined;
+    });
+    // Its own pass stopped it after closing its one session; the retirement stopped it again
+    // after the version ended superseded, with nothing left to close.
+    assert.deepEqual(stopsAt.get(older.id), [
+      { closed: 1, own: "claimed" },
+      { closed: 1, own: "succeeded" },
+    ]);
+    assert.deepEqual([...driver.harnesses], []);
+  },
+);
 
 // The selected version is never stopped by its own superseded pass. A newer exclusive admission
 // supersedes its maintenance before Compute effects, even when that version is refused before its
