@@ -3,7 +3,12 @@ import {
   type OpenShellGitPolicyOverlap,
   type OpenShellGitRuntime,
 } from "../egress-proxy/openshell-git-runtime.ts";
-import { networkPolicySpecToJson } from "../kubernetes/network-policy.ts";
+import {
+  isCoreNetworkPolicy,
+  networkPolicySpecToJson,
+  networkPolicyToSdk,
+} from "../kubernetes/network-policy.ts";
+import { unsentManifestFields } from "../kubernetes/manifest-fields.ts";
 import {
   openShellEgressConfiguration,
   type OpenShellProxyOptions,
@@ -436,6 +441,57 @@ function validateKubernetesResource(value: unknown, path: string): void {
       `${path} must not contain OpenShell credential-bearing Secrets.`,
     );
   }
+}
+
+/** Configuration is a wire manifest: the client alias would drop or hide ingress sources. */
+function refuseIngressAlias(value: unknown, pointer: string): void {
+  const resource = asRecord(value);
+  const ingress = asRecord(resource?.spec)?.ingress;
+  if (resource === undefined || !isCoreNetworkPolicy(resource) || !Array.isArray(ingress)) {
+    return;
+  }
+  for (const [index, rule] of ingress.entries()) {
+    const fields = asRecord(rule);
+    if (fields === undefined) {
+      throw new ConfigurationValidationError([
+        {
+          path: `${pointer}/spec/ingress/${index}`,
+          code: "INVALID_VALUE",
+          message: "Write each NetworkPolicy ingress rule as an object.",
+        },
+      ]);
+    }
+    if (Object.hasOwn(fields, "_from")) {
+      throw new ConfigurationValidationError([
+        {
+          path: `${pointer}/spec/ingress/${index}/_from`,
+          code: "INVALID_VALUE",
+          message: "Name NetworkPolicy ingress sources with the Kubernetes field from.",
+        },
+      ]);
+    }
+  }
+}
+
+/** Refuse fields the client would drop or change, before they could widen a rule (finding 3111). */
+function refuseUnsentFields(value: unknown, list: string, index: number): void {
+  const fields = unsentManifestFields(value as KubernetesNamespacedResource);
+  if (fields.length === 0) {
+    return;
+  }
+  const item = `/gateway/${list}/${index}`;
+  throw new ConfigurationValidationError(
+    fields.map((field) => ({
+      // ErrorDetail bounds paths and messages to 512 characters.
+      path: item.length + field.length <= 512 ? `${item}${field}` : item,
+      code: "INVALID_VALUE",
+      // The write-only list is reported at its own path, so the message names the field.
+      message:
+        field === ""
+          ? `The Kubernetes client cannot serialize item ${index}. Use the Kubernetes field types.`
+          : `The Kubernetes client does not send item ${index} field ${field.length > 384 ? `${field.slice(0, 384)}...` : field} as written. Use the Kubernetes field name and type.`,
+    })) as [ErrorDetail, ...ErrorDetail[]],
+  );
 }
 
 function validateOperatorWorkspaceResource(value: unknown, path: string): void {
@@ -1169,7 +1225,7 @@ async function applyResources(
 ): Promise<void> {
   for (const resource of resources ?? []) {
     await kubernetes(context).patch(
-      withNamespace(resource, context),
+      networkPolicyToSdk(withNamespace(resource, context)),
       undefined,
       undefined,
       "openclaw-enterprise-sandbox",
@@ -2352,12 +2408,16 @@ function validateOptions(options: OpenShellSandboxDriverOptions): void {
       );
     }
   }
-  options.gateway.networkPolicyResources?.forEach((resource, index) =>
-    validateKubernetesResource(resource, `gateway.networkPolicyResources[${index}]`),
-  );
-  options.gateway.operatorWorkspaceResources?.forEach((resource, index) =>
-    validateOperatorWorkspaceResource(resource, `gateway.operatorWorkspaceResources[${index}]`),
-  );
+  options.gateway.networkPolicyResources?.forEach((resource, index) => {
+    validateKubernetesResource(resource, `gateway.networkPolicyResources[${index}]`);
+    refuseIngressAlias(resource, `/gateway/networkPolicyResources/${index}`);
+    refuseUnsentFields(resource, "networkPolicyResources", index);
+  });
+  options.gateway.operatorWorkspaceResources?.forEach((resource, index) => {
+    validateOperatorWorkspaceResource(resource, `gateway.operatorWorkspaceResources[${index}]`);
+    refuseIngressAlias(resource, `/gateway/operatorWorkspaceResources/${index}`);
+    refuseUnsentFields(resource, "operatorWorkspaceResources", index);
+  });
   nonempty(options.kubernetes.runtimeClassName, "OpenShell RuntimeClass name");
   if (options.kubernetes.serviceAccount.mode !== "gatewayConfigured") {
     throw new OpenShellSandboxConfigurationFailure(
