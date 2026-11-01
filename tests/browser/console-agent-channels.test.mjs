@@ -468,7 +468,8 @@ describe("Agent channels", { concurrency: 3 }, () => {
       ["padded", [" Slack"], true],
       ["upper", ["SLACK "], true],
       ["exact", ["slack"], true],
-      ["other", ["discord", 7], false],
+      // Not a non-text item: every Configuration save refuses one (finding 3101).
+      ["other", ["discord", "telegram"], false],
     ];
     const agents = [];
     for (const [slug, deny] of cases) {

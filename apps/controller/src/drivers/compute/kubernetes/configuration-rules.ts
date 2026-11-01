@@ -5,6 +5,7 @@ import {
 } from "@openclaw-enterprise/contracts";
 import {
   activePluginSecretInputs,
+  codexPluginPolicyProblem,
   enabledChannelEntries,
   gatewayPasswordRequirement,
   generatedGatewayPasswordReference,
@@ -126,6 +127,37 @@ export function requireWorkspaceNodePlugins(
   }
   if (asRecord(asRecord(plugins?.entries)?.[FILE_TRANSFER_PLUGIN])?.enabled === false) {
     throw createError("plugins.entries.file-transfer.enabled", `must not be false: ${requirement}`);
+  }
+}
+
+/**
+ * Every Dedicated Codex Gateway runs the codex plugin: Kubernetes Compute gives each one a codex
+ * plugin runtime (`pluginFreeRuntimeForRevision` in plugin-runtime.ts), whose overlay sets
+ * `plugins.entries.codex.enabled`. The Gateway entrypoint (`assertNoOpenClawPluginConfigConflict`
+ * in runtime-entrypoints.ts) then exits at every start, in this order, on a `plugins.allow` or
+ * `plugins.deny` list item that is not text, `plugins.enabled: false`, a `plugins.deny` that
+ * names codex, or a non-empty `plugins.allow` without it (finding 3096); a parity test pins the
+ * two. It reads both lists as the OpenClaw Plugin Driver's catalog rule does (pluginPolicyList:
+ * trimmed, lowercased IDs, and no built-in alias names codex). `plugins.entries.codex.enabled: false`
+ * starts: the overlay turns it back on. On Preset defaults (`options.unresolved`), an item that
+ * waits on a variable may name codex, so it is checked once filled.
+ */
+export function requireCodexPlugin(
+  configuration: Readonly<OpenClawConfigurationDocument>,
+  createError: SettingError,
+  options?: ConfigurationValidationOptions,
+): void {
+  const plugins = asRecord(configuration.plugins);
+  if (plugins === undefined) {
+    return;
+  }
+  // The rule lives in OCC's environment-references.ts, which the Console also loads (finding 3105).
+  const problem = codexPluginPolicyProblem(
+    plugins,
+    (key) => (item, index) => waitsOnVariable(item, ["plugins", key, index], options),
+  );
+  if (problem !== undefined) {
+    throw createError(problem.setting, problem.requirement);
   }
 }
 

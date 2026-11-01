@@ -5193,6 +5193,49 @@ export const scenarios = {
     ],
     gap: "The stored key is simulated; this story does not call save or deploy admission or start a Gateway.",
   },
+  openClawSandboxRefused: {
+    group: "Pages/Agent detail",
+    name: "OpenClaw sandbox before a plugin entry key",
+    path: draft,
+    deployed: true,
+    openClawSandbox: true,
+    pluginEntryKeyVariant: true,
+    description:
+      "An older release saved OpenClaw's sandbox on and a plugins.entries.Codex entry beside codex. Every Compute refuses to save or deploy both, and deploy names the sandbox first, so the page shows that refusal and holds Deploy.",
+    steps: [
+      "In Prepare this version, the first step reads Turn off OpenClaw's sandbox.",
+      'Deploy new version is disabled with Configuration setting agents.defaults.sandbox.mode must be "off" or unset: OCE runs each Agent in its own isolated runtime and does not support OpenClaw\'s sandbox.',
+    ],
+    gap: "The stored settings are simulated; this story does not call save or deploy admission or start a Gateway.",
+  },
+  providerKeyVariantRefused: {
+    group: "Pages/Agent detail",
+    name: "Model provider key in another spelling",
+    path: draft,
+    deployed: true,
+    providerKeyVariant: true,
+    description:
+      "An older release saved a models.providers.OpenAI entry. OpenClaw applies it to openai, and every Compute refuses to save or deploy it, so the page shows that refusal and holds Deploy.",
+    steps: [
+      "In Prepare this version, the first step reads Fix the model provider key.",
+      'Deploy new version is disabled with Configuration setting models.providers.OpenAI must be named "openai": OpenClaw applies it to that provider\'s entry, the one OCE checks. Move these settings there if that key exists, else rename this key.',
+    ],
+    gap: "The stored key is simulated; this story does not call save or deploy admission or start a Gateway.",
+  },
+  pluginPolicyListRefused: {
+    group: "Pages/Agent detail",
+    name: "Plugin deny list item that is not text",
+    path: draft,
+    deployed: true,
+    pluginDeny: ["discord", 7],
+    description:
+      "An older release saved a plugins.deny list with a number in it. OpenClaw's config schema refuses it, so no Gateway starts, and every Compute refuses to save or deploy it: the page shows that refusal and holds Deploy.",
+    steps: [
+      "In Prepare this version, the first step reads Fix the plugin allow or deny list.",
+      "Deploy new version is disabled with Configuration setting plugins.deny must list only plugin IDs as text, or the Gateway does not start: remove any other item.",
+    ],
+    gap: "The stored list is simulated; this story does not call save or deploy admission or start a Gateway.",
+  },
   kubernetesEntryKeyVariantRefused: {
     group: "Pages/Agent detail",
     name: "Plugin entry key Kubernetes Compute refuses",
@@ -5216,6 +5259,30 @@ export const scenarios = {
       "Deploy new version is disabled with Configuration setting plugins.entries.File-Transfer must be named file-transfer: OpenClaw merges it into plugins.entries.file-transfer, the entry OCE checks. If that entry exists, move these settings into it and remove this key; else rename this key.",
     ],
     gap: "The stored key and the preflight refusal are simulated; tests/browser/console-agent-detail.test.mjs covers the page with the real Kubernetes and SSH Compute rules.",
+  },
+  codexPluginsDisabledRefused: {
+    group: "Pages/Agent detail",
+    name: "Codex plugin turned off on Dedicated Codex",
+    path: draft,
+    deployed: true,
+    codexPluginsDisabled: true,
+    rules: [
+      {
+        suffix: "/agents/validate",
+        method: "POST",
+        status: 400,
+        code: "INVALID_REQUEST",
+        message:
+          "Configuration setting plugins.enabled must not be false: Dedicated Codex runs the codex plugin, so its Gateway would not start. Remove it.",
+      },
+    ],
+    description:
+      "An older release saved plugins.enabled false on a Dedicated Codex Agent. Only Kubernetes Compute refuses it, so the page asks Create Agent's preflight, which runs the Installation's Compute rules. Here it refuses, so the page shows that refusal and holds Deploy.",
+    steps: [
+      "In Prepare this version, the first step reads Let the codex plugin run.",
+      "Deploy new version is disabled with Configuration setting plugins.enabled must not be false: Dedicated Codex runs the codex plugin, so its Gateway would not start. Remove it.",
+    ],
+    gap: "The stored setting and the preflight refusal are simulated; tests/browser/console-agent-detail.test.mjs covers the page with the real Kubernetes Compute rules.",
   },
   kubernetesEntryKeyVariantChecking: {
     group: "Pages/Agent detail",

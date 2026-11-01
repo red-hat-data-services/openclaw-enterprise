@@ -594,10 +594,12 @@ export { imageReferenceProblem } from "./image-reference.ts";
 export type { ImageReferenceProblem } from "./image-reference.ts";
 export { DEPLOYMENT_FAILURE_STEPS, deploymentFailureStep } from "./deployment-failure-steps.ts";
 export { admitGatewaySecurityDefaults } from "./gateway-security-defaults.ts";
-export { retiredOpenClawSettingMessage } from "./retired-openclaw-settings.ts";
+export { storedConfigurationProblem } from "./stored-configuration-rules.ts";
+export type { StoredConfigurationRule } from "./stored-configuration-rules.ts";
 export type { DeploymentFailureStep } from "./deployment-failure-steps.ts";
 export {
   activePluginSecretInputs,
+  codexPluginPolicyProblem,
   configIncludeProblem,
   environmentReference,
   environmentReferenceNames,
@@ -605,6 +607,7 @@ export {
   generatedGatewayPasswordReference,
   pluginEntryKeyVariantProblem,
   pluginPolicyId,
+  pluginPolicyList,
   pluginSecretInputReference,
   secretInputReference,
   secretInputShorthandName,

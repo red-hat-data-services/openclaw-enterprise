@@ -104,6 +104,7 @@ import {
   STOP_STATUS_REFRESH_FAILED,
   STOPPED_NO_VERSION,
   WORKSPACE_FILES_UNAVAILABLE,
+  codexPluginRefusal,
   configIncludeRefusal,
   credentialCheckedAtDeploy,
   invalidSecretProviderDefaultsRefusal,
@@ -112,6 +113,8 @@ import {
   namespaceListDenied,
   notIncluded,
   pluginEntryKeyVariantRefusal,
+  pluginPolicyListRefusal,
+  providerKeyVariantRefusal,
   secretOperateRefused,
   stopRefused,
   stopStatusRefreshFailed,
@@ -120,6 +123,10 @@ import {
   READ_ONLY_DRAFT_NOTICE,
 } from "../helpers/refusal-text.mjs";
 import { liftRestriction, restrict } from "../helpers/iam-grants.mjs";
+import {
+  OPENCLAW_SANDBOX_SETTINGS,
+  openClawSandboxRefusal,
+} from "../helpers/admitted-configuration.mjs";
 
 test("Deployment shows a historical version's snapshot read failure and Retry recovers", async (t) => {
   const fixture = await createConsoleAppFixture(t);
@@ -1539,17 +1546,19 @@ for (const viewport of [
   });
 }
 
-// A Configuration an older release saved with OpenClaw's $include, or with a Codex entry beside
-// codex: every Compute refuses to save or deploy it (findings 3077, 3078), so the draft holds
-// Deploy with that refusal and names it in the Configuration step, as for a plugin secret input
-// (finding 3086). Following the refusal's step saves, and the draft is ready again: the include
-// is written out, and the variant's settings move into codex instead of being renamed onto a
-// duplicate key (finding 3087).
+// A Configuration an older release saved with OpenClaw's $include, with a Codex entry beside
+// codex, with OpenClaw's sandbox as well, with an OpenAI model provider key, or with a plugins.deny
+// item that is not text: every Compute refuses to save or deploy it (findings 2767, 3077, 3078,
+// 3097, 3101), so the draft holds Deploy with the refusal deploy gives first and names it in the
+// Configuration step, as for a plugin secret input (findings 3086, 3093). Following the refusal's
+// step saves, and the draft is ready again: the include is written out, and the variant's
+// settings move into codex instead of being renamed onto a duplicate key (finding 3087).
 for (const viewport of [
   { width: 1440, height: 900 },
   { width: 390, height: 844 },
 ]) {
-  test(`A stored include or plugin entry key variant holds Deploy at ${viewport.width}px`, async (t) => {
+  test(`A stored include, key variant, sandbox or plugin list item holds Deploy at ${viewport.width}px`, async (t) => {
+    const [sandboxMode] = OPENCLAW_SANDBOX_SETTINGS;
     const configurationDriver = createTestConfigurationDriver({ id: "console-configuration" });
     const fixture = await createConsoleAppFixture(t, { configurationDriver });
     await fixture.bootstrap();
@@ -1580,6 +1589,45 @@ for (const viewport of [
         reason: pluginEntryKeyVariantRefusal("plugins.entries.Codex", "codex"),
         step: "Fix the plugin entry key",
         fixed: withEntries({ codex: { enabled: true, ...codex } }),
+      },
+      // Deploy checks OpenClaw's sandbox before the entry key, so the page names the sandbox
+      // too, not the later entry key problem (finding 3093).
+      {
+        name: "Sandbox",
+        stored: {
+          ...withEntries({ codex, Codex: { enabled: true } }),
+          agents: {
+            ...values.agents,
+            defaults: { ...values.agents.defaults, sandbox: { mode: "all" } },
+          },
+        },
+        reason: openClawSandboxRefusal(sandboxMode, sandboxMode.path),
+        step: "Turn off OpenClaw's sandbox",
+        fixed: values,
+      },
+      // A model provider key spelling is the only problem: deploy refuses it after the other
+      // stored-row rules, so the page holds Deploy instead of showing Ready to deploy (3093).
+      {
+        name: "Provider key",
+        stored: {
+          ...structuredClone(values),
+          models: { providers: { OpenAI: { baseUrl: "https://models.example/v1" } } },
+        },
+        reason: providerKeyVariantRefusal("models.providers.OpenAI", "openai"),
+        step: "Fix the model provider key",
+        fixed: values,
+      },
+      // A plugins.deny item that is not text is the only problem: deploy refuses it last of the
+      // stored-row rules, so the page holds Deploy instead of showing Ready to deploy (3102).
+      {
+        name: "Plugin list",
+        stored: {
+          ...structuredClone(values),
+          plugins: { ...values.plugins, deny: ["discord", 7] },
+        },
+        reason: pluginPolicyListRefusal("deny"),
+        step: "Fix the plugin allow or deny list",
+        fixed: values,
       },
     ]) {
       const agent = await fixture.createAgent(namespace.id, `${name} Agent`, values);
@@ -1803,6 +1851,114 @@ test("A member without Agent create sends no Compute preflight for a plugin entr
   );
   assert.deepEqual(authorizationDenials(fixture.auditSink, "openclaw.agents.validate"), []);
 });
+
+// Every Dedicated Codex Gateway runs the codex plugin, and only Kubernetes Compute refuses a
+// plugins setting that turns it off (finding 3096). A Dedicated Codex row stored with
+// plugins.enabled false holds Deploy with deploy's refusal and a step, through the same Compute
+// preflight as the entry keys above, and following the step makes the draft ready (finding 3105).
+// The same row on an OpenClaw Agent sends no preflight and shows no codex refusal.
+for (const viewport of [
+  { width: 1440, height: 900 },
+  { width: 390, height: 844 },
+]) {
+  test(`A Dedicated Codex row that turns off the codex plugin holds Deploy at ${viewport.width}px`, async (t) => {
+    const reason = codexPluginRefusal("plugins.enabled", "must not be false", "Remove it");
+    const pluginsOff = (values) => ({
+      ...structuredClone(values),
+      plugins: { ...values.plugins, enabled: false },
+    });
+    await t.test("Dedicated Codex", async (t) => {
+      const configurationDriver = createTestConfigurationDriver({ id: "console-configuration" });
+      const fixture = await createConsoleAppFixture(t, { configurationDriver });
+      await fixture.bootstrap();
+      const namespace = await fixture.createNamespace("Codex plugin off", { ready: true });
+      const values = nativeValues("codex-plugin-off", { harnessId: "codex" });
+      const agent = await fixture.createAgent(namespace.id, "Codex plugin off", values, {
+        executionMode: "dedicated",
+      });
+      const configurationPath = `/namespaces/${namespace.id}/configurations/${agent.configurationId}`;
+      const refusedSave = await fixture.request("PATCH", configurationPath, {
+        body: { values: pluginsOff(values) },
+      });
+      assert.equal(refusedSave.status, 400, JSON.stringify(refusedSave.body));
+      assert.equal(refusedSave.body.error.message, reason);
+      // The row as a release before the save rule stored it.
+      await configurationDriver.update({
+        ...configurationDriver.stored({ namespaceId: namespace.id, id: agent.configurationId }),
+        values: pluginsOff(values),
+      });
+
+      const { page } = await newPage(t, fixture, { context: { viewport } });
+      await login(
+        page,
+        fixture,
+        detailUrl(fixture, namespace.id, agent.id, "draft", "configuration"),
+      );
+      const card = page.locator(".agent-draft-actions");
+      const deploy = card.getByRole("button", { name: "Deploy new version", exact: true });
+      const firstStep = card.getByRole("listitem").first().locator(".checklist-detail");
+      await card.getByText(reason, { exact: true }).waitFor();
+      assert.equal(await deploy.isDisabled(), true);
+      assert.equal(await card.getByText("Ready to deploy.", { exact: true }).count(), 0);
+      assert.ok((await firstStep.textContent()).startsWith("Let the codex plugin run · "));
+      // Deploy admission refuses the stored row with the text the page shows.
+      const refusedDeploy = await fixture.request(
+        "POST",
+        `/namespaces/${namespace.id}/agents/${agent.id}/deploy`,
+      );
+      assert.equal(refusedDeploy.status, 400, JSON.stringify(refusedDeploy.body));
+      assert.equal(refusedDeploy.body.error.message, reason);
+
+      // The step, followed in the editor, saves and the draft is ready.
+      const edit = page.getByRole("button", { name: "Edit Configuration", exact: true });
+      await edit.scrollIntoViewIfNeeded();
+      await edit.click();
+      await page.getByLabel("Configuration JSON").fill(JSON.stringify(values, null, 2));
+      await page.getByRole("button", { name: "Save Configuration", exact: true }).click();
+      await card.getByText("Ready to deploy.", { exact: true }).waitFor();
+      assert.equal(await deploy.isDisabled(), false);
+      assert.match(await firstStep.textContent(), /^Saved · Configuration /);
+      // The page fits the viewport: no horizontal scroll.
+      assert.equal(
+        await page.evaluate(
+          () => globalThis.document.documentElement.scrollWidth <= globalThis.innerWidth,
+        ),
+        true,
+      );
+    });
+
+    await t.test("OpenClaw Agent", async (t) => {
+      const fixture = await createConsoleAppFixture(t);
+      await fixture.bootstrap();
+      const namespace = await fixture.createNamespace("OpenClaw plugins off", { ready: true });
+      const values = nativeAdminValues("openclaw-plugins-off", "http://127.0.0.1:18789");
+      const agent = await fixture.createAgent(namespace.id, "OpenClaw plugins off", values);
+      // No codex rule applies to an OpenClaw Agent, so Kubernetes Compute saves the row.
+      const saved = await fixture.request(
+        "PATCH",
+        `/namespaces/${namespace.id}/configurations/${agent.configurationId}`,
+        { body: { values: pluginsOff(values) } },
+      );
+      assert.equal(saved.status, 200, JSON.stringify(saved.body));
+
+      const { page } = await newPage(t, fixture, { context: { viewport } });
+      const requests = apiRequests(page, fixture.origin);
+      await login(
+        page,
+        fixture,
+        detailUrl(fixture, namespace.id, agent.id, "draft", "configuration"),
+      );
+      const card = page.locator(".agent-draft-actions");
+      await card.getByText("Ready to deploy.", { exact: true }).waitFor();
+      await waitForEnabled(card.getByRole("button", { name: "Deploy new version", exact: true }));
+      assert.equal(await card.getByText(reason, { exact: true }).count(), 0);
+      assert.deepEqual(
+        pathRequests(requests, "POST", `/namespaces/${namespace.id}/agents/validate`),
+        [],
+      );
+    });
+  });
+}
 
 // The default env alias is a configured env provider whose allowlist leaves out the generated
 // password, so OpenClaw cannot read the reference Enable gateway password access would write and
