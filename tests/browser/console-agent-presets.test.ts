@@ -83,7 +83,9 @@ import {
   READ_UNAVAILABLE,
   namespaceListDenied,
   PLUGIN_CREDENTIALS_REJECTED,
+  KUBERNETES_ALLOW_USERS_REFUSAL,
 } from "../helpers/refusal-text.mjs";
+import { nativeAdminGatewayAuth } from "../helpers/harness-configuration.mjs";
 import { restrict } from "../helpers/iam-grants.mjs";
 import { within } from "../helpers/wait-for.mjs";
 
@@ -2616,6 +2618,250 @@ test("Preset marks referenced variables without defaults as required before rend
   await page.getByLabel("Agent name", { exact: true }).waitFor();
   assert.equal(await page.getByLabel("Agent name", { exact: true }).inputValue(), "Required Agent");
 });
+
+// A Preset variable feeds the trusted-proxy allowlist, which Kubernetes Compute refuses with a
+// case-duplicate of the machine identity. The refusal names only the setting, so Create Agent
+// names the variable that filled it and reopens the Preset with that field marked and focused;
+// a valid value then creates the Agent (finding 3122).
+for (const viewport of consoleViewports) {
+  test(`A refused setting a Preset variable filled marks that variable at ${viewport.width}px`, async (t) => {
+    const fixture = await createConsoleAppFixture(t);
+    await fixture.bootstrap();
+    const namespace = await fixture.createNamespace("Preset variable refusal", { ready: true });
+    const artifact = structuredClone(standardCodexPreset) as typeof standardCodexPreset & {
+      template: { configuration: { values: { gateway: Record<string, unknown> } } };
+    };
+    artifact.template.variables.human = {
+      type: "string",
+      description: "Identity of the person who runs this Agent",
+    };
+    const auth = nativeAdminGatewayAuth();
+    auth.trustedProxy.allowUsers = ["occ-workspace-files", "{{ vars.human }}"];
+    const gateway = artifact.template.configuration.values.gateway;
+    gateway.controlUi = { enabled: true, allowedOrigins: ["http://127.0.0.1:18789"] };
+    gateway.auth = auth;
+    const preset: FixtureResponse<Preset> = await fixture.request(
+      "POST",
+      `/namespaces/${namespace.id}/presets`,
+      { body: artifact },
+    );
+    // The allowlist waits on the variable, so the Preset itself saves.
+    assert.equal(preset.status, 201, JSON.stringify(preset.body));
+    const { page } = await newPage(t, fixture, { context: { viewport } });
+    await routeInstallationWithoutProvisioning(page, fixture);
+    await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`);
+    await page.getByLabel("Preset template").selectOption(preset.data.id);
+    const human = page.getByLabel("Human", { exact: true });
+    const password = page.getByLabel("Model Secret", { exact: true });
+    await page.getByLabel("Name", { exact: true }).fill("Variable Agent");
+    await page.getByLabel("Model", { exact: true }).fill("gpt-5.1");
+    await password.fill("synthetic-variable-key");
+    // Identities compare case-insensitively, so this duplicates the machine identity.
+    await human.fill("OCC-Workspace-Files");
+    await page.getByRole("button", { name: "Use Preset" }).click();
+    await page.getByLabel("Agent name", { exact: true }).waitFor();
+
+    const preflight = page.waitForResponse(
+      (response) =>
+        response.url().endsWith(`/namespaces/${namespace.id}/agents/validate`) &&
+        response.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: "Create Agent", exact: true }).click();
+    assert.equal((await preflight).status(), 400);
+    const feedback = page.getByRole("alert").filter({
+      hasText: KUBERNETES_ALLOW_USERS_REFUSAL,
+    });
+    await feedback.waitFor();
+    // The API's sentence, then the variable the person typed into; never the value.
+    const feedbackText = (await feedback.textContent()) ?? "";
+    assert.match(
+      feedbackText,
+      /^Configuration setting gateway\.auth\.trustedProxy\.allowUsers .* names\. The Preset variable Human filled this setting\. Request ID: \S+ Change Human$/,
+    );
+    assert.equal(feedbackText.includes("OCC-Workspace-Files"), false);
+    await feedback.getByRole("button", { name: "Change Human", exact: true }).click();
+
+    // The Preset step again, with the entered variables kept (never the password): Human holds
+    // the refusal under it and has focus.
+    await page.locator("#preset-variable-human[aria-invalid=true]").waitFor();
+    const error = await human.evaluate((input) => {
+      const doc = globalThis.document;
+      const errorId = input
+        .getAttribute("aria-describedby")
+        ?.split(/\s+/)
+        .find((id) => id.endsWith("-error"));
+      return {
+        focused: doc.activeElement === input,
+        text: errorId ? doc.getElementById(errorId)?.textContent : undefined,
+      };
+    });
+    assert.deepEqual(error, { focused: true, text: KUBERNETES_ALLOW_USERS_REFUSAL });
+    assert.equal(await human.inputValue(), "OCC-Workspace-Files");
+    assert.equal(await page.getByLabel("Name", { exact: true }).inputValue(), "Variable Agent");
+    assert.equal(await password.inputValue(), "");
+    // Editing the variable clears its mark.
+    await human.fill("oidc:member-01");
+    assert.equal(await human.getAttribute("aria-invalid"), null);
+    await password.fill("synthetic-variable-key");
+    await page.getByRole("button", { name: "Use Preset" }).click();
+    await page.getByLabel("Agent name", { exact: true }).waitFor();
+    const created = await createAgentThroughForm(page, fixture, namespace.id);
+    await page.waitForURL((url) => url.pathname === `/console/agents/${created.id}`);
+    const configuration: FixtureResponse<ConfigurationWire> = await fixture.request(
+      "GET",
+      `/namespaces/${namespace.id}/configurations/${created.configurationId}`,
+    );
+    assert.deepEqual(responseAllowUsers(configuration.data.values), [
+      "occ-workspace-files",
+      "oidc:member-01",
+    ]);
+    assert.equal(
+      await page.evaluate(
+        () => globalThis.document.documentElement.scrollWidth <= globalThis.innerWidth,
+      ),
+      true,
+    );
+  });
+}
+
+type VariablePresetTemplate = (typeof standardCodexPreset)["template"] & {
+  configuration: {
+    values: {
+      gateway: Record<string, unknown>;
+      agents: { defaults: { models: Record<string, unknown> } };
+    };
+  };
+};
+
+// The standard Preset with an existing model Secret bound (a restored form then needs no new
+// key), edited by `edit`, chosen on Create Agent with its name and model filled.
+async function boundSecretVariablePreset(
+  t: TestContext,
+  label: string,
+  edit: (template: VariablePresetTemplate) => void,
+) {
+  const fixture = await createConsoleAppFixture(t);
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace(label, { ready: true });
+  const modelSecret = await fixture.createSecret(namespace.id, "Model token", "hidden-model-token");
+  const artifact = structuredClone(standardCodexPreset) as typeof standardCodexPreset & {
+    template: VariablePresetTemplate;
+  };
+  delete artifact.template.variables.modelSecret;
+  artifact.template.agent.harnessAuth = { method: "api_key", source: modelSecret.ref };
+  edit(artifact.template);
+  const preset: FixtureResponse<Preset> = await fixture.request(
+    "POST",
+    `/namespaces/${namespace.id}/presets`,
+    { body: artifact },
+  );
+  assert.equal(preset.status, 201, JSON.stringify(preset.body));
+  const { page } = await newPage(t, fixture);
+  await routeInstallationWithoutProvisioning(page, fixture);
+  await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`);
+  await page.getByLabel("Preset template").selectOption(preset.data.id);
+  await page.getByLabel("Name", { exact: true }).fill("Variable Agent");
+  await page.getByLabel("Model", { exact: true }).fill("gpt-5.1");
+  return { namespace, preset: preset.data, page };
+}
+
+// Create Agent's preflight refuses the form; the alert holding `refusal` shows it.
+async function refusedPreflight(page: Page, namespaceId: string, refusal: string) {
+  const preflight = page.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/namespaces/${namespaceId}/agents/validate`) &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Create Agent", exact: true }).click();
+  assert.equal((await preflight).status(), 400);
+  const feedback = page.getByRole("alert").filter({ hasText: refusal });
+  await feedback.waitFor();
+  return feedback;
+}
+
+// The API quotes a key that is not a plain ID, here one a variable filled with a space in it:
+// agents.defaults.models["openai/gpt 5 mini"]. The refusal still names the variable (finding 3122).
+test("A refused quoted setting key names the Preset variable that filled it", async (t) => {
+  const setting = 'agents.defaults.models["openai/gpt 5 mini"]';
+  const { namespace, page } = await boundSecretVariablePreset(t, "Quoted setting", (template) => {
+    template.variables.fallback = { type: "string", description: "Another model ref" };
+    template.configuration.values.agents.defaults.models["{{ vars.fallback }}"] = {
+      agentRuntime: { id: "codex" },
+    };
+  });
+  const fallback = page.getByLabel("Fallback", { exact: true });
+  await fallback.fill("openai/gpt 5 mini");
+  await page.getByRole("button", { name: "Use Preset" }).click();
+  await page.getByLabel("Agent name", { exact: true }).waitFor();
+  const feedback = await refusedPreflight(page, namespace.id, `Configuration setting ${setting} `);
+  assert.match(
+    (await feedback.textContent()) ?? "",
+    / The Preset variable Fallback filled this setting\. Request ID: \S+ Change Fallback$/,
+  );
+  await feedback.getByRole("button", { name: "Change Fallback", exact: true }).click();
+  await page.locator("#preset-variable-fallback[aria-invalid=true]").waitFor();
+  assert.equal(
+    await fallback.evaluate((input) => globalThis.document.activeElement === input),
+    true,
+  );
+  assert.equal(await fallback.inputValue(), "openai/gpt 5 mini");
+});
+
+// An Agent form edit survives navigating away and back (the restored draft keeps it as edited),
+// so Change <variable> still asks before it discards it. When the Preset then fails to load, the
+// pressed button is gone and focus goes to the chooser heading, not the document (findings 1446,
+// 3122).
+test("Change Preset variables confirms restored form edits and keeps focus when the Preset fails to load", async (t) => {
+  const { namespace, preset, page } = await boundSecretVariablePreset(
+    t,
+    "Preset variable return",
+    (template) => {
+      template.variables.human = {
+        type: "string",
+        description: "Identity of the person who runs this Agent",
+      };
+      const auth = nativeAdminGatewayAuth();
+      auth.trustedProxy.allowUsers = ["occ-workspace-files", "{{ vars.human }}"];
+      const gateway = template.configuration.values.gateway;
+      gateway.controlUi = { enabled: true, allowedOrigins: ["http://127.0.0.1:18789"] };
+      gateway.auth = auth;
+    },
+  );
+  await page.getByLabel("Human", { exact: true }).fill("OCC-Workspace-Files");
+  await page.getByRole("button", { name: "Use Preset" }).click();
+  const agentName = page.getByLabel("Agent name", { exact: true });
+  await agentName.fill("Edited Variable Agent");
+  await page.getByRole("link", { name: "← Agents" }).click();
+  await page.getByRole("button", { name: "Create Agent", exact: true }).click();
+  await agentName.waitFor();
+  assert.equal(await agentName.inputValue(), "Edited Variable Agent");
+  const feedback = await refusedPreflight(page, namespace.id, KUBERNETES_ALLOW_USERS_REFUSAL);
+
+  await page.route(`**/namespaces/${namespace.id}/presets/${preset.id}`, (route) =>
+    route.abort("failed"),
+  );
+  const dialogs: string[] = [];
+  page.on("dialog", (dialog) => {
+    dialogs.push(dialog.message());
+    void dialog.accept();
+  });
+  await feedback.getByRole("button", { name: "Change Human", exact: true }).click();
+  await page.getByText(/^This Preset could not be loaded\./).waitFor();
+  assert.deepEqual(dialogs, ["Discard the changes on this form and go back to the Preset?"]);
+  assert.equal(
+    await page.evaluate(() => {
+      const active = globalThis.document.activeElement;
+      return active?.tagName === "H2" ? active.textContent : active?.tagName;
+    }),
+    "Use a saved setup",
+  );
+});
+
+function responseAllowUsers(values: unknown) {
+  const gateway = (values as { gateway?: { auth?: { trustedProxy?: { allowUsers?: unknown } } } })
+    .gateway;
+  return gateway?.auth?.trustedProxy?.allowUsers;
+}
 
 test("Preset with a prebound model Secret grants the created draft access", async (t) => {
   const fixture = await createConsoleAppFixture(t);
