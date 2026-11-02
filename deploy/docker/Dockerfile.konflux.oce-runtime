@@ -163,7 +163,7 @@ WORKDIR /source
 # the conf plays that role here, so verify it against the checked-out manifest
 # the same way scripts/lib/openclaw-source.mjs verify does upstream.
 COPY --from=oce-source /oce/deploy/runtime/*.patch /oce/scripts/build-runtime-assets.mjs /oce/deploy/runtime/openclaw-source.json /tmp/oce/
-COPY --from=oce-source /oce/scripts/lib/openclaw-source.mjs /tmp/oce/lib/
+COPY --from=oce-source /oce/scripts/lib/openclaw-source.mjs /oce/scripts/lib/openclaw-source.ts /tmp/oce/lib/
 RUN /bin/bash -euo pipefail <<'EOF'
 OPENCLAW_COMMIT="${OPENCLAW_COMMIT}" OPENCLAW_SOURCE_SHA256="${OPENCLAW_SOURCE_SHA256}" \
     OPENCLAW_BUILD_TIMESTAMP="${OPENCLAW_BUILD_TIMESTAMP}" \
@@ -176,7 +176,6 @@ rm /tmp/openclaw-source.tar.gz
 # order of deploy/runtime/Dockerfile.
 git apply /tmp/oce/openclaw-codex-read-only-paths.patch
 git apply /tmp/oce/openclaw-codex-full-access-profile.patch
-git apply --unidiff-zero /tmp/oce/stock-codex-0.163.0-alpha.2-dependency-pin.patch
 node /tmp/oce/build-runtime-assets.mjs inputs /source /inputs
 EOF
 
@@ -240,11 +239,19 @@ RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce
 # Forward the scoped Google placeholder and the OpenShell TLS root to native worker children.
 RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce-runtime \
     git apply /tmp/oce-runtime/openclaw-google-worker-placeholder.patch
+# Local qualification bridge for the pinned OpenClaw private-store owner.
+# Remove after selecting an OpenClaw revision containing this owning repair.
+RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce-runtime \
+    git apply /tmp/oce-runtime/openclaw-linux-private-store-setgid.patch
+# Name each invalid plugin setting and exit 78 when Gateway startup refuses its config
+# (openclaw/openclaw#189392). Remove after selecting an OpenClaw commit that contains it.
+RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce-runtime \
+    git apply /tmp/oce-runtime/openclaw-plugin-config-startup-report.patch
 
 # Run the bridge tests alongside the build using the same patched source.
 # Packaging mounts this stage so a failed test still blocks the runtime image.
 FROM openclaw-patched-source AS openclaw-bridge-tests
-# One runner invocation for the Node test files: the runner compiles the whole
+# One runner invocation for the gateway Node test files: the runner compiles the whole
 # source tree for its workers first (about a minute), and a second invocation on
 # a fresh .artifacts mount would compile it again. The test runner restores its
 # cache by renaming directories; a fresh mount keeps those renames off the
@@ -253,6 +260,12 @@ RUN --network=none --mount=type=tmpfs,target=/source/.artifacts \
     OPENCLAW_VITEST_RUNTIME=node OPENCLAW_VITEST_MAX_WORKERS=1 pnpm_config_verify_deps_before_run=false \
     node --import ./scripts/tsx.mjs scripts/test-projects.mts src/gateway/server.required-placement-scopes.test.ts \
     src/infra/gateway-lock-recovery.test.ts src/node-host/node-worker-google-placeholder.test.ts
+# The setgid bridge test needs directories to inherit the setgid bit, which a
+# runner's build storage does not always do, so it gets a tmpfs /tmp. Its own
+# invocation also keeps it from loading the timing-sensitive gateway tests above.
+RUN --network=none --mount=type=tmpfs,target=/source/.artifacts --mount=type=tmpfs,target=/tmp \
+    OPENCLAW_VITEST_RUNTIME=node OPENCLAW_VITEST_MAX_WORKERS=1 pnpm_config_verify_deps_before_run=false \
+    node --import ./scripts/tsx.mjs scripts/test-projects.mts src/infra/private-store-file.test.ts
 # Type-check the two UI test graphs touched by the bridge. The upstream runner
 # generates its database types and compiler cache under .artifacts.
 RUN --network=none --mount=type=tmpfs,target=/source/.artifacts \
@@ -304,9 +317,10 @@ RUN rm -rf node_modules ui/node_modules \
 FROM openclaw-production-deps AS openclaw-runtime-assets
 COPY --from=openclaw-build-output /source/ ./
 # Keep lib/ a separate COPY: a multi-source COPY flattens every file to its
-# basename, and build-runtime-assets.mjs imports ./lib/openclaw-source.mjs.
+# basename, and build-runtime-assets.mjs imports ./lib/openclaw-source.mjs,
+# which re-exports ./openclaw-source.ts.
 COPY --from=openclaw-source /tmp/oce/build-runtime-assets.mjs /tmp/oce/openclaw-source.json /tmp/oce/
-COPY --from=openclaw-source /tmp/oce/lib/openclaw-source.mjs /tmp/oce/lib/
+COPY --from=openclaw-source /tmp/oce/lib/openclaw-source.mjs /tmp/oce/lib/openclaw-source.ts /tmp/oce/lib/
 RUN /bin/bash -euo pipefail <<'EOF'
 node scripts/postinstall-bundled-plugins.mjs
 OPENCLAW_EXTENSIONS=codex,slack node scripts/prune-docker-plugin-dist.mjs
@@ -468,7 +482,7 @@ RUN mkdir -p node_modules/.bin \
     && ln -s ../openclaw/node_modules/@openai/codex/bin/codex.js node_modules/.bin/codex
 
 COPY --from=openclaw-runtime-assets /tmp/oce/build-runtime-assets.mjs /tmp/build-runtime-assets.mjs
-COPY --from=openclaw-runtime-assets /tmp/oce/lib/openclaw-source.mjs /tmp/lib/openclaw-source.mjs
+COPY --from=openclaw-runtime-assets /tmp/oce/lib/openclaw-source.mjs /tmp/oce/lib/openclaw-source.ts /tmp/lib/
 RUN /bin/bash -euo pipefail <<'EOF'
 mkdir -p node_modules/openclaw/dist/extensions ./plugin-skills /etc/openclaw /home/node/.codex/generated_images
 chown node:node /home/node/.codex /home/node/.codex/generated_images
@@ -497,7 +511,7 @@ rm -rf "$codex_home"
 test -f /app/dist/extensions/codex/openclaw.plugin.json
 test -f /app/dist/extensions/slack/openclaw.plugin.json
 node /tmp/build-runtime-assets.mjs inventory /app/node_modules/openclaw /opt/oce/runtime
-rm /tmp/build-runtime-assets.mjs /tmp/lib/openclaw-source.mjs
+rm /tmp/build-runtime-assets.mjs /tmp/lib/openclaw-source.mjs /tmp/lib/openclaw-source.ts
 EOF
 
 RUN /usr/bin/git config --system --add include.path /run/oce/repository-credentials/gitconfig
