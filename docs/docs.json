@@ -367,6 +367,10 @@
                             "label": "Overview"
                           },
                           {
+                            "page": "reference/drivers/kubernetes-compute/configuration",
+                            "label": "Configuration"
+                          },
+                          {
                             "page": "reference/drivers/kubernetes-compute/networking-and-isolation",
                             "label": "Networking and Isolation"
                           },
@@ -389,6 +393,10 @@
                           {
                             "page": "reference/drivers/kubernetes-compute/split-layout-installations",
                             "label": "Split-Layout Installations"
+                          },
+                          {
+                            "page": "reference/drivers/kubernetes-compute/preprovisioned-namespace",
+                            "label": "Preprovisioned Namespace"
                           }
                         ]
                       },
