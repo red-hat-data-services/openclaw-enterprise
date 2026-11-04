@@ -1,3 +1,9 @@
+import { channelsScenarios } from "./scenario-groups/channels.mts";
+import { namespacesScenarios } from "./scenario-groups/namespaces.mts";
+import { secretsScenarios } from "./scenario-groups/secrets.mts";
+import { settingsScenarios } from "./scenario-groups/settings.mts";
+import { signInScenarios } from "./scenario-groups/sign-in.mts";
+
 const draft =
   "/console/agents/agt_00000000-0000-4000-8000-000000000001?namespace=ns_00000000-0000-4000-8000-000000000001&revision=draft";
 const revision =
@@ -14,12 +20,8 @@ const soulVersion = (version) =>
     (_, index) => `Line ${index + 1}: keep answers short and cite the files you used.\n`,
   ).join("");
 const create = "/console/agents/new?namespace=ns_00000000-0000-4000-8000-000000000001";
+/** @param {string} text */
 const click = (text) => ({ click: text });
-const submitPassword = [
-  { selector: "#username", value: "operator@example.com" },
-  { selector: "#password", value: "demo-only" },
-  click("Sign in"),
-];
 const runtimeLogsPage = {
   group: "Pages/Agent detail",
   path: `${candidateVersion}&tab=logs`,
@@ -182,6 +184,14 @@ const pluginToolRefusal =
 // The same refusal from Create Agent's preflight, worded as the OpenClaw Plugin Driver words it.
 const pluginPreflightRefusal =
   "Configuration setting tools.deny blocks every tool of plugin codex-plugin:calendar@openai-curated-remote; remove the matching deny entry or deselect the plugin.";
+/** @type {"plugins"} */
+const pluginsComponent = "plugins";
+
+/** @typedef {import("/console/agents/plugin-fields.mjs").PluginFieldsOptions} PluginFieldsOptions */
+/** @typedef {PluginFieldsOptions["catalog"]} PluginFieldCatalog */
+/** @typedef {PluginFieldsOptions["capabilities"]} PluginFieldCapabilities */
+
+/** @satisfies {PluginFieldCapabilities} */
 const pluginCapabilities = {
   driver: { id: "codex-plugin", implementation: "occ/codex-plugin" },
   approvers: { agent: true, plugin: false, tools: false },
@@ -211,16 +221,21 @@ const slackTool = {
   name: "slack_search_public",
   ownerId: slackPluginId,
 };
+const manageWorkspacePlugins = {
+  label: "Manage workspace plugins",
+  url: "https://chatgpt.com/admin/plugins?catalog=GLOBAL",
+};
+const ocePluginSetup = {
+  label: "OCE plugin setup",
+  url: "https://github.com/openclaw/openclaw-enterprise/blob/main/docs/reference/drivers/plugin-bundled.md#selection-and-catalogs",
+};
 const pluginSetup = {
   message:
     "App connection status is not verified. Catalog availability does not confirm linked credentials. In ChatGPT admin, select the same workspace as this credential and enable plugin and app access for its user or service account. For service-account plugin credentials, open Service accounts, choose the account, and configure its app connections. Workspace administrator access is required. OCE policies do not grant access or configure credentials. Reload plugins after changes.",
   links: [
-    { label: "Manage workspace plugins", url: "https://chatgpt.com/admin/plugins?catalog=GLOBAL" },
+    manageWorkspacePlugins,
     { label: "Service account credentials", url: "https://admin.openai.com/" },
-    {
-      label: "OCE plugin setup",
-      url: "https://github.com/openclaw/openclaw-enterprise/blob/main/docs/reference/drivers/plugin-bundled.md#selection-and-catalogs",
-    },
+    ocePluginSetup,
   ],
 };
 const unavailablePlugins = [
@@ -231,7 +246,7 @@ const unavailablePlugins = [
     available: false,
     unavailableReason:
       "This plugin requires local components or skills that OCE hosted discovery does not support. Changing ChatGPT access will not enable it here.",
-    unavailableHelp: pluginSetup.links[2],
+    unavailableHelp: ocePluginSetup,
     tools: null,
   },
   {
@@ -241,7 +256,7 @@ const unavailablePlugins = [
     available: false,
     unavailableReason:
       "Disabled by a ChatGPT workspace administrator. Ask one to enable access for the user or service account behind this token.",
-    unavailableHelp: pluginSetup.links[0],
+    unavailableHelp: manageWorkspacePlugins,
     tools: null,
   },
   {
@@ -251,7 +266,7 @@ const unavailablePlugins = [
     available: false,
     unavailableReason:
       "This workspace's plan is not eligible for this plugin. Ask a ChatGPT workspace administrator to review plan availability.",
-    unavailableHelp: pluginSetup.links[0],
+    unavailableHelp: manageWorkspacePlugins,
     tools: null,
   },
 ];
@@ -311,41 +326,50 @@ const devdayCuratedEntries = codexPluginSuggestions.map((suggestion) => {
         : [],
   };
 });
+const calendarPlugin = {
+  id: "codex-plugin:calendar@openai-curated-remote",
+  remoteId: "plugin_demo_calendar",
+  name: "Calendar",
+  logoUrl: "/storybook-fixtures/plugin-logos/calendar.svg",
+  websiteUrl: "https://example.com/calendar",
+  privacyPolicyUrl: "https://example.com/calendar/privacy",
+  termsOfServiceUrl: "https://example.com/calendar/terms",
+  description: "Find events and manage a team calendar.",
+  available: true,
+  tools: [
+    {
+      id: "app_calendar/list_events",
+      name: "List events",
+      ownerId: "app_calendar",
+      description: "Find events in a calendar and date range.",
+    },
+    {
+      id: "app_calendar/create_event",
+      name: "Create event",
+      ownerId: "app_calendar",
+      description: "Create a calendar event with a title, time, and attendees.",
+    },
+    {
+      id: "app_calendar/delete_event",
+      name: "Delete event",
+      ownerId: "app_calendar",
+      description: "Remove an existing calendar event.",
+    },
+  ],
+};
+const projectTrackerPlugin = {
+  id: "codex-plugin:project-tracker@openai-curated-remote",
+  remoteId: "plugin_demo_project_tracker",
+  name: "Project tracker",
+  logoUrl: "/storybook-fixtures/plugin-logos/missing.svg",
+  tools: null,
+};
+/** @satisfies {PluginFieldCatalog} */
 const pluginCatalog = {
   status: "ready",
   setup: pluginSetup,
   entries: [
-    {
-      id: "codex-plugin:calendar@openai-curated-remote",
-      remoteId: "plugin_demo_calendar",
-      name: "Calendar",
-      logoUrl: "/storybook-fixtures/plugin-logos/calendar.svg",
-      websiteUrl: "https://example.com/calendar",
-      privacyPolicyUrl: "https://example.com/calendar/privacy",
-      termsOfServiceUrl: "https://example.com/calendar/terms",
-      description: "Find events and manage a team calendar.",
-      available: true,
-      tools: [
-        {
-          id: "app_calendar/list_events",
-          name: "List events",
-          ownerId: "app_calendar",
-          description: "Find events in a calendar and date range.",
-        },
-        {
-          id: "app_calendar/create_event",
-          name: "Create event",
-          ownerId: "app_calendar",
-          description: "Create a calendar event with a title, time, and attendees.",
-        },
-        {
-          id: "app_calendar/delete_event",
-          name: "Delete event",
-          ownerId: "app_calendar",
-          description: "Remove an existing calendar event.",
-        },
-      ],
-    },
+    calendarPlugin,
     {
       id: "codex-plugin:documents@openai-curated-remote",
       remoteId: "plugin_demo_documents",
@@ -366,13 +390,7 @@ const pluginCatalog = {
         },
       ],
     },
-    {
-      id: "codex-plugin:project-tracker@openai-curated-remote",
-      remoteId: "plugin_demo_project_tracker",
-      name: "Project tracker",
-      logoUrl: "/storybook-fixtures/plugin-logos/missing.svg",
-      tools: null,
-    },
+    projectTrackerPlugin,
     ...unavailablePlugins,
   ],
 };
@@ -414,7 +432,7 @@ const pluginPreviewGap =
 const pluginDiscovery = {
   pages: {
     initial: {
-      plugins: [...unavailablePlugins, { ...pluginCatalog.entries[0], tools: null }],
+      plugins: [...unavailablePlugins, { ...calendarPlugin, tools: null }],
       nextCursor: "demo-page-2",
       setup: pluginSetup,
     },
@@ -426,10 +444,11 @@ const pluginDiscovery = {
   },
   details: Object.fromEntries(pluginCatalog.entries.map((entry) => [entry.remoteId, entry])),
 };
+/** @satisfies {PluginFieldCatalog} */
 const devdayPluginCatalog = {
   status: "ready",
   setup: pluginSetup,
-  entries: [...devdayCuratedEntries, pluginCatalog.entries[0]],
+  entries: [...devdayCuratedEntries, calendarPlugin],
 };
 const devdayPluginDiscovery = {
   pages: {
@@ -513,6 +532,8 @@ const devdayCreateCheckpoint = [
   { selector: "#slack-secret-slack-bot-token", value: "sec_devday_slack_bot_token" },
   click("Apply channel settings"),
   click("Create Agent"),
+  { text: "devday claw" },
+  { selector: '.agent-tabs button[role="tab"][aria-controls$="-deployment-panel"]', click: true },
   { selector: ".deployment-status" },
 ];
 const devdayAdminCheckpoint = [
@@ -528,260 +549,7 @@ const shareExistingPerson = [
 
 // Page failures use the HTTP boundary; isolated component previews receive their input state.
 export const scenarios = {
-  secrets: {
-    group: "Pages/Secrets",
-    name: "Populated",
-    path: "/console/secrets",
-    description:
-      "The library shows names and IDs. The privacy notice explains why stored values are never returned. Simulated UI proof.",
-    steps: [
-      "Search by name or ID. Tab to a result and press Enter; its dialog names the Namespace and lists consumers.",
-      "Create a Secret with a dummy value, replace it, then delete it. Switch Namespace to inspect isolation in navigation.",
-    ],
-  },
-  secretsMobile: {
-    group: "Pages/Secrets",
-    name: "Mobile",
-    path: "/console/secrets",
-    mobile: true,
-    actions: [{ selector: "#secret-search", value: "sec_demo_model" }],
-    description:
-      "Compare the same 390 × 844 page with one search result, then with a list that scrolls.",
-    steps: [
-      "Open the one Secret, then Replace value. The top bar, dimmed page and sheet reach the right edge, with no empty strip. Press Escape without entering a value.",
-      "Clear Search Secrets, scroll to the last Secret and open it. The sheet reaches the available edge: beside a classic scrollbar, or under an overlay scrollbar. Escape returns focus to that Secret.",
-    ],
-  },
-  secretsSearch: {
-    group: "Pages/Secrets",
-    name: "No search matches",
-    path: "/console/secrets",
-    actions: [{ selector: '[aria-label="Search Secrets"]', value: "no-such-secret" }],
-    description: "Clear the search to see the Secrets in this Namespace again.",
-  },
-  secretsEmpty: {
-    group: "Pages/Secrets",
-    name: "Empty",
-    path: "/console/secrets",
-    emptySecrets: true,
-    description: "An authorized list without Secrets offers creation.",
-  },
-  secretsLoading: {
-    group: "Pages/Secrets",
-    name: "Loading",
-    path: "/console/secrets",
-    rules: [{ path: presetSecretsPath, hold: true }],
-    description: "Namespace admission succeeds while the Secret list is still loading.",
-  },
-  secretsUnavailable: {
-    group: "Pages/Secrets",
-    name: "Read unavailable",
-    path: "/console/secrets",
-    rules: [{ path: presetSecretsPath, status: 503 }],
-    description: "A failed Secret collection read shows recovery, with no stale rows.",
-  },
-  secretsNoNamespace: {
-    group: "Pages/Secrets",
-    name: "No readable Namespace",
-    path: "/console/secrets",
-    emptyNamespaces: true,
-    description: "Secret requests require an admitted Namespace selection.",
-  },
-  secretsNamespaceNotReady: {
-    group: "Pages/Secrets",
-    name: "Namespace provisioning",
-    path: "/console/secrets",
-    namespaceStatus: "provisioning",
-    description: "Metadata stays readable; creation and replacement wait for Namespace readiness.",
-  },
-  secretsCreate: {
-    group: "Pages/Secrets",
-    name: "Create",
-    path: "/console/secrets",
-    actions: [click("Create Secret")],
-    description:
-      "The header identifies the Namespace. The form preserves whitespace and explains that you can replace a saved value but cannot retrieve it.",
-    steps: [
-      "Enter a name and a dummy value. Use Show value beside the Value label, then hide it again.",
-      "Press Enter from Secret name to submit. After the save, Close is the only dialog action.",
-    ],
-  },
-  secretsMissingValue: {
-    group: "Pages/Secrets",
-    name: "Missing value",
-    path: "/console/secrets",
-    actions: [
-      click("Create Secret"),
-      { selector: "#secret-name", value: "Team API key" },
-      { selector: 'dialog button[type="submit"]', click: true },
-    ],
-    description: "Required-value errors remain beside their field; no request is sent.",
-  },
-  secretsCreateNotPermitted: {
-    group: "Pages/Secrets",
-    name: "Create not permitted",
-    path: "/console/secrets",
-    secretCreateNotPermitted: true,
-    description:
-      "The caller's access does not include Secret creation. Create Secret is disabled and the note under the toolbar names the reason.",
-    steps: [
-      "Tab to Create Secret. It takes focus and looks unavailable, a screen reader names the note as its description, and Enter, Space or a click opens nothing.",
-    ],
-  },
-  secretsCreateDenied: {
-    group: "Pages/Secrets",
-    name: "Create denied",
-    path: "/console/secrets",
-    denySecretCreate: true,
-    actions: [
-      click("Create Secret"),
-      { selector: "#secret-name", value: "Team API key" },
-      { selector: "#secret-value", value: "synthetic-story-value" },
-      { selector: 'dialog button[type="submit"]', click: true },
-    ],
-    description:
-      "The permission answer allowed creation, but the API refuses it (for example, a grant removed after the page loaded). The form clears the value, disables editing, and focuses Close.",
-    steps: [
-      "Tab to Secret name, Show value, Value and Create Secret. Each takes focus and looks unavailable, described by the refusal; typing, Enter, Space or a click sends nothing and the value stays masked (finding 2935).",
-      "Close the dialog. The page's Create Secret looks unavailable, described by the note under the toolbar that asks to select Refresh after access changes.",
-    ],
-  },
-  secretsUnknownSave: {
-    group: "Pages/Secrets",
-    name: "Unknown save outcome",
-    path: "/console/secrets",
-    rules: [{ path: presetSecretsPath, method: "POST", bodyError: true }],
-    actions: [
-      click("Create Secret"),
-      { selector: "#secret-name", value: "Team API key" },
-      { selector: "#secret-value", value: "synthetic-story-value" },
-      { selector: 'dialog button[type="submit"]', click: true },
-    ],
-    description:
-      "An unreadable reply leaves an amber warning that the outcome is unknown. The value is erased and this dialog cannot resubmit.",
-  },
-  secretsConsumers: {
-    group: "Pages/Secrets",
-    name: "Consumers and restricted references",
-    path: "/console/secrets",
-    secretConsumers: {
-      agents: [
-        "agt_00000000-0000-4000-8000-000000000001",
-        "agt_00000000-0000-4000-8000-000000000099",
-      ],
-      configurations: ["cfg_00000000-0000-4000-8000-000000000001"],
-      credentialSources: [],
-      provisioningRequests: [],
-      unreadable: 2,
-      truncated: true,
-    },
-    actions: [click("Demo model API key (simulated)")],
-    description:
-      "The readable Agent keeps its link. A previously listed Agent shows no identity or link and asks you to reopen the Secret to check again. Hidden count, incomplete-list warning and disabled deletion remain. Simulated UI proof.",
-  },
-  secretsReadOnly: {
-    group: "Pages/Secrets",
-    name: "Read only for this caller",
-    path: "/console/secrets",
-    secretCallerPermissions: { update: false, delete: false },
-    secretConsumers: {
-      agents: ["agt_00000000-0000-4000-8000-000000000001"],
-      configurations: [],
-      credentialSources: [],
-      provisioningRequests: [],
-      unreadable: 0,
-      truncated: false,
-    },
-    actions: [click("Demo model API key (simulated)")],
-    description:
-      "The Secret read says this caller may neither replace nor delete the Secret. Both buttons are disabled before any typing, and each names its reason. Consumers name the Agent, with its ID beside it. Simulated UI proof.",
-    steps: [
-      "Tab to Replace value and Delete Secret. Each takes focus and looks unavailable. Replace value is described by its note; Delete Secret by the blocked-deletion sentence and its note. Enter, Space or a click opens nothing.",
-    ],
-    gap: "The answer is advisory. The controller still authorizes each write.",
-  },
-  secretsLinkUnlisted: {
-    group: "Pages/Secrets",
-    name: "Link to an unlisted Secret",
-    path: "/console/secrets?secret=sec_not_listed",
-    description:
-      "A link to a Secret the readable list leaves out opens no dialog. For a member, a note says it may not exist or the caller may not read it, and who grants read. This simulated caller administers the Installation, so the note says only that no such Secret is in the readable list. Nothing reads the Secret.",
-  },
-  secretsReplace: {
-    group: "Pages/Secrets",
-    name: "Replace value",
-    path: "/console/secrets",
-    actions: [click("Demo model API key (simulated)"), click("Replace value")],
-    description:
-      "Replacement preserves the reference and explains deployment and CredentialSource handoff. Existing values are never loaded.",
-  },
-  secretsReplaceDenied: {
-    group: "Pages/Secrets",
-    name: "Replace denied",
-    path: "/console/secrets",
-    rules: [{ suffix: "/secrets/sec_demo_model", method: "PATCH", status: 403, code: "FORBIDDEN" }],
-    actions: [
-      click("Demo model API key (simulated)"),
-      click("Replace value"),
-      { selector: "#secret-value", value: "synthetic-story-value" },
-      { selector: 'dialog button[type="submit"]', click: true },
-    ],
-    description: "A denied replacement clears the value, disables editing, and focuses Close.",
-  },
-  secretsDelete: {
-    group: "Pages/Secrets",
-    name: "Delete confirmation",
-    path: "/console/secrets",
-    actions: [click("Demo model API key (simulated)"), click("Delete Secret")],
-    description:
-      "Permanent storage deletion requires confirmation and explains upstream revocation and previously delivered values.",
-  },
-  secretsDeleteConflict: {
-    group: "Pages/Secrets",
-    name: "Concurrent reference conflict",
-    path: "/console/secrets",
-    rules: [
-      {
-        suffix: "/secrets/sec_demo_model",
-        method: "DELETE",
-        status: 409,
-        code: "RESOURCE_CONFLICT",
-        message:
-          "The Secret is still referenced by Agent agt_00000000-0000-4000-8000-000000000001. Remove those references first.",
-      },
-    ],
-    actions: [
-      click("Demo model API key (simulated)"),
-      click("Delete Secret"),
-      click("Permanently delete Secret"),
-    ],
-    description:
-      "A newly added reference can refuse deletion after the detail read. Reopen the detail to inspect current consumers.",
-    steps: [
-      "Tab to Permanently delete Secret. It takes focus and looks unavailable, described by the refusal; Enter, Space or a click sends nothing (finding 2935).",
-    ],
-  },
-  secretsDeletionUnconfirmed: {
-    group: "Pages/Secrets",
-    name: "Deletion could not be confirmed",
-    path: "/console/secrets",
-    rules: [
-      { suffix: "/secrets/sec_demo_model", method: "DELETE", bodyError: true },
-      {
-        suffix: "/secrets/sec_demo_model",
-        skip: 1,
-        data: { id: "sec_different", name: "Different Secret (simulated)" },
-      },
-    ],
-    actions: [
-      click("Demo model API key (simulated)"),
-      click("Delete Secret"),
-      click("Permanently delete Secret"),
-      click("Check deletion status"),
-    ],
-    description:
-      "The delete response was lost, then the status check returned a different Secret. The dialog leaves the outcome unknown and offers no second Delete.",
-  },
+  ...secretsScenarios({ presetSecretsPath, click }),
 
   runtimeImages: {
     group: "Pages/Navigation",
@@ -831,250 +599,7 @@ export const scenarios = {
       "Browse pages, component states, and guided Agent workflows. Every preview mounts the production console modules and styles in its own frame. Reset story discards all local changes.",
     gap: "Stop Agent requests the stopped desired state; deployment resumes an Agent. Namespace provisioning, Preset management, and experimental Backend setup require an API, CLI, or operator workflow. Serving health and model responses require separate runtime verification.",
   },
-  login: {
-    group: "Pages/Sign in",
-    name: "Signed out",
-    path: "/console/login",
-    signedOut: true,
-    buildRevision: "1234567890abcdef1234567890abcdef12345678",
-    description:
-      "The email and password form, and a footer naming the build. Any nonempty demo email/password signs into this fixture.",
-  },
-  githubLogin: {
-    group: "Pages/Sign in",
-    name: "GitHub enabled",
-    path: "/console/login",
-    signedOut: true,
-    githubEnabled: true,
-    description:
-      "Provider discovery adds Continue with GitHub beside the password form. Clicking it demonstrates an unavailable provider; this fixture never navigates to GitHub.",
-    steps: [
-      "Check the GitHub icon and label, then select the button to see the unavailable message.",
-    ],
-    gap: "An administrator must attach the numeric GitHub identity to an existing account through the API. Enrollment, account creation, and recovery administration have no console controls. OAuth navigation and session issuance require backend verification.",
-  },
-  githubUnavailable: {
-    group: "Pages/Sign in",
-    name: "GitHub unavailable",
-    path: "/console/login",
-    signedOut: true,
-    githubEnabled: true,
-    actions: [click("Continue with GitHub")],
-    description: "A failed GitHub start leaves password sign-in and a deliberate retry available.",
-  },
-  githubRateLimited: {
-    group: "Pages/Sign in",
-    name: "GitHub rate limited",
-    path: "/console/login",
-    signedOut: true,
-    githubEnabled: true,
-    rules: [{ path: "/api/auth/providers/github/start", method: "POST", status: 429 }],
-    actions: [click("Continue with GitHub")],
-    description: "Admission refusal asks the user to wait without automatically retrying.",
-  },
-  recoveryOnlyLogin: {
-    group: "Pages/Sign in",
-    name: "Recovery-only password",
-    path: "/console/login",
-    signedOut: true,
-    githubEnabled: true,
-    googleEnabled: true,
-    passwordRecoveryOnly: true,
-    description:
-      "With OCC_AUTH_PASSWORD_SIGN_IN=recovery-only, ordinary accounts continue with GitHub or Google. The password form stays behind Recovery sign-in for the recovery account.",
-  },
-  recoveryOnlyForm: {
-    group: "Pages/Sign in",
-    name: "Recovery sign-in form",
-    path: "/console/login",
-    signedOut: true,
-    githubEnabled: true,
-    passwordRecoveryOnly: true,
-    rules: [{ path: "/api/auth/sign-in/email", method: "POST", status: 401 }],
-    actions: [
-      click("Recovery sign-in"),
-      { selector: "#username", value: "member@example.com" },
-      { selector: "#password", value: "demo-only" },
-      click("Sign in"),
-    ],
-    description:
-      "Recovery sign-in reveals the password form. A refused password explains that only the recovery account can use one.",
-  },
-  recoveryOnlyCallbackRejected: {
-    group: "Pages/Sign in",
-    name: "Recovery-only GitHub callback rejected",
-    path: "/console/?authError=github",
-    signedOut: true,
-    githubEnabled: true,
-    passwordRecoveryOnly: true,
-    description:
-      "Without a password to fall back on, a rejected callback points the user to an administrator.",
-  },
-  githubCallbackRejected: {
-    group: "Pages/Sign in",
-    name: "GitHub callback rejected",
-    path: "/console/?authError=github",
-    signedOut: true,
-    githubEnabled: true,
-    description:
-      "A rejected callback shows the generic sign-in error and keeps password recovery available.",
-  },
-  githubResultRejected: {
-    group: "Pages/Sign in",
-    name: "GitHub result not confirmed",
-    path: "/console/",
-    pendingGithubAttempt: true,
-    githubEnabled: true,
-    rules: [{ path: "/api/auth/providers/github/result", method: "POST", status: 401 }],
-    description:
-      "The tab that started GitHub sign-in could not confirm that the current session is the one its attempt created, so it shows the sign-in error instead of adopting that session.",
-  },
-  googleLogin: {
-    group: "Pages/Sign in",
-    name: "Google enabled",
-    path: "/console/login",
-    signedOut: true,
-    githubEnabled: true,
-    googleEnabled: true,
-    description:
-      "Provider discovery adds Continue with Google beside the password form and any other configured provider. Clicking it demonstrates an unavailable provider; this fixture never navigates to Google.",
-    steps: [
-      "Check the Google and GitHub icons and labels, then select either button to see the unavailable message.",
-    ],
-    gap: "An administrator must attach the Google subject identifier to an existing account through the API. Email addresses never match an account. OAuth navigation and session issuance require backend verification.",
-  },
-  googleUnavailable: {
-    group: "Pages/Sign in",
-    name: "Google unavailable",
-    path: "/console/login",
-    signedOut: true,
-    googleEnabled: true,
-    actions: [click("Continue with Google")],
-    description: "A failed Google start leaves password sign-in and a deliberate retry available.",
-  },
-  googleCallbackRejected: {
-    group: "Pages/Sign in",
-    name: "Google callback rejected",
-    path: "/console/?authError=google",
-    signedOut: true,
-    googleEnabled: true,
-    description:
-      "A rejected Google callback shows the generic sign-in error and keeps password recovery available.",
-  },
-  googleAccountDisabled: {
-    group: "Pages/Sign in",
-    name: "Google account disabled",
-    path: "/console/?authError=google&authReason=account-disabled",
-    signedOut: true,
-    googleEnabled: true,
-    description:
-      "Google authenticated an identity attached to a disabled account, so the page says the account is disabled and names an administrator, not a retry, password or identity attach.",
-  },
-  recoveryOnlyAccountDisabled: {
-    group: "Pages/Sign in",
-    name: "Recovery-only account disabled",
-    path: "/console/?authError=github&authReason=account-disabled",
-    signedOut: true,
-    githubEnabled: true,
-    passwordRecoveryOnly: true,
-    description:
-      "With recovery-only password sign-in, a disabled account's GitHub sign-in gives the same administrator advice.",
-  },
-  recoveryOnlyProviderUnavailable: {
-    group: "Pages/Sign in",
-    name: "Recovery-only provider outage",
-    path: "/console/?authError=github&authReason=provider-unavailable",
-    signedOut: true,
-    githubEnabled: true,
-    passwordRecoveryOnly: true,
-    description:
-      "The provider could not answer or refused the client, so the page says sign-in is unavailable right now and points administrators to Recovery sign-in, not to an identity attach.",
-  },
-  googleResultRejected: {
-    group: "Pages/Sign in",
-    name: "Google result not confirmed",
-    path: "/console/",
-    pendingGoogleAttempt: true,
-    googleEnabled: true,
-    rules: [{ path: "/api/auth/providers/google/result", method: "POST", status: 401 }],
-    description:
-      "The tab that started Google sign-in could not confirm that the current session is the one its attempt created, so it shows the sign-in error instead of adopting that session.",
-  },
-  providerDiscoveryUnavailable: {
-    group: "Pages/Sign in",
-    name: "Provider discovery unavailable",
-    path: "/console/login",
-    signedOut: true,
-    rules: [{ path: "/api/auth/providers", status: 503 }],
-    description:
-      "Failed provider discovery leaves the password form usable without provider buttons.",
-  },
-  loginError: {
-    group: "Pages/Sign in",
-    name: "Invalid credentials",
-    path: "/console/login",
-    signedOut: true,
-    rules: [{ path: "/api/auth/sign-in/email", method: "POST", status: 401 }],
-    actions: submitPassword,
-    description: "A rejected sign-in leaves the form available for retry.",
-  },
-  passwordSignInUnconfirmed: {
-    group: "Pages/Sign in",
-    name: "Password sign-in unconfirmed",
-    path: "/console/login",
-    signedOut: true,
-    rules: [{ path: "/api/auth/sign-in/email", method: "POST", bodyError: true }],
-    actions: submitPassword,
-    description:
-      "An interrupted password response leaves the result unknown. Reload to check the session before entering the password again.",
-  },
-  expired: {
-    group: "Pages/Sign in",
-    name: "Session expired",
-    path: draft,
-    signedOut: true,
-    expiredSession: true,
-    description:
-      "A protected deep link in a tab whose session expired says so, redirects to sign-in and retains the return destination.",
-    steps: [
-      "Sign in with the fixture credentials and confirm the Agent draft page returns.",
-      "Confirm no draft is saved or deployment started by signing in.",
-    ],
-  },
-  firstVisit: {
-    group: "Pages/Sign in",
-    name: "Deep link, first visit",
-    path: draft,
-    signedOut: true,
-    description:
-      "A first visit to a protected deep link asks to sign in without saying a session expired, and retains the return destination.",
-    steps: ["Sign in with the fixture credentials and confirm the Agent draft page returns."],
-  },
-  sessionUnavailable: {
-    group: "Pages/Sign in",
-    name: "Session unavailable",
-    rules: [{ path: "/api/auth/session", status: 503 }],
-    description: "The console cannot verify the session. Private data stays hidden.",
-  },
-  loading: {
-    group: "Pages/Sign in",
-    name: "Checking session",
-    rules: [{ path: "/api/auth/session", hold: true }],
-    description:
-      "Reload with the entry script throttled: “Loading OpenClaw Enterprise…” appears before it runs, then becomes “Checking session…” in the same place.",
-    steps: [
-      "Check that neither console navigation nor a sign-in form appears while the session is unknown.",
-      "Wait for Session unavailable, then choose Retry to repeat the check.",
-    ],
-  },
-  logoutFailure: {
-    group: "Pages/Sign in",
-    name: "Sign-out unconfirmed",
-    rules: [{ path: "/api/auth/sign-out", method: "POST", status: 503 }],
-    actions: [...account, click("Sign out")],
-    description:
-      "Failed sign-out with a still-active session hides private content until revocation can be confirmed.",
-  },
+  ...signInScenarios({ draft, click, account }),
   agents: {
     group: "Pages/Agents",
     name: "Populated",
@@ -1680,430 +1205,8 @@ export const scenarios = {
     description:
       "A caller without Installation access is told Backends apply to the whole Installation. The Namespace selector is hidden, since another Namespace would not change the answer.",
   },
-  namespaces: {
-    group: "Pages/Namespaces",
-    name: "Ready and provisioning",
-    path: "/console/namespaces",
-    description:
-      "Installation-wide Namespace cards and Create Namespace, without a Namespace selector. Each card opens that Namespace's Agents; status badges read Ready or Provisioning.",
-    steps: [
-      "Select Create Namespace, enter a unique name, and submit. The success dialog explains provisioning; Open Agents selects the created Namespace.",
-      "Reset, then cancel a new form with Escape. No Namespace is created and focus returns to Create Namespace.",
-    ],
-  },
-  namespaceDelete: {
-    group: "Pages/Namespaces",
-    name: "Delete Namespace",
-    path: "/console/namespaces",
-    emptyAgents: true,
-    namespaceDeleteOutcome: "complete",
-    description:
-      "Use the same trash icon as the Agents table, confirm the exact Namespace, and watch simulated cleanup finish.",
-    steps: [
-      "Select Engineering's trash icon, then Delete Namespace. The row stays Deleting until the next status reads confirm removal.",
-    ],
-  },
-  namespaceDeleteConfirmation: {
-    group: "Pages/Namespaces",
-    name: "Delete confirmation",
-    path: "/console/namespaces",
-    namespaceDeleteOutcome: "complete",
-    actions: [{ selector: '[aria-label="Delete Engineering"]', click: true }],
-    description:
-      "The confirmation identifies the Namespace and explains reserved names, asynchronous cleanup, and default Presets. Cancel restores focus to the trash icon.",
-  },
-  namespaceDeleteMobile: {
-    group: "Pages/Namespaces",
-    name: "Delete confirmation mobile",
-    path: "/console/namespaces",
-    mobile: true,
-    namespaceDeleteOutcome: "complete",
-    actions: [{ selector: '[aria-label="Delete Engineering"]', click: true }],
-    description: "The same confirmation becomes a bottom sheet at phone width.",
-  },
-  namespaceDeleteBlocked: {
-    group: "Pages/Namespaces",
-    name: "Delete blocked by resources",
-    path: "/console/namespaces",
-    namespaceDeleteOutcome: "blocked",
-    actions: [
-      { selector: '[aria-label="Delete Engineering"]', click: true },
-      { click: "Delete Namespace" },
-    ],
-    description:
-      "A simulated NAMESPACE_NOT_EMPTY response names remaining resources the caller can read and counts the rest. Open Agents or Secrets, or inspect Configuration cleanup commands.",
-  },
-  namespaceDeleteDenied: {
-    group: "Pages/Namespaces",
-    name: "Delete permission denied",
-    path: "/console/namespaces",
-    namespaceDeleteDenied: true,
-    description:
-      "A member's advisory permission answer refuses deletion. The trash icon looks disabled and its reason says only an Installation administrator can delete a Namespace.",
-  },
-  namespaceDeleteRestricted: {
-    group: "Pages/Namespaces",
-    name: "Delete blocked by a Restriction",
-    path: "/console/namespaces",
-    namespaceDeleteRestricted: true,
-    description:
-      "An Installation administrator whom a deny Restriction keeps from deleting the Namespace. The reason names the Restriction and who can lift it, not an administrator to ask.",
-    gap: "The permission answer is advisory. The controller still authorizes each delete.",
-  },
-  namespaceDeleteRefused: {
-    group: "Pages/Namespaces",
-    name: "Delete permission changed",
-    path: "/console/namespaces",
-    namespaceDeleteOutcome: "forbidden",
-    actions: [
-      { selector: '[aria-label="Delete Engineering"]', click: true },
-      { click: "Delete Namespace" },
-    ],
-    description:
-      "A write can still be refused after the advisory read. The row shows the reason and request ID.",
-  },
-  namespaceDeletePending: {
-    group: "Pages/Namespaces",
-    name: "Delete request pending",
-    path: "/console/namespaces",
-    namespaceDeleteOutcome: "pending",
-    actions: [
-      { selector: '[aria-label="Delete Engineering"]', click: true },
-      { click: "Delete Namespace" },
-    ],
-    description:
-      "The pending write blocks dismissal and navigation. Its timeout requires a status read before another attempt.",
-  },
-  namespaceDeleteUnknown: {
-    group: "Pages/Namespaces",
-    name: "Delete outcome unknown",
-    path: "/console/namespaces",
-    namespaceDeleteOutcome: "unknown",
-    actions: [
-      { selector: '[aria-label="Delete Engineering"]', click: true },
-      { click: "Delete Namespace" },
-    ],
-    description:
-      "An unconfirmed write requires Refresh status. The Console does not replay deletion or assume it started.",
-  },
-  namespaceDeleteRetry: {
-    group: "Pages/Namespaces",
-    name: "Delete cleanup recovery",
-    path: "/console/namespaces",
-    namespaceStatus: "deleting",
-    namespaceDeleteOutcome: "stalled",
-    description:
-      "An existing deleting Namespace keeps status and deliberate retry controls. Only the backend decides whether retry is allowed.",
-  },
-  namespacesUnavailable: {
-    group: "Pages/Namespaces",
-    name: "Unavailable selection",
-    path: "/console/namespaces?namespace=ns_00000000-0000-4000-8000-000000000099",
-    description:
-      "Recover from a stale Namespace URL using the selector inside the message, which says the Namespace is missing or not readable.",
-    steps: [
-      "Choose Engineering under Choose a valid Namespace; the URL changes and the warning disappears without leaving Namespaces.",
-      "Use browser Back to return to the unavailable selection and recover again.",
-    ],
-  },
-  namespacesUnavailableMobile: {
-    group: "Pages/Namespaces",
-    name: "Unavailable selection mobile",
-    path: "/console/namespaces?namespace=ns_00000000-0000-4000-8000-000000000099",
-    mobile: true,
-    description: "Recover inline at 390px without opening navigation.",
-  },
-  namespacesUnavailableEmpty: {
-    group: "Pages/Namespaces",
-    name: "Unavailable selection without access",
-    path: "/console/namespaces?namespace=ns_00000000-0000-4000-8000-000000000099",
-    emptyNamespaces: true,
-    description: "No readable alternatives: show access guidance instead of a selection action.",
-  },
-  namespacesEmpty: {
-    group: "Pages/Namespaces",
-    name: "Empty",
-    path: "/console/namespaces",
-    emptyNamespaces: true,
-    description:
-      "No readable Namespaces. Create Namespace remains available; the API decides whether creation is permitted.",
-  },
-  namespacesEmptyMember: {
-    group: "Pages/Namespaces",
-    name: "Empty for a member",
-    path: "/console/namespaces",
-    emptyNamespaces: true,
-    observabilityDenied: true,
-    description:
-      "A person who does not administer the Installation gets Create Namespace as a secondary action and is told to ask an administrator. A Namespace create grant still works from it.",
-  },
-  namespaceCreateRefused: {
-    group: "Pages/Namespaces",
-    name: "Create refused, then closed",
-    path: "/console/namespaces",
-    emptyNamespaces: true,
-    observabilityDenied: true,
-    rules: [{ path: "/namespaces", method: "POST", status: 403, code: "FORBIDDEN" }],
-    actions: [
-      { click: "Create Namespace", focus: true },
-      { selector: "#namespace-name", value: "Support" },
-      { selector: 'dialog button[type="submit"]', click: true },
-      { click: "Cancel" },
-    ],
-    description:
-      "After the API refuses creation, the page disables Create Namespace, says why, and focuses that reason. Refresh or a browser reload offers creation again.",
-    steps: [
-      "Tab to Create Namespace. It takes focus and looks unavailable, described by the refusal; Enter, Space or a click opens nothing.",
-    ],
-  },
-  namespaceCreate: {
-    group: "Pages/Namespaces",
-    name: "Create Namespace",
-    path: "/console/namespaces",
-    actions: [{ click: "Create Namespace", focus: true }],
-    description:
-      "A name-only dialog uses the shared field and modal patterns. No credentials or infrastructure configuration are required in this form.",
-    steps: [
-      "Enter a unique name and create. Inspect the provisioning explanation, then select Done to see the new Namespace or Open Agents to use it.",
-    ],
-  },
-  namespaceCreateMobile: {
-    group: "Pages/Namespaces",
-    name: "Create Namespace on mobile",
-    path: "/console/namespaces",
-    mobile: true,
-    emptyNamespaces: true,
-    actions: [{ click: "Create Namespace", focus: true }],
-    description:
-      "The empty list offers creation. On a phone the form becomes a bottom sheet with reachable actions.",
-  },
-  namespaceCreateRequired: {
-    group: "Pages/Namespaces",
-    name: "Create name required",
-    path: "/console/namespaces",
-    actions: [
-      { click: "Create Namespace", focus: true },
-      { selector: 'dialog button[type="submit"]', click: true },
-    ],
-    description:
-      "Submitting an empty name shows a persistent inline error and focuses the field without sending a request.",
-  },
-  namespaceCreateInvalidName: {
-    group: "Pages/Namespaces",
-    name: "Create invalid name",
-    path: "/console/namespaces",
-    actions: [
-      { click: "Create Namespace", focus: true },
-      { selector: "#namespace-name", value: "Support\tteam" },
-    ],
-    description:
-      "A pasted tab is refused at the field as it arrives, by the API's own Name rule, before any request. More than 200 characters is refused the same way instead of being cut.",
-  },
-  namespaceCreateConflict: {
-    group: "Pages/Namespaces",
-    name: "Create name conflict",
-    path: "/console/namespaces",
-    actions: [
-      { click: "Create Namespace", focus: true },
-      { selector: "#namespace-name", value: "Engineering" },
-      { selector: 'dialog button[type="submit"]', click: true },
-    ],
-    description:
-      "An existing name is refused. The entered name remains editable; choose another name and submit again.",
-  },
-  namespaceCreateDenied: {
-    group: "Pages/Namespaces",
-    name: "Create permission denied",
-    path: "/console/namespaces",
-    emptyNamespaces: true,
-    rules: [{ path: "/namespaces", method: "POST", status: 403, code: "FORBIDDEN" }],
-    actions: [
-      { click: "Create Namespace", focus: true },
-      { selector: "#namespace-name", value: "Support" },
-      { selector: 'dialog button[type="submit"]', click: true },
-    ],
-    description:
-      "A creation denial explains the missing Installation permission and disables resubmission. Cancel returns to the empty list.",
-    steps: [
-      "Tab to Namespace name and Create Namespace. Each takes focus and looks unavailable, described by the refusal; typing, Enter, Space or a click sends nothing (finding 2935).",
-    ],
-  },
-  namespaceCreatePending: {
-    group: "Pages/Namespaces",
-    name: "Create pending",
-    path: "/console/namespaces",
-    rules: [{ path: "/namespaces", method: "POST", hold: true }],
-    actions: [
-      { click: "Create Namespace", focus: true },
-      { selector: "#namespace-name", value: "Support" },
-      { selector: 'dialog button[type="submit"]', click: true },
-    ],
-    description:
-      "While creation waits, the field and actions are disabled and Escape cannot dismiss the form. After the client timeout, inspect the unknown-outcome recovery.",
-  },
-  namespaceCreateUnknown: {
-    group: "Pages/Namespaces",
-    name: "Create outcome unknown",
-    path: "/console/namespaces",
-    rules: [{ path: "/namespaces", method: "POST", status: 503, code: "DEPENDENCY_UNAVAILABLE" }],
-    actions: [
-      { click: "Create Namespace", focus: true },
-      { selector: "#namespace-name", value: "Support" },
-      { selector: 'dialog button[type="submit"]', click: true },
-    ],
-    description:
-      "An unconfirmed write blocks resubmission. Check Namespaces rereads the list before a deliberate new attempt; this fixture does not establish whether the write committed.",
-    steps: [
-      "Tab to Namespace name and Create Namespace. Each takes focus and looks unavailable, described by the Outcome unknown warning; Enter, Space or a click sends nothing (finding 2935).",
-    ],
-  },
-  namespaceCreateSuccess: {
-    group: "Pages/Namespaces",
-    name: "Namespace created",
-    path: "/console/namespaces",
-    actions: [
-      { click: "Create Namespace", focus: true },
-      { selector: "#namespace-name", value: "Support" },
-      { selector: 'dialog button[type="submit"]', click: true },
-    ],
-    description:
-      "Creation succeeded in the simulated fixture. The dialog distinguishes provisioning from readiness and offers the new Namespace's Agents.",
-  },
-  namespaceCreateUnreadable: {
-    group: "Pages/Namespaces",
-    name: "Created without read access",
-    path: "/console/namespaces",
-    emptyNamespaces: true,
-    // A create-only role: the authorized list never includes the new Namespace.
-    rules: [{ path: "/namespaces", data: [] }],
-    actions: [
-      { click: "Create Namespace", focus: true },
-      { selector: "#namespace-name", value: "Support" },
-      { selector: 'dialog button[type="submit"]', click: true },
-    ],
-    description:
-      "The caller may create Namespaces but not read them. The dialog says the Namespace was created and that their access does not include viewing it, and offers only Done.",
-  },
-  namespacesDenied: {
-    group: "Pages/Namespaces",
-    name: "Access denied",
-    path: "/console/namespaces",
-    rules: [{ path: "/namespaces", status: 403 }],
-    description:
-      "Namespace discovery is denied, as for an account whose access was removed. Private data stays hidden, and the panel offers Sign out beside Retry.",
-    steps: ["Choose Sign out and confirm the sign-in page replaces the panel."],
-  },
-  settings: {
-    group: "Pages/Settings",
-    name: "Account",
-    path: "/console/settings",
-    description:
-      "An account card with initials, name and email, and a Session card with Sign out. Administrators can inspect accepted startup fields or the same values as JSON, including redacted sections and an empty object. There are no editable settings in this release.",
-    steps: [
-      "Check that the page has no Namespace selector and that the account card shows initials, name and email.",
-      "Expand each Installation Driver below the cards. Read the human labels and raw keys; Credential Gateway shows binary paths, Sandbox shows nested fields and hidden resources, and IAM has no visible fields. Switch Fields / JSON and confirm the expanded groups stay open.",
-      "Choose Sign out in the Session card: “Signing out…” appears, then the sign-in page.",
-      "On a long page, scroll to the bottom and check that the sidebar background and operator profile reach it. At phone width, values fit and the existing navigation drawer still opens.",
-    ],
-  },
-  settingsModelProvider: {
-    group: "Pages/Settings",
-    name: "Shared model provider",
-    path: "/console/settings",
-    installationModelProvider: true,
-    description:
-      "Read the shared Compute provider as Fields and JSON. The same endpoint serves Codex and OpenClaw. These are simulated accepted Installation values; editing remains an operator configuration task.",
-    steps: [
-      "Expand Compute, then runtime and modelProvider.",
-      "Switch to JSON and confirm protocol and baseUrl.",
-      "No key or source routing field is present.",
-    ],
-  },
-  settingsDriverNestedValues: {
-    group: "Pages/Settings",
-    name: "Nested Driver values",
-    path: "/console/settings",
-    installationNestedValues: true,
-    description:
-      "A simulated package Driver has nested records, arrays, empty values and a writeOnly field. The API fixture returns its redaction marker, and the production renderer handles the safe JSON without a bundled schema-specific form. The expanded page exercises the shared sidebar beyond one viewport.",
-    steps: [
-      "Expand Configuration. Inspect groups, nested records, false, zero, null, empty arrays and objects, literal markup text, and the hidden value.",
-      "Switch to JSON and back to Fields. The values and expanded state remain unchanged.",
-      "Scroll to the bottom: the navigation background and profile reach the page bottom. At phone width, open and close the navigation drawer and check that fields fit the viewport.",
-    ],
-  },
-  settingsDriverValuesUnavailable: {
-    group: "Pages/Settings",
-    name: "Driver values unavailable",
-    path: "/console/settings",
-    installationValuesUnavailable: true,
-    description:
-      "These simulated Driver schemas mark the whole startup object writeOnly, so the API omits its values. Each expanded group explains that values are unavailable; schemas are not substituted.",
-    steps: ["Expand a Driver and check the unavailable message. No JSON Schema is shown."],
-  },
-  settingsDriverConfigurationsEmpty: {
-    group: "Pages/Settings",
-    name: "No Driver configurations",
-    path: "/console/settings",
-    rules: [{ path: "/installation/driver-configurations", data: { configurations: [] } }],
-    description: "Installation discovery succeeds without any selected Driver configurations.",
-    steps: ["Check the empty message beneath the Installation Driver configuration heading."],
-  },
-  settingsDriverConfigurationsLoading: {
-    group: "Pages/Settings",
-    name: "Driver configuration loading",
-    path: "/console/settings",
-    rules: [{ path: "/installation/driver-configurations", hold: true }],
-    description:
-      "Installation discovery is pending. The section shows a loading message until the normal client timeout reports the failed read.",
-  },
-  settingsDriverConfigurationsFailure: {
-    group: "Pages/Settings",
-    name: "Driver configuration unavailable",
-    path: "/console/settings",
-    rules: [{ path: "/installation/driver-configurations", status: 503 }],
-    description:
-      "Installation discovery fails. The section reports the read failure without exposing values or showing a schema fallback.",
-  },
-  settingsDriverConfigurationsDenied: {
-    group: "Pages/Settings",
-    name: "Driver configuration denied",
-    path: "/console/settings",
-    readOnlyPermissionSummary: true,
-    rules: [{ path: "/installation/driver-configurations", status: 403, code: "FORBIDDEN" }],
-    description:
-      "An account without Installation administration can still use Settings. The protected Driver section is absent after the refusal.",
-  },
-  settingsNameIsEmail: {
-    group: "Pages/Settings",
-    name: "Account without a display name",
-    path: "/console/settings",
-    // Sign-in providers that have no display name record the email as the name.
-    sessionUser: {
-      id: "storybook-operator",
-      name: "operator@example.com",
-      email: "operator@example.com",
-    },
-    description:
-      "An account whose recorded name is its email address. The account card names it once, by email.",
-    steps: [
-      "Check that the account card shows the initial O and operator@example.com under Email, with no Name row repeating the address.",
-      "Compare Account: a distinct display name still shows under Name.",
-    ],
-  },
-  settingsSignOutFailure: {
-    group: "Pages/Settings",
-    name: "Sign-out unconfirmed",
-    path: "/console/settings",
-    rules: [{ path: "/api/auth/sign-out", method: "POST", status: 503 }],
-    // The account menu's hidden Sign out comes first in the page, so name the card's button.
-    actions: [{ selector: ".settings-sign-out", click: true }],
-    description:
-      "Sign out from the Session card fails with the session still active: private content stays hidden until revocation can be confirmed.",
-    steps: [
-      "Choose Retry: it repeats the sign-out and keeps private content hidden until it succeeds.",
-    ],
-  },
+  ...namespacesScenarios,
+  ...settingsScenarios,
   notFound: {
     group: "Pages/Navigation",
     name: "Page not found",
@@ -2666,7 +1769,7 @@ export const scenarios = {
   pluginsAvailable: {
     group: "Components/Plugins",
     name: "Available catalog",
-    component: "plugins",
+    component: pluginsComponent,
     actions: [click("Configure plugins")],
     pluginCatalog,
     pluginCapabilities,
@@ -2688,7 +1791,7 @@ export const scenarios = {
   pluginsUnavailableReasonPopover: {
     group: "Components/Plugins",
     name: "Unavailable reason popover",
-    component: "plugins",
+    component: pluginsComponent,
     pluginCatalog,
     pluginCapabilities,
     actions: [
@@ -2708,7 +1811,7 @@ export const scenarios = {
   pluginsSelected: {
     group: "Components/Plugins",
     name: "Write approval and tool overrides",
-    component: "plugins",
+    component: pluginsComponent,
     pluginCatalog,
     pluginCapabilities,
     pluginSelections,
@@ -2731,7 +1834,7 @@ export const scenarios = {
   pluginsUnsupportedToolReviewer: {
     group: "Components/Plugins",
     name: "Unsupported saved tool reviewer",
-    component: "plugins",
+    component: pluginsComponent,
     pluginCatalog,
     pluginCapabilities,
     pluginSelections: JSON.stringify(
@@ -2760,9 +1863,12 @@ export const scenarios = {
   pluginsUnknownTools: {
     group: "Components/Plugins",
     name: "Tool catalog unavailable",
-    component: "plugins",
+    component: pluginsComponent,
     pluginCapabilities,
-    pluginCatalog: { status: "ready", entries: [pluginCatalog.entries[2]] },
+    pluginCatalog: /** @satisfies {PluginFieldCatalog} */ ({
+      status: "ready",
+      entries: [projectTrackerPlugin],
+    }),
     actions: [
       click("Configure plugins"),
       { selector: 'button[aria-label="Project tracker"]', click: true },
@@ -2774,10 +1880,10 @@ export const scenarios = {
   pluginsEmpty: {
     group: "Components/Plugins",
     name: "Empty catalog",
-    component: "plugins",
+    component: pluginsComponent,
     actions: [click("Configure plugins")],
     pluginCapabilities,
-    pluginCatalog: { status: "ready", entries: [] },
+    pluginCatalog: /** @satisfies {PluginFieldCatalog} */ ({ status: "ready", entries: [] }),
     description:
       "An empty catalog has an explicit empty state and keeps the JSON editor available.",
     gap: pluginPreviewGap,
@@ -2785,27 +1891,27 @@ export const scenarios = {
   pluginsLoading: {
     group: "Components/Plugins",
     name: "Catalog loading",
-    component: "plugins",
+    component: pluginsComponent,
     actions: [click("Configure plugins")],
     pluginCapabilities,
-    pluginCatalog: { status: "loading" },
+    pluginCatalog: /** @satisfies {PluginFieldCatalog} */ ({ status: "loading" }),
     description: "A pending catalog is distinct from a successful empty catalog.",
     gap: pluginPreviewGap,
   },
   pluginsDenied: {
     group: "Components/Plugins",
     name: "Catalog access denied",
-    component: "plugins",
+    component: pluginsComponent,
     actions: [
       click("Configure plugins"),
       { selector: 'button[aria-label="Available plugins"]', click: true },
     ],
     pluginCapabilities,
-    pluginCatalog: {
+    pluginCatalog: /** @satisfies {PluginFieldCatalog} */ ({
       status: "error",
       canLoad: true,
       message: "This credential does not have access to the plugin catalog.",
-    },
+    }),
     description:
       "A simulated catalog permission error stays visible while existing configuration remains editable.",
     pluginSelections,
@@ -2814,21 +1920,21 @@ export const scenarios = {
   pluginsError: {
     group: "Components/Plugins",
     name: "Catalog unavailable",
-    component: "plugins",
+    component: pluginsComponent,
     actions: [click("Configure plugins")],
     pluginCapabilities,
-    pluginCatalog: {
+    pluginCatalog: /** @satisfies {PluginFieldCatalog} */ ({
       status: "error",
       canLoad: true,
       message: "The plugin catalog could not be loaded. Try again after restoring connectivity.",
-    },
+    }),
     description: "A simulated catalog failure is shown as an error, not a successful empty result.",
     gap: pluginPreviewGap,
   },
   pluginsUnavailable: {
     group: "Components/Plugins",
     name: "Discovery credential required",
-    component: "plugins",
+    component: pluginsComponent,
     actions: [click("Configure plugins")],
     pluginCapabilities,
     description:
@@ -2837,7 +1943,7 @@ export const scenarios = {
   pluginsCapabilitiesUnavailable: {
     group: "Components/Plugins",
     name: "Policy capabilities unavailable",
-    component: "plugins",
+    component: pluginsComponent,
     pluginCatalog,
     pluginSelections,
     actions: [
@@ -2851,13 +1957,13 @@ export const scenarios = {
   managedGoogleInstall: {
     group: "Components/Plugins",
     name: "Install Google Workspace",
-    component: "plugins",
-    pluginCapabilities: {
+    component: pluginsComponent,
+    pluginCapabilities: /** @satisfies {PluginFieldCapabilities} */ ({
       ...pluginCapabilities,
       driver: { id: "occ-plugin", implementation: "occ/openclaw-plugin" },
       policyScopeByPlugin: { "occ-plugin:google@1.0.0": "enablement_only" },
-    },
-    pluginCatalog: {
+    }),
+    pluginCatalog: /** @satisfies {PluginFieldCatalog} */ ({
       status: "ready",
       entries: [
         {
@@ -2869,7 +1975,7 @@ export const scenarios = {
           tools: [],
         },
       ],
-    },
+    }),
     actions: [
       click("Configure plugins"),
       { selector: 'button[aria-label="Google Workspace"]', click: true },
@@ -2881,17 +1987,17 @@ export const scenarios = {
   pluginsNativeLimited: {
     group: "Components/Plugins",
     name: "Native Driver with unsupported saved policy",
-    component: "plugins",
-    pluginCatalog: {
+    component: pluginsComponent,
+    pluginCatalog: /** @satisfies {PluginFieldCatalog} */ ({
       status: "ready",
       entries: [{ id: "occ-plugin:diffs", name: "Diffs", tools: null }],
-    },
-    pluginCapabilities: {
+    }),
+    pluginCapabilities: /** @satisfies {PluginFieldCapabilities} */ ({
       driver: { id: "occ-plugin", implementation: "occ/openclaw-plugin" },
       toolDefaults: { enabled: true, approval: ["provider_default", "none"], reviewer: [] },
       tools: { enabled: true, approval: ["provider_default", "none"], reviewer: [] },
       driverPolicySchema: { type: "object", properties: {}, additionalProperties: false },
-    },
+    }),
     pluginSelections: JSON.stringify(
       {
         "occ-plugin:diffs": {
@@ -8038,665 +7144,13 @@ export const scenarios = {
       "Open navigation and press Escape. Scroll Secrets normally. Reopen navigation, widen past 760px, and check that desktop scrolling is available.",
     ],
   },
-  slack: {
-    group: "Components/Channels",
-    name: "Slack configured",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    description: "Enabled Socket Mode with standard unresolved credential references.",
-  },
-  slackDisableReplaceDenied: {
-    group: "Components/Channels",
-    name: "Slack Disable, editor must replace the bot token Secret",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    agentPermissionSummary: {
-      update: true,
-      deploy: true,
-      operate: true,
-      delete: true,
-      administer: true,
-      configurationUpdate: true,
-      configurationRead: true,
-      configurationSecretsOperate: false,
-      configurationSecretsOperateDeniedBindings: ["SLACK_BOT_TOKEN"],
-      agentSourcesOperate: false,
-      sandboxPolicyRead: true,
-    },
-    description:
-      "The permission answer lists the bot token binding as the only one whose Secret the editor cannot operate. Disable saves no bindings, so it would keep that Secret bound: Disable Slack is shown disabled with a note to choose another Secret in Edit Slack first. Edit Slack stays available.",
-    steps: [
-      "Tab to Disable Slack. It takes focus and looks unavailable, described by the note; Enter, Space or a click saves nothing.",
-    ],
-    gap: "The permission answer is simulated, so a rebind here does not enable Disable; the browser test covers that step.",
-  },
-  slackThreadedDefault: {
-    group: "Components/Channels",
-    name: "Slack threaded default",
-    path: `${draft}&tab=channels`,
-    description:
-      "New Slack setup threads channel replies without changing DM reply behavior. Missing credentials remain visible until Secrets are bound.",
-    steps: [
-      "Configure Slack, enter CDEMO123, allow everyone in the channel, and choose Disabled for direct messages.",
-      "Save configuration and open Configuration → View native Configuration: replyToModeByChatType.channel is all, with no global replyToMode.",
-    ],
-  },
-  slackDmPolicy: {
-    group: "Components/Channels",
-    name: "Slack direct-message policy",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    actions: [click("Edit Slack")],
-    description:
-      "Choose DM access independently of channel senders. Invalid allowlists stay in the drawer without saving.",
-    steps: [
-      "Select Allowlist, remove the selected people, and save to inspect the validation error.",
-      "Enter UDIRECT123, save, and reopen Slack to verify the saved selection.",
-      'Select Open and save: allowFrom becomes ["*"]. Switch to Allowlist: enter explicit IDs before saving.',
-      "Select Disabled for channel-only access; existing channel users and reply overrides stay unchanged.",
-    ],
-  },
-  slackEnterpriseDm: {
-    group: "Components/Channels",
-    name: "Slack organization-wide DM policy",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    slackPolicy: "disabled",
-    slackEnterpriseOrgInstall: true,
-    actions: [click("Edit Slack")],
-    description:
-      "Organization-wide installs recommend Disabled. Selecting Pairing or Allowlist fails before saving; Open is supported.",
-  },
-  slackReplyOverride: {
-    group: "Components/Channels",
-    name: "Slack non-threaded override",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    slackReplyToMode: "off",
-    description: "An existing explicit non-threaded setting survives Slack drawer edits.",
-    steps: [
-      "Edit Slack, change the channel IDs, and save configuration.",
-      "Open Configuration → View native Configuration: replyToMode remains off.",
-    ],
-  },
-  slackNavigation: {
-    group: "Components/Channels",
-    name: "Keep Slack edits",
-    path: `${draft}&tab=configuration`,
-    slack: true,
-    actions: [
-      click("Channels"),
-      click("Edit Slack"),
-      { selector: "#slack-channel-ids-search", value: "CNAVIGATION", key: "Enter" },
-    ],
-    description:
-      "An open Slack drawer restores ordinary edits and staged Secret references after browser history navigation.",
-    steps: [
-      "Use Back to return to Configuration, then Forward to reopen the drawer.",
-      "Confirm CNAVIGATION remains. Cancel, reopen Slack, and check saved channel IDs.",
-    ],
-    gap: "Simulated UI proof, not Slack delivery or Secret propagation.",
-  },
-  slackDrawer: {
-    group: "Components/Channels",
-    name: "Slack editor",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    actions: [click("Edit Slack")],
-    description:
-      "Select or create Slack token Secrets at the top, then configure channel and direct-message access. The bot token enables name lookup; both tokens are required before deployment.",
-    steps: [
-      "Change the channel IDs, then click inside the panel and drag from its heading onto the gray backdrop. The editor stays open.",
-      "Click the gray backdrop. Reopen Edit Slack and confirm the unsaved channel changes were discarded, just as with Cancel.",
-    ],
-  },
-  slackDrawerNoAuthentication: {
-    group: "Components/Channels",
-    name: "Slack editor, no model authentication",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    auth: null,
-    actions: [click("Edit Slack")],
-    description:
-      "An Agent with no model authentication source: the drawer's notice adds that model credentials are configured in the Credentials tab before deploying. With a source bound (Slack editor), the notice stops after the first sentence.",
-    steps: [
-      'The notice at the top of the drawer reads "New version. Changes affect future deployments using this Configuration. Configure model credentials in the Credentials tab before deploying."',
-      'Open the Slack editor story: its notice reads only "New version. Changes affect future deployments using this Configuration."',
-    ],
-  },
-  slackDirectoryChannels: {
-    group: "Components/Channels",
-    name: "Find Slack channels by name",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    actions: [click("Edit Slack"), { selector: "#slack-channel-ids-search", focus: true }],
-    description:
-      "The picker shows five channels per page with the bot's workspace, names and exact IDs. Next page shows two buffered matches before another directory request. Typing waits 300 ms; Enter searches immediately. Selecting a result saves only its ID.",
-    steps: [
-      "Use Next page to see design and engineering, then Previous page to restore the first five without another directory request.",
-      "Use Next page twice to fetch product and announcements. Type platform and select its result.",
-      "Type another query, then click Save configuration once while results are open. The dropdown closes without moving Save, and only selected channel chips are saved.",
-    ],
-    gap: "Directory data and Secret access are simulated; no Slack API call occurs.",
-  },
-  slackDirectorySavedNames: {
-    group: "Components/Channels",
-    name: "Saved Slack IDs show current names",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    actions: [click("Edit Slack")],
-    description:
-      "Saved channel and user IDs are resolved with the selected bot Secret when the editor opens. Names appear as removable chips. Exact IDs are available on hover and are the only values saved.",
-    gap: "Directory data and Secret access are simulated; no Slack API call occurs.",
-  },
-  slackDirectoryQualifiedNames: {
-    group: "Components/Channels",
-    name: "Qualified Slack targets keep names and IDs",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    slackChannels: {
-      "team:TDEMO123:channel:CDEMO123": {
-        requireMention: true,
-        users: ["team:TDEMO123:user:UDEMO123"],
-      },
-    },
-    slackAllowFrom: ["user:UDEMO123"],
-    actions: [click("Edit Slack")],
-    description:
-      "Existing workspace-qualified channel and user targets remain editable. Matching names label removable chips, with exact saved targets on hover; the directory picker still inserts bare IDs.",
-    gap: "Directory data and Secret access are simulated; no Slack API call occurs.",
-  },
-  slackDirectoryUsers: {
-    group: "Components/Channels",
-    name: "Resolve duplicate Slack people",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    actions: [click("Edit Slack"), { selector: "#slack-dm-user-ids-search", focus: true }],
-    description:
-      "People appear five per page. Two share the same display name; their handle and exact Slack user IDs identify which one will be saved. Next page preserves the remaining matches from the directory response.",
-    gap: "Directory data and Secret access are simulated; no Slack API call occurs.",
-  },
-  slackDirectoryDenied: {
-    group: "Components/Channels",
-    name: "Slack directory access denied",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    rules: [
-      { suffix: "/channel-directory/lookup", method: "POST", bodyHasIds: false, status: 403 },
-    ],
-    actions: [click("Edit Slack"), { selector: "#slack-channel-ids-search", focus: true }],
-    description:
-      "A denied lookup keeps manual exact-ID entry available and explains Secret permissions.",
-  },
-  slackDirectoryLoading: {
-    group: "Components/Channels",
-    name: "Slack directory loading",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    rules: [{ suffix: "/channel-directory/lookup", method: "POST", bodyHasIds: false, hold: true }],
-    actions: [click("Edit Slack"), { selector: "#slack-channel-ids-search", focus: true }],
-    description:
-      "While lookup is pending, the picker announces loading and disables page navigation.",
-  },
-  slackDirectorySearchRace: {
-    group: "Components/Channels",
-    name: "New search supersedes pending results",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    rules: [
-      {
-        suffix: "/channel-directory/lookup",
-        method: "POST",
-        bodyHasIds: false,
-        delayMs: 500,
-        once: true,
-      },
-    ],
-    actions: [click("Edit Slack"), { selector: "#slack-channel-ids-search", focus: true }],
-    description:
-      "An older directory request is delayed. Search for platform before it returns; typing cancels the browser request and searches after 300 ms. Escape dismisses results and cancels a queued search. Enter searches immediately.",
-  },
-  slackDirectoryMissingSecret: {
-    group: "Components/Channels",
-    name: "Slack directory needs a bot Secret",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    slackBindings: "app",
-    actions: [click("Edit Slack")],
-    description:
-      "Credentials appear before access settings. The instructions explain that name lookup needs a bot token; exact-ID entry remains available.",
-    steps: [
-      "At the top of the editor, open Slack bot token and choose Slack bot token (simulated). Existing IDs resolve to names.",
-      "Continue to Channels, search for platform, and select the result. Review channel and direct-message access before saving.",
-    ],
-    gap: "Secret choices and directory responses are simulated; this does not verify a real Slack token.",
-  },
-  slackEveryone: {
-    group: "Components/Channels",
-    name: "Slack everyone in channels",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    slackAllowEveryone: true,
-    actions: [click("Edit Slack")],
-    description:
-      'The editor shows users: ["*"] as Allow everyone in these channels and keeps direct-message allowFrom unchanged.',
-  },
-  slackRestrictedUsers: {
-    group: "Components/Channels",
-    name: "Slack restricted channel users",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    actions: [click("Edit Slack")],
-    description:
-      "Explicit channel user IDs disable the everyone checkbox while preserving unrelated channel properties and direct-message allowFrom.",
-  },
-  slackChannelAccessIncomplete: {
-    group: "Components/Channels",
-    name: "Slack sender access incomplete",
-    path: `${draft}&tab=channels`,
-    actions: [
-      click("Configure Slack"),
-      { selector: "#slack-dm-policy", value: "disabled" },
-      { selector: "#slack-channel-ids-search", value: "CDEMO123", key: "Enter" },
-      click("Save configuration"),
-    ],
-    description:
-      "A selected channel needs allowed channel user IDs or the everyone checkbox before the Configuration can be saved.",
-  },
-  slackTokensMissing: {
-    group: "Components/Channels",
-    name: "Slack token Secrets missing",
-    path: `${draft}&tab=channels`,
-    actions: [
-      click("Configure Slack"),
-      { selector: "#slack-dm-policy", value: "disabled" },
-      { selector: "#slack-channel-ids-search", value: "CDEMO123", key: "Enter" },
-      { selector: "#slack-channel-access", value: "everyone" },
-      click("Save configuration"),
-    ],
-    description:
-      "An enabled Slack channel saves only with both token Secrets: each missing one is named under its picker, and nothing is sent.",
-  },
-  slackSecretMenu: {
-    group: "Components/Channels",
-    name: "Slack Secret menu",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    actions: [click("Edit Slack")],
-    description:
-      "Search Slack token Secrets by name or ID; options and selections show names only. Use arrow keys and Enter to select, and Escape to retain the current binding. Metadata is simulated within this Namespace.",
-  },
-  slackSecretNameCollision: {
-    group: "Components/Channels",
-    name: "Slack Secret action name collision",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    extraSecrets: [
-      { id: "sec_story_create_name", name: "Create new Secret..." },
-      { id: "sec_story_none_name", name: "No Secret bound" },
-      { id: "sec_story_bound_name", name: "Bound Secret" },
-    ],
-    actions: [click("Edit Slack")],
-    description:
-      "Open the bot token selector to compare Secret names with matching picker actions. Real Secret names remain unchanged and conflicting actions have a qualifier.",
-  },
-  slackCreateSecretModal: {
-    group: "Components/Channels",
-    name: "Slack create Secret modal",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    agentName: "Research " + "engineering ".repeat(15) + "review team",
-    actions: [
-      click("Edit Slack"),
-      { selector: "#slack-secret-slack-bot-token", value: "__openclaw_create_secret__" },
-    ],
-    description:
-      "A long Agent name produces a shortened, editable Secret Name that retains the Slack bot token purpose. Creation uses only the simulated service.",
-    steps: [
-      "Inspect Name before editing: it contains an ellipsis, ends with Slack bot token, and fits the 200-character limit.",
-      "Replace Name with Walkthrough Slack bot token and enter synthetic-demo-token as Value. Select Create Secret.",
-      "Confirm Create Secret closes and Walkthrough Slack bot token is selected in the Slack editor. The binding is staged until you save the editor.",
-    ],
-  },
-  slackDuplicateSecret: {
-    group: "Components/Channels",
-    name: "Slack duplicate Secret name",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    actions: [
-      click("Edit Slack"),
-      { selector: "#slack-secret-slack-bot-token", value: "__openclaw_create_secret__" },
-      {
-        selector: "#create-slack-secret-slack-bot-token-name",
-        value: "Slack bot token (simulated)",
-      },
-      { selector: "#create-slack-secret-slack-bot-token-value", value: "synthetic-demo-token" },
-      click("Create Secret"),
-    ],
-    description:
-      "A simulated duplicate-name rejection preserves Name and the masked value. Change the Name and create again; the existing Secret remains unchanged.",
-    gap: "Simulated UI proof only; the browser integration suite verifies real controller conflict handling.",
-  },
-  slackSecretStaged: {
-    group: "Components/Channels",
-    name: "Slack staged Secret binding",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    actions: [
-      click("Edit Slack"),
-      { selector: "#slack-secret-slack-app-token", value: "sec_demo_slack_backup_token" },
-    ],
-    description:
-      "Selecting a different existing Secret stages the binding and updates the metadata link. Cancel discards the staged choice; Save persists it.",
-  },
-  slackOpen: {
-    group: "Components/Channels",
-    name: "Slack open policy",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    slackPolicy: "open",
-    actions: [click("Edit Slack")],
-    description: "Editing preserves the existing open direct-message policy and allowFrom entry.",
-  },
-  slackDisabled: {
-    group: "Components/Channels",
-    name: "Slack disabled policy",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    slackPolicy: "disabled",
-    actions: [click("Edit Slack")],
-    description: "A disabled access policy does not disable the editor or silently change policy.",
-  },
-  slackUnsupported: {
-    group: "Components/Channels",
-    name: "Slack unsupported shape",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    slackMode: "http",
-    description:
-      "The Socket Mode editor disables editing for an HTTP-mode configuration and shows native JSON.",
-  },
-  slackPluginDenied: {
-    group: "Components/Channels",
-    name: "Slack plugin denied",
-    path: `${draft}&tab=channels`,
-    pluginDeny: [" Slack"],
-    description:
-      'plugins.deny names " Slack". OpenClaw matches deny entries by trimmed, lowercased plugin ID, so the slack plugin is blocked: Configure Slack is disabled and described by the danger note.',
-    steps: [
-      "Tab to Configure Slack. It takes focus and looks unavailable, described by the blocked note; Enter, Space or a click opens nothing.",
-    ],
-  },
-  slackMixedUsersUnsupported: {
-    group: "Components/Channels",
-    name: "Slack mixed sender lists",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    slackChannels: {
-      CDEMO123: { requireMention: true, users: ["UDEMO123"] },
-      CDEMO456: { requireMention: true, users: ["UDEMO456"] },
-    },
-    description:
-      "Different per-channel sender lists are unsupported by the simple editor and remain editable through native Configuration JSON.",
-  },
-  slackWildcardUnsupported: {
-    group: "Components/Channels",
-    name: "Slack wildcard channel map",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    slackChannels: { "*": { requireMention: true, users: ["*"] } },
-    description:
-      "A native Slack '*' channel map matches all channels and is unsupported by this editor.",
-  },
-  channelsEmpty: {
-    group: "Components/Channels",
-    name: "Not configured",
-    path: `${draft}&tab=channels`,
-    description: "Configure Slack from the supported channel card.",
-  },
-  channelsReadOnly: {
-    group: "Components/Channels",
-    name: "Revision read only",
-    path: `${revision}&tab=channels`,
-    deployed: true,
-    slack: true,
-    description:
-      "Inspect the app and bot token Secret names and IDs, then switch to Configuration to inspect the Harness Secret. This read-only snapshot retains its own bindings.",
-  },
-  revisionSecretsDenied: {
-    group: "Components/Channels",
-    name: "Revision Secret metadata denied",
-    path: `${revision}&tab=channels`,
-    deployed: true,
-    slack: true,
-    rules: [{ prefix: `${presetSecretsPath}/`, status: 403 }],
-    description:
-      "Bound IDs remain visible when exact Secret metadata reads are denied. Switch to Configuration to inspect the same state for Harness authentication.",
-  },
-  revisionSecretsMissing: {
-    group: "Components/Channels",
-    name: "Revision Secret metadata missing",
-    path: `${revision}&tab=channels`,
-    deployed: true,
-    slack: true,
-    rules: [{ prefix: `${presetSecretsPath}/`, status: 404 }],
-    description:
-      "Unavailable metadata does not erase the revision's bindings or claim credentials are unconfigured.",
-  },
-  revisionSecretsLoading: {
-    group: "Components/Channels",
-    name: "Revision Secret metadata loading",
-    path: `${revision}&tab=channels`,
-    deployed: true,
-    slack: true,
-    rules: [{ prefix: `${presetSecretsPath}/`, hold: true }],
-    description: "The bound IDs stay visible while metadata loads. Other tabs remain usable.",
-  },
-  revisionSecretsAbsent: {
-    group: "Components/Channels",
-    name: "Revision without Slack bindings",
-    path: `${revision}&tab=channels`,
-    deployed: true,
-    description: "A revision without Slack bindings shows No Secret bound for both token slots.",
-  },
-  channelConflict: {
-    group: "Components/Channels",
-    name: "Save conflict",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    rules: [
-      {
-        path: "/namespaces/ns_00000000-0000-4000-8000-000000000001/configurations/cfg_00000000-0000-4000-8000-000000000001",
-        method: "PATCH",
-        status: 409,
-        code: "RESOURCE_CONFLICT",
-        message:
-          "The Configuration changed since it was read. Read its current generation before updating it.",
-        details: [{ path: "/expectedGeneration", code: "INVALID_VALUE" }],
-      },
-    ],
-    actions: [click("Edit Slack"), click("Save configuration")],
-    description:
-      "The API refuses the Configuration write with 409: another save landed after the page's reread. The editor closes and the section offers Reload draft, with focus on it.",
-  },
-  channelProvisioningReserved: {
-    group: "Components/Channels",
-    name: "Save refused during provisioning",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    rules: [reservedConfigurationWrite],
-    actions: [click("Edit Slack"), click("Save configuration")],
-    description:
-      "Save keeps the editor open and explains that this Configuration is reserved for provisioning. There is no Reload draft action: reloading would not release the reservation.",
-  },
-  channelSaveRejected: {
-    group: "Components/Channels",
-    name: "Save rejected",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    rules: [
-      {
-        path: "/namespaces/ns_00000000-0000-4000-8000-000000000001/configurations/cfg_00000000-0000-4000-8000-000000000001",
-        method: "PATCH",
-        status: 400,
-      },
-    ],
-    actions: [click("Edit Slack"), click("Save configuration")],
-    description:
-      "A rejected Configuration write keeps the drawer and feedback visible, with focus back on Save configuration.",
-  },
-  channelSaveDenied: {
-    group: "Components/Channels",
-    name: "Save denied",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    rules: [
-      {
-        path: "/namespaces/ns_00000000-0000-4000-8000-000000000001/configurations/cfg_00000000-0000-4000-8000-000000000001",
-        method: "PATCH",
-        status: 403,
-        code: "FORBIDDEN",
-      },
-    ],
-    actions: [click("Edit Slack"), click("Save configuration")],
-    description:
-      "A caller without Configuration update is refused. The drawer stays open with the edits and names the grant to ask an administrator for; the text is the same for every refusal.",
-  },
-  channelChangedElsewhere: {
-    group: "Components/Channels",
-    name: "Configuration changed elsewhere",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    configurationChangedElsewhere: true,
-    actions: [click("Edit Slack"), click("Save configuration")],
-    description:
-      "Another browser saved this Configuration after the page read it. The editor closes and the section offers Reload draft; editing, deployment and tab changes wait for it.",
-    steps: [
-      "Check that focus is on Reload draft and the alert says the saved Configuration changed while you were editing.",
-      "Select Reload draft: the tab rebuilds in place with Draft reloaded., and Edit Slack saves again.",
-    ],
-  },
-  channelChangedElsewhereWithEdits: {
-    group: "Components/Channels",
-    name: "Configuration changed elsewhere with unsaved edits",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    configurationChangedElsewhere: true,
-    actions: [
-      click("Edit Slack"),
-      { selector: "#slack-dm-policy", value: "disabled" },
-      click("Save configuration"),
-    ],
-    description:
-      "Another browser saved this Configuration while Edit Slack had unsaved changes. The alert says Reload draft reopens them over the saved settings.",
-    steps: [
-      "Check that focus is on Reload draft and the alert ends with Reload draft reopens your Slack edits over the saved settings.",
-      "Select Reload draft: Edit Slack reopens with Direct-message policy still Disabled and says the edits are applied over the reloaded settings; Save configuration saves them.",
-    ],
-  },
-  channelChangedElsewhereMerged: {
-    group: "Components/Channels",
-    name: "Edits merged over another browser's save",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    slackPolicy: "open",
-    configurationChangedElsewhere: {
-      values: {
-        channels: {
-          slack: {
-            dmPolicy: "allowlist",
-            allowFrom: ["UDDDD111", "UEEEE222"],
-            channels: { CDEMO123: { users: ["UDEMO123", "UOTHER99"] } },
-          },
-        },
-      },
-    },
-    actions: [
-      click("Edit Slack"),
-      { selector: "#slack-allowed-user-ids", value: "UDEMO123, UNEW4567" },
-      { selector: "#slack-dm-policy", value: "pairing" },
-      click("Save configuration"),
-      click("Reload draft"),
-    ],
-    description:
-      "Another browser added a channel user and set a DM allowlist while this editor added a user and chose Pairing. Reload draft adds only this reader's user to the reread list and names the DM policy both browsers changed.",
-    steps: [
-      "Check the note: Allowed people in these channels (added UNEW4567), and Direct-message policy also changed in another browser, saved as Allowlist.",
-      "Check that the channel list keeps UOTHER99 and the DM list keeps UDDDD111 and UEEEE222; Save configuration saves the merge.",
-    ],
-  },
-  channelSavePending: {
-    group: "Components/Channels",
-    name: "Channel save pending",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    auth: "runtime",
-    rules: [
-      {
-        path: "/namespaces/ns_00000000-0000-4000-8000-000000000001/configurations/cfg_00000000-0000-4000-8000-000000000001",
-        method: "PATCH",
-        hold: true,
-      },
-    ],
-    actions: [click("Disable Slack")],
-    description:
-      "A pending channel save disables deployment and revision navigation. The real client times out after 15 seconds; reset the story to replay it.",
-  },
-  channelSecretGrantRefused: {
-    group: "Components/Channels",
-    name: "Slack token saved, grant refused",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    actions: [
-      click("Edit Slack"),
-      { selector: "#slack-secret-slack-app-token", value: "sec_demo_slack_backup_token" },
-      click("Save configuration"),
-    ],
-    rules: [{ suffix: "/iam/roles", status: 403 }],
-    description:
-      "A session the console takes for an Installation administrator saves a Slack token from the editor. The Configuration saves, but its IAM read for the Agent's grant is refused. That is a known outcome, not an unknown one: the page names who can grant it and links to Credentials, where Retry Secret access waits.",
-    steps: [
-      "The editor closes. A warning above Channels names the Installation administrator step; Prepare says to resolve the saved Secret access grant, not that the outcome is unknown.",
-      "Edit Slack stays available. Open Credentials: the app token reads Bound · Agent access not confirmed beside Retry Secret access.",
-    ],
-    gap: "The member browser test uses a member account and the real Native IAM refusal.",
-  },
-  channelSecretGrantMemberUnverified: {
-    group: "Components/Channels",
-    name: "Member Slack token saved, access not verified",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    observabilityDenied: true,
-    actions: [
-      click("Edit Slack"),
-      { selector: "#slack-secret-slack-app-token", value: "sec_demo_slack_backup_token" },
-      click("Save configuration"),
-    ],
-    description:
-      "A member saves a Slack token from the editor. The session already knows this member does not administer the Installation, so it sends no IAM request for the Agent's grant. The warning says this session did not verify the Agent's access and names the Installation administrator step.",
-    steps: [
-      "The editor closes. The warning above Channels says access was not verified; Deploy new version stays available, since the API checks the Agent's access when it deploys. The request log shows no /iam/ request.",
-      "Open Credentials: the app token reads Bound · Agent access not confirmed. There is no Retry Secret access; Reload draft clears the warning.",
-    ],
-    gap: "The member browser test uses a member account and the real Installation permission check.",
-  },
-  channelSaveUnknown: {
-    group: "Components/Channels",
-    name: "Channel save outcome unknown",
-    path: `${draft}&tab=channels`,
-    slack: true,
-    auth: "runtime",
-    rules: [
-      {
-        path: "/namespaces/ns_00000000-0000-4000-8000-000000000001/configurations/cfg_00000000-0000-4000-8000-000000000001",
-        method: "PATCH",
-        status: 503,
-        once: true,
-      },
-    ],
-    description:
-      "Disable Slack to simulate an uncertain save. Deployment and navigation stay blocked until Reload draft; inspect the saved state before retrying.",
-  },
+  ...channelsScenarios({
+    click,
+    draft,
+    revision,
+    presetSecretsPath,
+    reservedConfigurationWrite,
+  }),
   credentials: {
     group: "Components/Credentials",
     name: "Model authentication",
@@ -9816,7 +8270,8 @@ export const scenarios = {
       { suffix: "/runtime", status: 403 },
       {
         suffix: "/agents/agt_00000000-0000-4000-8000-000000000001/permissions",
-        skip: 1,
+        // Keep the initial read and first Logs recheck denied.
+        skip: 2,
         once: true,
         data: { update: true, deploy: true, operate: true, delete: true },
       },
@@ -10093,7 +8548,7 @@ export const scenarios = {
     ],
     actions: [
       click("Request deletion again"),
-      { selector: ".agent-delete-dialog button.danger", click: "Request deletion again" },
+      { selector: ".agent-delete-dialog button.danger", click: true },
     ],
     description:
       "An uncertain repeat request remains disabled until Refresh reads the already deleting Agent successfully. No write is automatically retried.",
@@ -10264,7 +8719,7 @@ export const scenarios = {
     swePreset: true,
     pluginDiscovery: devdayPluginDiscovery,
     pluginCapabilities,
-    fixturePluginCatalog: true,
+    fixturePluginCatalog: /** @type {const} */ (true),
     fixturePluginCatalogMessage:
       "Storybook is showing a simulated curated plugin catalog for DevDay rehearsal. Real deployments still require plugin access for the selected service account.",
     repositoryOptions: [
@@ -10310,7 +8765,7 @@ export const scenarios = {
   },
   devdayCreateCheckpoint: {
     group: "Flows",
-    name: "DevDay segment 1 checkpoint: deployed devday claw",
+    name: "DevDay segment 1 checkpoint: first deployment queued",
     path: "/console/agents?namespace=ns_00000000-0000-4000-8000-000000000001",
     agentName: "oceclaw",
     deployed: true,
@@ -10321,7 +8776,7 @@ export const scenarios = {
     swePreset: true,
     pluginDiscovery: devdayPluginDiscovery,
     pluginCapabilities,
-    fixturePluginCatalog: true,
+    fixturePluginCatalog: /** @type {const} */ (true),
     fixturePluginCatalogMessage:
       "Storybook is showing a simulated curated plugin catalog for DevDay rehearsal. Real deployments still require plugin access for the selected service account.",
     repositoryOptions: [
