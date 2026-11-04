@@ -71,7 +71,14 @@ const readyForm = [
 const modelCredentialSourceTypes = [
   {
     type: "openai",
-    config: [],
+    config: [
+      {
+        name: "authorized_base_url",
+        required: false,
+        description:
+          "Immutable destination authorization. Must match the Installation model provider; omission authorizes only the default OpenAI endpoint.",
+      },
+    ],
     secrets: [{ name: "api_key", required: true }],
     rotation: "none",
     harnessAuth: { modelProvider: "openai", loginMode: "api_key" },
@@ -195,6 +202,14 @@ const pluginCapabilities = {
     },
     additionalProperties: false,
   },
+};
+const slackPluginId = "occ-plugin:slack@1.0.0";
+const slackSourceId = "cs_00000000-0000-4000-8000-000000000001";
+const slackEntry = { id: slackPluginId, name: "Slack", tools: [] };
+const slackTool = {
+  id: "slack_search_public",
+  name: "slack_search_public",
+  ownerId: slackPluginId,
 };
 const pluginSetup = {
   message:
@@ -1991,6 +2006,19 @@ export const scenarios = {
       "On a long page, scroll to the bottom and check that the sidebar background and operator profile reach it. At phone width, values fit and the existing navigation drawer still opens.",
     ],
   },
+  settingsModelProvider: {
+    group: "Pages/Settings",
+    name: "Shared model provider",
+    path: "/console/settings",
+    installationModelProvider: true,
+    description:
+      "Read the shared Compute provider as Fields and JSON. The same endpoint serves Codex and OpenClaw. These are simulated accepted Installation values; editing remains an operator configuration task.",
+    steps: [
+      "Expand Compute, then runtime and modelProvider.",
+      "Switch to JSON and confirm protocol and baseUrl.",
+      "No key or source routing field is present.",
+    ],
+  },
   settingsDriverNestedValues: {
     group: "Pages/Settings",
     name: "Nested Driver values",
@@ -3284,6 +3312,34 @@ export const scenarios = {
       "Open the Slack editor, then cancel it. Channel controls remain available for dedicated OpenClaw.",
       "Select Embedded, then return to Dedicated. Confirm the Harness remains OpenClaw.",
       "Create the Agent and follow simulated provisioning to Agent details. Open Configuration and confirm the snapshot shows Dedicated execution and the OpenClaw Harness.",
+    ],
+  },
+  createSharedModelProviderSource: {
+    group: "Pages/Create Agent",
+    name: "Authorize shared model destination",
+    path: create,
+    credentialSourceTypes: modelCredentialSourceTypes,
+    actions: readyForm,
+    description:
+      "Enter destination authorization for the selected key. This does not change the Installation endpoint. The simulated API records the source and starts provisioning.",
+    steps: [
+      "Enter https://models.example.com/v1 under Authorized base url.",
+      "Create the Agent and inspect the source request: config.authorized_base_url is present; config.base_url is absent.",
+    ],
+  },
+  createSharedModelProviderRefusal: {
+    group: "Pages/Create Agent",
+    name: "Destination authorization refusal",
+    path: create,
+    credentialSourceTypes: modelCredentialSourceTypes,
+    credentialRegistrationOutcome: "invalid-config",
+    actions: readyForm,
+    description:
+      "The first source request receives a simulated destination mismatch. Check registration to confirm absence, then correct authorization and retry. Uncertain writes remain locked until checked.",
+    steps: [
+      "Select the simulated model Secret and enter https://other.example.com/v1.",
+      "Create the Agent, then choose Check credential registration.",
+      "Correct the authorization to https://models.example.com/v1 and retry.",
     ],
   },
   createDedicatedCodexCredentialSource: {
@@ -5670,6 +5726,57 @@ export const scenarios = {
       "Close and reopen the picker. Calendar's saved policy is unchanged. Repeat from Reset story to inspect the skipped prefetch again.",
     ],
     gap: "Catalog responses and the saved Agent are simulated. This verifies Console recovery, not plugin installation or a live runtime.",
+  },
+  slackMcpTools: {
+    group: "Pages/Agent detail",
+    name: "Choose tools for a connected Slack account",
+    path: `${draft}&tab=plugins`,
+    harnessId: "openclaw",
+    deployed: true,
+    agentPlugins: { [slackPluginId]: { enabled: true } },
+    credentialSources: [{ sourceId: slackSourceId }],
+    pluginDiscoveryCredential: "none",
+    pluginCapabilities: {
+      driver: { id: "occ-plugin", implementation: "occ/openclaw-plugin" },
+      approvers: { agent: false, plugin: false, tools: false },
+      toolDefaults: { enabled: false },
+      tools: { enabled: false },
+      driverPolicySchema: { type: "object", properties: {} },
+      policyScopeByPlugin: { [slackPluginId]: "enablement_only" },
+      credentialSlots: [
+        {
+          pluginId: slackPluginId,
+          releaseSha256: "a".repeat(64),
+          id: "account",
+          label: "Slack account",
+          toolDiscovery: true,
+          sources: [{ id: slackSourceId, name: "Slack search connection (simulated)" }],
+        },
+      ],
+    },
+    pluginDiscovery: {
+      pages: { initial: { plugins: [slackEntry], nextCursor: null } },
+      details: { [slackPluginId]: { ...slackEntry, tools: [slackTool] } },
+    },
+    rules: [
+      {
+        suffix: "/plugins/details",
+        method: "POST",
+        delayMs: 650,
+        once: true,
+        status: 403,
+        code: "FORBIDDEN",
+      },
+    ],
+    actions: [click("Configure plugins")],
+    description:
+      "The Tools picker loads available tools from the selected Slack account. Select the tools the next deployment may call.",
+    steps: [
+      "Open Slack. Before selecting an account, no tools can be loaded. Select Slack search connection (simulated).",
+      "Choose Load tools. The first request shows a loading state, then a permission error. Choose Load tools again to recover.",
+      "Check slack_search_public. Choose Done and Save plugin selections. Open the picker and load tools again to confirm the saved choice.",
+    ],
+    gap: "The account and MCP response are simulated. This verifies Console selection and readback.",
   },
   pluginsDraft: {
     group: "Pages/Agent detail",
