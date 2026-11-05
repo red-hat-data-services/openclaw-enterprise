@@ -23,8 +23,9 @@ ARG PNPM_OPENCLAW_VERSION
 ARG PNPM_OPENCLAW_SHA512
 ARG PNPM_OPENCLAW_EXE_SHA256_AMD64
 ARG PNPM_OPENCLAW_EXE_SHA256_ARM64
+# The bridge tests call the openssl CLI, which the upstream Debian base ships.
 RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
-        git-core gcc-c++ make cmake python3 tar gzip findutils diffutils \
+        git-core gcc-c++ make cmake python3 tar gzip findutils diffutils openssl \
     && dnf clean all
 # Hummingbird ships neither corepack nor pnpm. Install the exact releases that
 # the OCE and OpenClaw packageManager fields select, verified with the same
@@ -239,37 +240,54 @@ RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce
 # Forward the scoped Google placeholder and the OpenShell TLS root to native worker children.
 RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce-runtime \
     git apply /tmp/oce-runtime/openclaw-google-worker-placeholder.patch
-# Local qualification bridge for the pinned OpenClaw private-store owner.
-# Remove after selecting an OpenClaw revision containing this owning repair.
+# Remove this bridge after selecting native setup renewal with bounded saved-device fallback.
 RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce-runtime \
-    git apply /tmp/oce-runtime/openclaw-linux-private-store-setgid.patch
-# Name each invalid plugin setting and exit 78 when Gateway startup refuses its config
-# (openclaw/openclaw#189392). Remove after selecting an OpenClaw commit that contains it.
-RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce-runtime \
-    git apply /tmp/oce-runtime/openclaw-plugin-config-startup-report.patch
+    git apply /tmp/oce-runtime/openclaw-node-setup-renewal.patch
 
 # Run the bridge tests alongside the build using the same patched source.
 # Packaging mounts this stage so a failed test still blocks the runtime image.
 FROM openclaw-patched-source AS openclaw-bridge-tests
-# One runner invocation for the gateway Node test files: the runner compiles the whole
+# Hummingbird's /usr/bin/node links to node-24, so process.execPath ends in
+# node-24, but the node daemon tests expect a path that ends in node, as the
+# upstream Debian image provides. Put a copy first on PATH for this stage only.
+RUN cp "$(readlink -f /usr/bin/node)" /usr/local/bin/node
+# Run the test files and type-check graphs that deploy/runtime/Dockerfile selects
+# for this stage; oce-bridge-tests.mjs fails when it cannot read them.
+RUN --mount=type=bind,source=deploy/runtime/Dockerfile,target=/tmp/oce/Dockerfile \
+    --mount=type=bind,source=deploy/konflux/oce-bridge-tests.mjs,target=/tmp/oce-bridge-tests.mjs \
+    node /tmp/oce-bridge-tests.mjs /tmp/oce/Dockerfile /source /opt/oce-bridge-tests
+# One main runner invocation for the Node test files: the runner compiles the whole
 # source tree for its workers first (about a minute), and a second invocation on
 # a fresh .artifacts mount would compile it again. The test runner restores its
 # cache by renaming directories; a fresh mount keeps those renames off the
 # previous layer.
 RUN --network=none --mount=type=tmpfs,target=/source/.artifacts \
     OPENCLAW_VITEST_RUNTIME=node OPENCLAW_VITEST_MAX_WORKERS=1 pnpm_config_verify_deps_before_run=false \
-    node --import ./scripts/tsx.mjs scripts/test-projects.mts src/gateway/server.required-placement-scopes.test.ts \
-    src/infra/gateway-lock-recovery.test.ts src/node-host/node-worker-google-placeholder.test.ts
-# The setgid bridge test needs directories to inherit the setgid bit, which a
+    node --import ./scripts/tsx.mjs scripts/test-projects.mts \
+    $(grep -vx 'src/infra/private-store-file.test.ts' /opt/oce-bridge-tests/files)
+# The private-store setgid test needs directories to inherit the setgid bit, which a
 # runner's build storage does not always do, so it gets a tmpfs /tmp. Its own
 # invocation also keeps it from loading the timing-sensitive gateway tests above.
 RUN --network=none --mount=type=tmpfs,target=/source/.artifacts --mount=type=tmpfs,target=/tmp \
-    OPENCLAW_VITEST_RUNTIME=node OPENCLAW_VITEST_MAX_WORKERS=1 pnpm_config_verify_deps_before_run=false \
+    grep -qx 'src/infra/private-store-file.test.ts' /opt/oce-bridge-tests/files \
+    && OPENCLAW_VITEST_RUNTIME=node OPENCLAW_VITEST_MAX_WORKERS=1 pnpm_config_verify_deps_before_run=false \
     node --import ./scripts/tsx.mjs scripts/test-projects.mts src/infra/private-store-file.test.ts
-# Type-check the two UI test graphs touched by the bridge. The upstream runner
-# generates its database types and compiler cache under .artifacts.
+# These CUA lifecycle cases use the supported SDK adapter boundary. The two
+# native SDK import cases need desktop libraries absent from this build image.
 RUN --network=none --mount=type=tmpfs,target=/source/.artifacts \
-    node scripts/run-tsgo-core-test-shards.mjs --ci-graphs-json '["core-test-ui-chat","core-test-ui-app"]'
+    OPENCLAW_VITEST_RUNTIME=node OPENCLAW_VITEST_MAX_WORKERS=1 pnpm_config_verify_deps_before_run=false \
+    node --import ./scripts/tsx.mjs scripts/test-projects.mts extensions/cua-computer/src/driver-client.test.ts \
+    -t '^(?!.*(?:matches the installed CUA Driver desktop input enum contract|preserves typed SDK click refusals in the shared driver result))'
+# Type-check production and the native/UI test graphs touched by the bridges.
+# The upstream runner generates database types and compiler cache under .artifacts.
+RUN --network=none --mount=type=tmpfs,target=/source/.artifacts \
+    node scripts/run-tsgo-core-test-shards.mjs --ci-graphs-json "$(cat /opt/oce-bridge-tests/graphs.json)"
+# Check the changed CUA extension with the upstream strict compiler settings.
+# Limit extension roots to CUA while checking all of its transitive imports.
+RUN --network=none --mount=type=tmpfs,target=/source/.artifacts \
+    node -e 'const fs=require("node:fs");fs.writeFileSync(".artifacts/tsconfig.cua-production.json",JSON.stringify({"extends": "../tsconfig.extensions.json", "include": ["../src/**/*.d.ts", "../ui/src/**/*.d.ts", "../extensions/cua-computer/**/*"], "compilerOptions": {"rootDir": ".."}}));fs.writeFileSync(".artifacts/tsconfig.cua-test.json",JSON.stringify({"extends": "../test/tsconfig/tsconfig.extensions.test.json", "include": ["../test/types/vitest-codex-attempt-runtime.d.ts", "../src/**/*.d.ts", "../ui/**/*.d.ts", "../extensions/**/*.d.ts", "../extensions/cua-computer/**/*.test.ts", "../extensions/cua-computer/**/*.test.tsx", "../packages/**/*.d.ts"]}));' && \
+    node scripts/run-tsgo.mjs -p .artifacts/tsconfig.cua-production.json --incremental --tsBuildInfoFile .artifacts/cua-production.tsbuildinfo && \
+    node scripts/run-tsgo.mjs -p .artifacts/tsconfig.cua-test.json --incremental --tsBuildInfoFile .artifacts/cua-test.tsbuildinfo
 # Select only the Node projects that own these files: the browser project starts a
 # Vite server on localhost, which Buildah's network-less RUN cannot resolve.
 RUN --network=none cd ui && node ../scripts/run-node-package-bin.mts vitest run --config vitest.config.ts \
@@ -472,6 +490,7 @@ rm -rf "$gh_state"
 EOF
 
 COPY --from=google-cli /out/ /
+COPY apps/controller/plugins/ /usr/local/lib/oce/plugin-catalog/
 
 COPY --from=openclaw-runtime-assets /out/ /opt/oce/runtime/
 COPY --from=openclaw-runtime-assets /source/ /app/node_modules/openclaw/

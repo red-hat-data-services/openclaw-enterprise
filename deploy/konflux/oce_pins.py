@@ -97,6 +97,13 @@ DIRECTIVE = re.compile(r"^#[ \t]*(check|escape|syntax)[ \t]*=", re.IGNORECASE)
 # line with a destination (COPY <<EOF /dest) or with further markers; a
 # marker inside a larger word (a<<b, <<<x) is content, not an opener.
 HEREDOC = re.compile(r"(?<![^\s\d])<<-?\s*(['\"]?)([^<\s'\"]+)\1(?![\"'])")
+# The runtime image reads the bridge test selection from deploy/runtime/Dockerfile
+# at build time (deploy/konflux/oce-bridge-tests.mjs): the test files of the first
+# scripts/test-projects.mts RUN in the openclaw-bridge-tests stage, and its
+# --ci-graphs-json list. Changing either needs no port, so both are masked.
+BRIDGE_TESTS_STAGE = re.compile(r"FROM\s.*\sAS\s+openclaw-bridge-tests", re.IGNORECASE)
+TEST_FILE = re.compile(r"[\w./-]+\.test\.tsx?")
+CI_GRAPHS = re.compile(r"--ci-graphs-json '\[[^']*\]'")
 
 
 class RecipeError(Exception):
@@ -276,6 +283,33 @@ def build_lines(dockerfile):
     return "".join(kept)
 
 
+def mask_bridge_tests(lines):
+    """Mask the bridge test selection in build_lines output, read the way
+    deploy/konflux/oce-bridge-tests.mjs reads it."""
+    kept = []
+    instruction = []
+    in_stage = False
+    tests_masked = False
+    for line in lines.splitlines(keepends=True):
+        instruction.append(line)
+        if continues(line.rstrip("\n")):
+            continue
+        text = "".join(instruction)
+        instruction = []
+        words = text.replace("\\\n", " ").split()
+        if words and words[0].upper() == "FROM":
+            in_stage = BRIDGE_TESTS_STAGE.fullmatch(" ".join(words)) is not None
+        elif in_stage:
+            text = CI_GRAPHS.sub("--ci-graphs-json '<CI_GRAPHS>'", text)
+            if not tests_masked and words and words[0].upper() == "RUN" and "scripts/test-projects.mts" in words:
+                tests_masked = True
+                words = [word for word in words if not TEST_FILE.fullmatch(word)]
+                index = words.index("scripts/test-projects.mts") + 1
+                text = " ".join([*words[:index], "<BRIDGE_TESTS>", *words[index:]]) + "\n"
+        kept.append(text)
+    return "".join(kept) + "".join(instruction)
+
+
 def masked(dockerfile):
     """Return the Dockerfile with pin values masked and cosmetic changes dropped."""
     pins = dockerfile_pins(dockerfile)
@@ -286,7 +320,7 @@ def masked(dockerfile):
     )
     for key, value in pins.items():
         dockerfile = dockerfile.replace(value, f"<{key}>")
-    return build_lines(dockerfile)
+    return mask_bridge_tests(build_lines(dockerfile))
 
 
 def package_manager(package_json):
