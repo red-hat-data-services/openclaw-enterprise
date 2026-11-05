@@ -39,37 +39,39 @@ import { InMemoryPlatformState } from "../../packages/occ/src/index.ts";
 import { apiErrorResponse } from "../helpers/api-error.mjs";
 import { createConsoleAppFixture as createBaseConsoleAppFixture } from "../helpers/console-app.mjs";
 import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs";
-import { createReadyConsoleNamespace } from "../helpers/console-ready-namespace.mjs";
+import { createReadyConsoleNamespace } from "../helpers/console-ready-namespace.ts";
 import { createTestSecretDriver } from "../helpers/secret-driver.mjs";
 import {
+  persistedDeploymentError,
   apiRequests,
   login,
   nativeValues,
   newPage,
   nonAuthWriteRequests,
   pathRequests,
-  persistedDeploymentError,
   recordLayoutShifts,
   secretOptionLabel,
   secretPostRequests,
   selectSecret,
-  settledFetches,
   takeLayoutShifts,
-  trackSettledFetches,
   waitForCondition,
   waitForEnabled,
+} from "./console-agents-browser-helpers.ts";
+
+import {
+  settledFetches,
+  trackSettledFetches,
   waitForIdleFetches,
   waitForSettledFetches,
-} from "./console-agents-browser-helpers.mjs";
+} from "./console-fetch-accounting.ts";
 import {
   configurationPostRequests,
   routeInstallationProvisioning,
   routeInstallationWithoutProvisioning,
   agentPostRequests,
   raceAgentName,
-  routeProvisioningJob,
-  provisioningJob,
 } from "./console-agents-test-support.mjs";
+import { provisioningJob, routeProvisioningJob } from "./console-provisioning-job-fixture.ts";
 import {
   AGENT_NAME_CONFLICT,
   CONSOLE_NAMESPACE_NOT_READY,
@@ -240,7 +242,7 @@ for (const malformed of ["revision ID", "error message"] as const) {
     await routeDedicatedProvisioning(page, fixture, namespace);
     const root = `/namespaces/${namespace.id}/agents/provision`;
     const work = provisioningJob(namespace.id, `work_${randomUUID()}`);
-    const served = await routeProvisioningJob(page, work, null);
+    const served = await routeProvisioningJob(page, fixture, work, null);
     const meta = { requestId: `req_${randomUUID()}` };
     const malformedMessage = { detail: "Unreadable provisioning message" };
     await page.route(`${fixture.origin}${work.url}`, (route) => {
@@ -957,6 +959,7 @@ test("Dedicated Agent creation distinguishes stopped, superseded and failed firs
   // A versioned job already identifies its revision when Create admits it.
   await routeProvisioningJob(
     page,
+    fixture,
     {
       ...work,
       job: (status, extra) =>
@@ -1075,7 +1078,7 @@ test("Dedicated Agent creation keeps the first revision observed after admission
         error: { code: "REVISION_SUPERSEDED", message: "Deployment was superseded." },
       }),
     ];
-    const served = await routeProvisioningJob(page, work, (index) => {
+    const served = await routeProvisioningJob(page, fixture, work, (index) => {
       const observation = observations[index];
       assert.ok(observation, "unexpected additional provisioning poll");
       return observation;
@@ -1294,7 +1297,7 @@ test("Dedicated Agent creation keeps one provisioning label while the job retrie
   const { url, job, failed } = work;
   // The worker starts the job, waits to retry it, then retries it twice before it fails.
   const reads = [job("running"), job("queued"), job("running"), job("running"), failed()];
-  const served = await routeProvisioningJob(page, work, reads);
+  const served = await routeProvisioningJob(page, fixture, work, reads);
 
   await trackSettledFetches(page);
   await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`);
@@ -1354,7 +1357,7 @@ test("Dedicated Agent creation names a full Namespace Pod quota while it waits",
       job("running", handedOff),
       failed(handedOff),
     ];
-    const served = await routeProvisioningJob(page, work, reads);
+    const served = await routeProvisioningJob(page, fixture, work, reads);
     const attempts: (ProvisioningMessage | "stalled" | "unavailable")[] =
       mode === "interrupted"
         ? [
@@ -1582,7 +1585,7 @@ test("Dedicated Agent creation names the first deployment's wait while it provis
       job("queued", waiting(null)),
       failed(handedOff),
     ];
-    const served = await routeProvisioningJob(page, work, reads);
+    const served = await routeProvisioningJob(page, fixture, work, reads);
     await page.route(
       `**/namespaces/${namespace.id}/agents/${agentId}/deployments/${revisionId}`,
       (route) => {
@@ -2752,6 +2755,15 @@ test("Agent creation reuses its saved Secret and Configuration after an Agent cr
   const fixture = await createConsoleAppFixture(t);
   await fixture.bootstrap();
   const pluginDriver = new CodexPluginDriver();
+  // Keep optional catalog prefetch local while exercising the real Agent creation conflict.
+  t.mock.method(
+    pluginDriver,
+    "discoverCatalog",
+    async (): ReturnType<typeof pluginDriver.discoverCatalog> => ({
+      plugins: [],
+      nextCursor: null,
+    }),
+  );
   fixture.controller.registerDriver(pluginDriver);
   fixture.controller.selectDriver("plugin", pluginDriver.id);
   const namespace = await fixture.createNamespace("Partial save retry", { ready: true });
