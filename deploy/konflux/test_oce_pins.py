@@ -222,6 +222,32 @@ class RecipeDriftTests(unittest.TestCase):
         after = "# escape=@\n" + dockerfile()
         self.assertEqual(len(self.drift(before, after)), 1)
 
+    def bridge_tests(self, files="a.test.ts b.test.ts", graphs='["core"]', extra=""):
+        return dockerfile(
+            extra="FROM patched AS openclaw-bridge-tests\n"
+            f"RUN node scripts/test-projects.mts {files.replace(' ', ' \\\n    ')}\n"
+            f"RUN node scripts/run-tsgo-core-test-shards.mjs --ci-graphs-json '{graphs}'\n"
+            f"{extra}FROM patched AS openclaw-build\n"
+        )
+
+    def test_bridge_test_selection_change_has_no_drift(self):
+        after = self.bridge_tests(files="a.test.ts b.test.ts c.test.tsx", graphs='["core","core-test-ui-app"]')
+        self.assertEqual(self.drift(self.bridge_tests(), after), [])
+
+    def test_bridge_test_runner_change_is_drift(self):
+        after = self.bridge_tests().replace("scripts/test-projects.mts a.test.ts", "scripts/test-projects.mts --bail a.test.ts")
+        self.assertEqual(len(self.drift(self.bridge_tests(), after)), 1)
+
+    def test_later_bridge_test_run_change_is_drift(self):
+        before = self.bridge_tests(extra="RUN node scripts/test-projects.mts cua.test.ts\n")
+        after = self.bridge_tests(extra="RUN node scripts/test-projects.mts cua.test.ts other.test.ts\n")
+        self.assertEqual(len(self.drift(before, after)), 1)
+
+    def test_test_files_outside_the_stage_are_drift(self):
+        before = dockerfile(extra="RUN node scripts/test-projects.mts a.test.ts")
+        after = dockerfile(extra="RUN node scripts/test-projects.mts b.test.ts")
+        self.assertEqual(len(self.drift(before, after)), 1)
+
     def test_new_bridge_patch_is_drift(self):
         problems = self.drift(dockerfile(), dockerfile(patches=("one.patch", "two.patch")))
         self.assertTrue(any("bridge patches differ" in problem for problem in problems))

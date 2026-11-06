@@ -23,6 +23,8 @@ repository (RHAI-16354), which built them from a pinned commit of this fork.
 - `deploy/konflux/<image>/smoke-test.sh`: image checks, using `common.sh`.
 - `deploy/konflux/oce_pins.py`: derives the runtime pins and detects recipe
   drift (see below). `test_oce_pins.py` holds its unit tests.
+- `deploy/konflux/oce-bridge-tests.mjs`: reads the bridge test selection from
+  `deploy/runtime/Dockerfile` during the runtime build.
 - `.github/renovate.json`: extends the org MintMaker default, which only
   bumps digests in Konflux Dockerfiles. Automerge stays off for these images
   until a Konflux build gates the updates.
@@ -52,7 +54,10 @@ python3 deploy/konflux/oce_pins.py --check    # list stale pins and the recipe d
 
 `--check` masks pin values, bridge patch checksums, comments and whitespace,
 then diffs each upstream recipe against the commit recorded in that image's
-`OCE_REVIEWED_COMMIT`. For the controller it skips the `development` stage,
+`OCE_REVIEWED_COMMIT`. It also masks the bridge test selection: the runtime
+build reads the test files and type-check graphs of the `openclaw-bridge-tests`
+stage from `deploy/runtime/Dockerfile` with `oce-bridge-tests.mjs`, so a change
+to those lists needs no port. For the controller it skips the `development` stage,
 which the port does not carry. Port what the diff shows, then record the port:
 
 ```sh
