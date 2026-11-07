@@ -9,8 +9,10 @@ import { isIP } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { isDeepStrictEqual } from "node:util";
 import { renderPresetTemplate } from "../../packages/contracts/src/index.ts";
 import { managedGatewayConfiguration } from "../../apps/controller/src/drivers/compute/gateway-tool-policy.ts";
+import { normalizeOpenAiBaseUrl } from "../../apps/controller/src/drivers/openai-endpoint.ts";
 import {
   authenticatedHeaders,
   createAuthenticatedControllerRequest,
@@ -2384,7 +2386,26 @@ async function arrangeProductionTopology(testContext, mode, slack, options = {})
   }
   secretApi = { ...secretApi, configuration: configuration.data };
   const persistedAgent = await storedAgent(observerPool, namespaceId, agent.data.id);
-  assert.deepEqual(deployed.data.harness, { id: harnessId, version: "1.0.0", mode });
+  const fixtureProvider = apiConfiguration.drivers.compute.configuration.runtime.modelProvider ?? {
+    protocol: "openai-responses",
+    baseUrl: "https://api.openai.com/v1",
+  };
+  assert.ok(
+    isDeepStrictEqual(deployed.data.harness, {
+      id: harnessId,
+      version: "1.0.0",
+      mode,
+      overrides: {},
+      configuration: {
+        modelProvider: {
+          protocol: fixtureProvider.protocol,
+          baseUrl: normalizeOpenAiBaseUrl(fixtureProvider.baseUrl),
+          supportsStandaloneWebSearch: fixtureProvider.supportsStandaloneWebSearch === true,
+        },
+      },
+    }),
+    "deployed Harness descriptor must match the fixture's configured or default model provider",
+  );
   assert.deepEqual(deployed.data.harnessAuth, agent.data.harnessAuth);
   assert.equal(Object.hasOwn(deployed.data, "serviceAccount"), false);
   for (const [description, response] of [
@@ -6396,7 +6417,10 @@ async function assertRoutedWorkspaceFileReads(topology, files) {
   const basePath = `/namespaces/${topology.agent.namespaceId}/agents/${topology.agent.id}/workspace/files`;
   for (const [name, content] of files) {
     const observed = await topology.workspaceRequest("GET", `${basePath}/${name}`);
-    assert.equal(observed.status, 200, JSON.stringify(observed.error));
+    const { status } = observed;
+    const diagnosticStatus =
+      Number.isInteger(status) && status >= 100 && status <= 599 ? status : "unknown";
+    assert.equal(diagnosticStatus, 200, `workspace-file GET returned HTTP ${diagnosticStatus}`);
     assert.deepEqual(observed.data, { name, content });
   }
 }
