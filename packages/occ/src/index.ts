@@ -1,3 +1,4 @@
+import { deploymentRepositoryAccessStatus } from "./deployment-repository-access.ts";
 import { exchangeAuthorizationCode, startBrowserAuthorization } from "./browser-authorization.ts";
 import { NativeIAMDriver } from "@openclaw-enterprise/iam";
 import { isReducedCredentialPlan } from "./credential-policy-reduction.ts";
@@ -207,6 +208,8 @@ import type {
   Preset,
   PresetSummary,
   PresetTemplate,
+  PresetDraftTemplate,
+  PresetDraftDefinition,
   PermissionAction,
   PluginDesiredSelection,
   PluginDesiredState,
@@ -460,6 +463,7 @@ export type { OperationRefusalHintCode } from "./state/controller-work.ts";
 export {
   ActivationFailedError,
   ComputePreparationFailedError,
+  RepositoryExecutionRequiresRedeployError,
   ActivationPendingError,
   agentEntryMessage,
   AgentCredentialSourceBindingError,
@@ -841,7 +845,7 @@ export interface ControllerOptions {
   readonly state?: PlatformStateStore;
   readonly recordOperations?: boolean;
   readonly backends?: readonly BackendDefinition[];
-  readonly defaultPresets?: readonly Pick<Preset, "name" | "template">[];
+  readonly defaultPresets?: readonly PresetDraftDefinition[];
   /**
    * Every shipped version of the bundled default Presets, current and superseded, loaded
    * whether or not `presets.includeDefaults` seeds them. Startup refreshes Namespace copies
@@ -881,9 +885,7 @@ export interface ServiceAccountDeletion {
 }
 
 /** One shipped version of a bundled default Preset (`deploy/presets/archive/versions.json`). */
-export interface BundledPresetVersion {
-  readonly name: string;
-  readonly template: PresetTemplate;
+export interface BundledPresetVersion extends PresetDraftDefinition {
   /** Bundled file this version shipped as, for example `standard-codex.json`. */
   readonly file: string;
   /** Canonical-JSON digest that names this version in the archive. */
@@ -2060,9 +2062,7 @@ function normalizeAgentPlugins(
   return normalizePluginDesiredState(plugins, invalidPluginRequest);
 }
 
-function normalizeAgentPluginApprovers(
-  approvers: PluginApprovers | undefined,
-): PluginApprovers | undefined {
+function normalizeAgentPluginApprovers(approvers: unknown): PluginApprovers | undefined {
   return normalizePluginApprovers(approvers, invalidPluginRequest);
 }
 
@@ -2266,7 +2266,7 @@ export class OpenClawController {
   private readonly selections = new Map<DriverCapability, RegisteredDriver>();
   private pluginRegistrations: readonly RegisteredDriver[] = [];
   private readonly backends: readonly BackendDefinition[];
-  private readonly defaultPresets: readonly Pick<Preset, "name" | "template">[];
+  private readonly defaultPresets: readonly PresetDraftDefinition[];
   private readonly bundledPresetVersions: readonly BundledPresetVersion[];
   private readonly refreshBundledDefaultPresets: boolean;
   private readonly loggingLevel: LoggingLevel;
@@ -6100,6 +6100,13 @@ export class OpenClawController {
         work.state === "queued" || work.state === "claimed"
           ? await state.operations.findWorkAttempt(idempotencyKey)
           : undefined;
+      const repositoryAccess = deploymentRepositoryAccessStatus(
+        await state.operations.hasRepositoryExecutionRedeployRequired({
+          namespaceId: revision.namespaceId,
+          agentId: revision.agentId,
+          revisionId: revision.id,
+        }),
+      );
       return Object.freeze({
         deploymentId: revision.id,
         namespaceId: revision.namespaceId,
@@ -6107,6 +6114,7 @@ export class OpenClawController {
         status: deploymentStatusForWork(work, attempt, this.clock()),
         cleanup: await this.deploymentCleanupStatus(state, revision),
         error: deploymentErrorForWork(work),
+        ...(repositoryAccess === undefined ? {} : { repositoryAccess }),
         warnings: deploymentWarningsForWork(work),
         progress: deploymentProgressForWork(work, attempt),
       });
@@ -6713,7 +6721,7 @@ export class OpenClawController {
     state: PlatformUnitOfWork,
     principalId: string,
     namespace: Readonly<Namespace>,
-    seeded: Pick<Preset, "name" | "template">,
+    seeded: PresetDraftDefinition,
     copy: Readonly<Preset>,
     refresh: {
       readonly skip: DefaultPresetRefreshSkip;
@@ -7005,7 +7013,7 @@ export class OpenClawController {
     );
   }
 
-  private presetMatchesTemplate(preset: Readonly<Preset>, template: PresetTemplate): boolean {
+  private presetMatchesTemplate(preset: Readonly<Preset>, template: PresetDraftTemplate): boolean {
     try {
       return isDeepStrictEqual(
         normalizePresetTemplate(template, preset.namespaceId),
@@ -7017,7 +7025,7 @@ export class OpenClawController {
   }
 
   private async admitPresetTemplate(
-    input: PresetTemplate,
+    input: PresetDraftTemplate,
     namespaceId: string,
   ): Promise<PresetTemplate> {
     const template = normalizePresetTemplate(input, namespaceId);
@@ -7091,7 +7099,7 @@ export class OpenClawController {
     }
     if (literal("pluginApprovers") && this.pluginRegistrations.length > 0) {
       checked("pluginApprovers", () => {
-        const approvers = normalizeAgentPluginApprovers(agent.pluginApprovers as PluginApprovers);
+        const approvers = normalizeAgentPluginApprovers(agent.pluginApprovers);
         // The Harness can be filled in at launch. Reject a literal here only when
         // every enabled catalog would refuse it.
         let refusal: PluginPolicyValidationError | undefined;
