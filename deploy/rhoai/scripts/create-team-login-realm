@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Create a new local-account Keycloak realm; refuse existing private state or realm.
+
+The other team-login scripts load this file with
+``runpy.run_path(..., run_name="existing_realm")`` and read module-level names:
+``root``, ``env``, ``request``, ``save``, ``token``, ``realm``, ``admin``,
+``issuer``, ``ui``, ``ns``, ``gateway``, and ``host``. Keep them module-level.
+The non-``__main__`` run_name skips realm creation.
+"""
+import base64
+import hashlib
+import json
+import os
+import pathlib
+import secrets
+import subprocess
+import urllib.request
+import urllib.parse
+import uuid
+
+os.umask(0o077)
+root = pathlib.Path(os.environ["TEAM_LOGIN_DIRECTORY"]).expanduser().resolve()
+root.mkdir(mode=0o700, parents=True, exist_ok=True)
+env = dict(os.environ)
+if not env.get("KUBECONFIG"):
+    raise SystemExit("Set KUBECONFIG explicitly")
+base = os.environ["KEYCLOAK_URL"].rstrip("/")
+realm = os.environ.get("KEYCLOAK_REALM", "team-claw")
+issuer = base + "/realms/" + realm
+host = os.environ["TEAM_CLAW_HOST"]
+ui = "https://" + host
+ns = os.environ["GATEWAY_NAMESPACE"]
+gateway = os.environ["GATEWAY_SERVICE"]
+if not base.startswith("https://"):
+    raise SystemExit("KEYCLOAK_URL must use HTTPS")
+
+
+def oc(*args):
+    p = subprocess.run(["oc", *args], env=env, capture_output=True, text=True)
+    if p.returncode:
+        raise RuntimeError("OpenShift command failed; no credentials printed")
+    return p.stdout
+
+
+def save(name, data):
+    (root / name).write_text(
+        json.dumps(data, indent=2) + "\n" if not isinstance(data, str) else data
+    )
+
+
+def request(url, data=None, method=None, token=None):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(data).encode() if data is not None else None,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=40) as r:
+            return (
+                json.load(r)
+                if r.status != 204 and r.headers.get("Content-Length") != "0"
+                else None
+            )
+    except urllib.error.HTTPError as e:
+        save("last-http-error-private.txt", e.read().decode())
+        raise RuntimeError("Keycloak request failed HTTP " + str(e.code)) from None
+
+
+s = json.loads(
+    oc(
+        "-n",
+        os.environ.get("KEYCLOAK_NAMESPACE", "openshell-auth"),
+        "get",
+        "secret",
+        os.environ.get("KEYCLOAK_ADMIN_SECRET", "openshell-keycloak-initial-admin"),
+        "-o",
+        "json",
+    )
+)["data"]
+req = urllib.request.Request(
+    base + "/realms/master/protocol/openid-connect/token",
+    data=urllib.parse.urlencode(
+        {
+            "client_id": "admin-cli",
+            "username": base64.b64decode(s["username"]).decode(),
+            "password": base64.b64decode(s["password"]).decode(),
+            "grant_type": "password",
+        }
+    ).encode(),
+)
+with urllib.request.urlopen(req, timeout=40) as r:
+    token = json.load(r)["access_token"]
+admin = base + "/admin/realms"
+if __name__ == "__main__":
+    if (root / "settings.json").exists():
+        raise RuntimeError("Private state exists; inspect rather than reprovision")
+    if realm in [x["realm"] for x in request(admin, token=token)]:
+        raise RuntimeError("Realm already exists; stop before overwriting")
+    names = json.loads(pathlib.Path(os.environ["TEAM_USERS_FILE"]).read_text())
+    admins = json.loads(pathlib.Path(os.environ["TEAM_ADMIN_USERS_FILE"]).read_text())
+    if (
+        not names
+        or not all(isinstance(n, str) and n.strip() == n and n for n in names)
+        or len(names) != len(set(names))
+        or not set(admins).issubset(names)
+    ):
+        raise SystemExit("Supply unique usernames and administrators from that list")
+    users = {
+        n: {"id": str(uuid.uuid4()), "password": secrets.token_urlsafe(28)}
+        for n in names
+    }
+    clientSecret = secrets.token_urlsafe(40)
+    doc = {
+        "realm": realm,
+        "enabled": True,
+        "registrationAllowed": False,
+        "resetPasswordAllowed": False,
+        "loginWithEmailAllowed": False,
+        "editUsernameAllowed": False,
+        "sslRequired": "all",
+        "bruteForceProtected": True,
+        "ssoSessionIdleTimeout": 28800,
+        "ssoSessionMaxLifespan": 28800,
+        "accessTokenLifespan": 300,
+        "groups": [{"name": "team-claw-members"}],
+        "clients": [
+            {
+                "clientId": "team-claw-browser",
+                "enabled": True,
+                "protocol": "openid-connect",
+                "publicClient": False,
+                "secret": clientSecret,
+                "standardFlowEnabled": True,
+                "directAccessGrantsEnabled": False,
+                "redirectUris": [ui + "/oauth2/callback"],
+                "webOrigins": [ui],
+                "attributes": {"pkce.code.challenge.method": "S256"},
+                "defaultClientScopes": [
+                    "basic",
+                    "profile",
+                    "roles",
+                    "web-origins",
+                    "acr",
+                ],
+                "protocolMappers": [
+                    {
+                        "name": "team-membership",
+                        "protocol": "openid-connect",
+                        "protocolMapper": "oidc-group-membership-mapper",
+                        "config": {
+                            "full.path": "true",
+                            "claim.name": "groups",
+                            "id.token.claim": "true",
+                            "access.token.claim": "true",
+                            "userinfo.token.claim": "true",
+                        },
+                    }
+                ],
+            }
+        ],
+        "users": [
+            {
+                "id": u["id"],
+                "username": n,
+                "enabled": True,
+                "firstName": n,
+                "lastName": "",
+                "groups": ["/team-claw-members"],
+                "requiredActions": ["UPDATE_PASSWORD"],
+                "credentials": [
+                    {"type": "password", "value": u["password"], "temporary": True}
+                ],
+            }
+            for n, u in users.items()
+        ],
+    }
+    save("realm-bootstrap-private.json", doc)
+    save("initial-passwords.json", {n: u["password"] for n, u in users.items()})
+    save("client-secret", clientSecret)
+    prefix = "oidc:" + hashlib.sha256(issuer.encode()).hexdigest() + ":"
+    save(
+        "settings.json",
+        {
+            "issuer": issuer,
+            "host": host,
+            "url": ui,
+            "realm": realm,
+            "namespace": ns,
+            "gatewayService": gateway,
+            "identities": {n: prefix + u["id"] for n, u in users.items()},
+            "administrators": admins,
+            "agentId": os.environ["AGENT_ID"],
+            "identityPrefix": prefix,
+        },
+    )
+    request(admin, doc, "POST", token)
+    # These local accounts authenticate by username. Do not invent verified email addresses.
+    profile = request(admin + "/" + realm + "/users/profile", token=token)
+    for a in profile["attributes"]:
+        if a["name"] in ["email", "lastName"]:
+            a.pop("required", None)
+    request(admin + "/" + realm + "/users/profile", profile, "PUT", token)
+    # Keycloak paginates users (100 by default); -1 returns the whole list.
+    live = request(admin + "/" + realm + "/users?max=-1", token=token)
+    live_ids = {x["username"]: x["id"] for x in live}
+    expected_ids = {n: u["id"] for n, u in users.items()}
+    if live_ids != expected_ids:
+        raise SystemExit("Realm users do not match the requested accounts; inspect before retry")
+    print(
+        json.dumps(
+            {
+                "realmCreated": realm,
+                "users": names,
+                "passwordChangeRequired": True,
+                "directory": str(root),
+            }
+        )
+    )

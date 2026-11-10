@@ -1,0 +1,13 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: oce-widget-preview-tls
+  namespace: openclaw-system
+spec:
+  secretName: oce-widget-preview-tls
+  dnsNames:
+    - '*.${WIDGET_DOMAIN}'
+  issuerRef:
+    name: ${WIDGET_ISSUER}
+    kind: Issuer
+    group: cert-manager.io

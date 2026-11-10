@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${OCE_CHECKOUT:?Set the OCE source checkout}"
+repository=$(cd "$(dirname "$0")/.." && pwd -P)
+install -d -m 700 "$repository/bin"
+go -C "$OCE_CHECKOUT" build -trimpath -o "$repository/bin/occ" ./cmd/occ

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Helm post-renderer for the openshell-dashboard release, not a cluster tool.
+# Resolve the public Keycloak issuer to the router Service inside the Pod so the
+# enforced egress policy admits OIDC traffic without changing the issuer URL.
+set -euo pipefail
+
+: "${KEYCLOAK_HOST:?Set the dashboard OIDC issuer hostname}"
+: "${ROUTER_IP:?Set the router Service ClusterIP}"
+
+exec yq eval '
+  with(select(.kind == "Deployment" and
+      .metadata.labels."app.kubernetes.io/name" == "openshell-dashboard");
+    .spec.template.spec.hostAliases =
+      [{"ip": strenv(ROUTER_IP), "hostnames": [strenv(KEYCLOAK_HOST)]}]
+  )' -

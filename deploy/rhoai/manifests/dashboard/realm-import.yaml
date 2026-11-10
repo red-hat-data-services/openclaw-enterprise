@@ -1,0 +1,66 @@
+# Client scopes and audience follow the dashboard's published Keycloak realm.
+apiVersion: k8s.keycloak.org/v2beta1
+kind: KeycloakRealmImport
+metadata:
+  name: openshell-dashboard
+  namespace: openshell-auth
+spec:
+  keycloakCRName: openshell-keycloak
+  placeholders:
+    DASHBOARD_CLIENT_SECRET:
+      secret: { name: dashboard-realm-bootstrap, key: client-secret }
+    DASHBOARD_USER_PASSWORD:
+      secret: { name: dashboard-realm-bootstrap, key: user-password }
+  realm:
+    realm: openshell
+    enabled: true
+    roles:
+      client:
+        openshell-api:
+          - name: openshell-admin
+          - name: openshell-user
+    groups:
+      - name: openshell-admins
+        clientRoles:
+          openshell-api: [openshell-admin]
+      - name: openshell-users
+        clientRoles:
+          openshell-api: [openshell-user]
+    clients:
+      - clientId: openshell-api
+        enabled: true
+        protocol: openid-connect
+        publicClient: false
+        standardFlowEnabled: false
+        directAccessGrantsEnabled: false
+        serviceAccountsEnabled: false
+      - clientId: openshell-dashboard
+        enabled: true
+        protocol: openid-connect
+        publicClient: false
+        secret: ${DASHBOARD_CLIENT_SECRET}
+        standardFlowEnabled: true
+        directAccessGrantsEnabled: false
+        serviceAccountsEnabled: false
+        fullScopeAllowed: false
+        defaultClientScopes: [basic, web-origins, acr, profile, roles, email]
+        redirectUris: ["https://${DASHBOARD_HOST}/oauth2/callback"]
+        attributes:
+          pkce.code.challenge.method: S256
+          post.logout.redirect.uris: "https://${DASHBOARD_HOST}/*"
+    clientScopeMappings:
+      openshell-api:
+        - client: openshell-dashboard
+          roles: [openshell-admin, openshell-user]
+    users:
+      - username: dashboard-admin
+        enabled: true
+        email: dashboard-admin@example.test
+        emailVerified: true
+        firstName: Dashboard
+        lastName: Administrator
+        groups: [/openshell-admins]
+        credentials:
+          - type: password
+            value: ${DASHBOARD_USER_PASSWORD}
+            temporary: false

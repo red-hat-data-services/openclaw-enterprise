@@ -1,0 +1,56 @@
+# OpenShift test-cluster profile for the pinned OpenShell v0.1.6 chart.
+# The plaintext, unauthenticated gateway is for isolated single-tenant clusters.
+# Its NetworkPolicy boundary matches namespace and pod labels, and labels are not
+# an authentication boundary: a user who can set them can reach the gateway.
+# Use the openshell-mtls overlay (allowUnauthenticatedUsers: false, mTLS) on any
+# cluster with users beyond the OCE control plane.
+fullnameOverride: openshell-gateway
+server:
+  disableTls: true
+  auth:
+    allowUnauthenticatedUsers: true
+  drivers:
+    kubernetes:
+      allowDriverConfig: true
+      resourceAdmission:
+        enabled: false
+      workspaceMode: operator
+      operatorNamespaceLabel: openshell.ai/openclaw-workspace=true
+# OpenShell 0.1.5 rejects Sandbox template labels unless the operator allows them.
+# Images: Red Hat Konflux builds of the v0.1.6-rhaiv.3 midstream release
+# (opendatahub-io/openshell), published on quay.io/opendatahub.
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    allowed_pod_labels:
+      - openclaw.dev/*
+      - app.kubernetes.io/name
+      - app.kubernetes.io/managed-by
+serviceAccount:
+  name: openshell-gateway
+sandboxServiceAccount:
+  name: openshell-sandbox
+workspaceResources:
+  enabled: false
+podSecurityContext:
+  fsGroup: null
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  runAsUser: null
+service:
+  type: ClusterIP
+gateway:
+  image:
+    registry: quay.io
+    repository: opendatahub/odh-openshell-gateway
+    digest: sha256:818aa0661fdf6a1e23a0484042aa5052a4ff3992eba196bc7a15837df1d1eb50
+sandboxRuntime:
+  image:
+    registry: quay.io
+    repository: opendatahub/odh-openshell-sandbox
+    digest: sha256:a26749a10cb0c68e56784486bc287a7a6ee5af0e65a6b3a2dc1c94d67cbcf144
+supervisor:
+  image:
+    registry: quay.io
+    repository: opendatahub/odh-openshell-supervisor
+    digest: sha256:7d9f48627abef8a7d9518a46b7e74875fa7187ca503bcd2e15533cb7d4fc745a

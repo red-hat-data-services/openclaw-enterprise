@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Prepare both managed Slack proxy paths in private inputs; never apply resources.
+set -euo pipefail
+umask 077
+: "${OCE_CHECKOUT:?Set the checkout matching the installed OCE release}"
+: "${OCC_INPUT_DIRECTORY:?Set the existing private installation input directory}"
+repository=$(cd "$(dirname "$0")/.." && pwd -P)
+OCE_CHECKOUT=$(cd "$OCE_CHECKOUT" && pwd -P)
+export OCC_INPUT_DIRECTORY
+OCC_INPUT_DIRECTORY=$(cd "$OCC_INPUT_DIRECTORY" && pwd -P)
+case "$OCC_INPUT_DIRECTORY/" in
+  "$repository/"*|"$OCE_CHECKOUT/"*) echo 'Keep deployment inputs outside both checkouts.' >&2; exit 1 ;;
+esac
+for name in values installation; do
+  test -f "$OCC_INPUT_DIRECTORY/$name.yaml"
+done
+test -f "$OCE_CHECKOUT/deploy/helm/openclaw-enterprise/templates/slack-proxy.yaml" || {
+  echo 'The selected OCE release does not include the managed Slack proxy.' >&2
+  exit 1
+}
+if [[ -n "$(yq -r '.api.channelDirectoryProxyUrl // ""' "$OCC_INPUT_DIRECTORY/values.yaml")" ]]; then
+  echo 'An external Slack directory proxy is configured; review it before selecting the managed proxy.' >&2
+  exit 1
+fi
+
+export SLACK_PROXY_SERVICE
+SLACK_PROXY_SERVICE=$(yq -er '.slackProxy.serviceName // "openclaw-enterprise-slack-proxy"' "$OCC_INPUT_DIRECTORY/values.yaml")
+export SLACK_PROXY_PORT
+SLACK_PROXY_PORT=$(yq -er '.slackProxy.port // 3128' "$OCC_INPUT_DIRECTORY/values.yaml")
+export SLACK_PROXY_HOST="$SLACK_PROXY_SERVICE.openclaw-system.svc"
+yq -i '.drivers.compute.configuration.runtime.channels.proxyUrl =
+    "http://" + strenv(SLACK_PROXY_HOST) + ":" + strenv(SLACK_PROXY_PORT) |
+  .drivers.compute.configuration.runtime.channels.managedProxy = {
+    "hostname":strenv(SLACK_PROXY_HOST), "namespace":"openclaw-system",
+    "podLabels":{"app.kubernetes.io/name":"openclaw-enterprise",
+      "app.kubernetes.io/instance":"oce", "app.kubernetes.io/component":"slack-proxy"},
+    "port":env(SLACK_PROXY_PORT)}' "$OCC_INPUT_DIRECTORY/installation.yaml"
+export OCC_INSTALLATION_CHECKSUM
+OCC_INSTALLATION_CHECKSUM=$(sha256sum "$OCC_INPUT_DIRECTORY/installation.yaml" | cut -d ' ' -f 1)
+yq -i '.slackProxy.enabled = true |
+  .slackProxy.serviceName = strenv(SLACK_PROXY_SERVICE) |
+  .slackProxy.port = env(SLACK_PROXY_PORT) |
+  .controlPlane.installationChecksum = strenv(OCC_INSTALLATION_CHECKSUM)' \
+  "$OCC_INPUT_DIRECTORY/values.yaml"
+
+printf 'Prepared API and gateway Slack proxy inputs. No cluster resources changed.\n'
+printf 'For an existing installation, apply them and redeploy affected Agents.\n'
+printf 'See deploy/rhoai/README.md#other-profiles.\n'

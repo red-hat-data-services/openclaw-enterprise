@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${OCE_CHECKOUT:?Set the OCE source checkout}"
+input=${1:?Usage: validate-installation /absolute/path/installation.yaml}
+[[ "$input" == /* ]] || { echo 'Use an absolute Installation file path.' >&2; exit 1; }
+cd "$OCE_CHECKOUT"
+node --input-type=module -e '
+  import { loadInstallationConfiguration } from "./apps/controller/src/composition/installation-config.ts";
+  await loadInstallationConfiguration({mode:"production",environment:{OCC_CONFIG_PATH:process.argv[1]}});
+  console.log("Installation configuration valid");
+' "$input"

@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Create missing local realm users with per-account temporary passwords."""
+
+import json
+import os
+import pathlib
+import runpy
+import secrets
+import urllib.parse
+
+context = runpy.run_path(
+    str(pathlib.Path(__file__).with_name("create-team-login-realm")),
+    run_name="existing_realm",
+)
+request = context["request"]
+save = context["save"]
+token = context["token"]
+realm = context["realm"]
+if realm == "master":
+    raise SystemExit("Use an application realm, not the administrator realm")
+admin = context["admin"] + "/" + urllib.parse.quote(realm, safe="")
+request(admin, token=token)
+names = json.loads(pathlib.Path(os.environ["TEAM_USERS_FILE"]).read_text())
+if (
+    not names
+    or not all(isinstance(n, str) and n and n.strip() == n for n in names)
+    or len({n.casefold() for n in names}) != len(names)
+):
+    raise SystemExit("Supply unique, nonempty teammate usernames")
+
+
+def find(name):
+    query = urllib.parse.urlencode({"username": name, "exact": "true"})
+    users = request(admin + "/users?" + query, token=token)
+    return [u for u in users if u["username"].casefold() == name.casefold()]
+
+
+def find_group(path):
+    name = path.rstrip("/").rsplit("/", 1)[-1]
+    query = urllib.parse.urlencode({"search": name, "exact": "true"})
+    groups = request(admin + "/groups?" + query, token=token)
+    return [group for group in groups if group["path"] == path]
+
+
+root = context["root"]
+settings_path = root / "settings.json"
+# A saved login names the Agent group, which must exist already. Without saved
+# settings, prepare only the accounts here: add-agent-keycloak-client creates the
+# Agent group and adds these users afterwards.
+group = None
+if settings_path.exists():
+    allowed_group = json.loads(settings_path.read_text()).get(
+        "allowedGroup", "/team-claw-members"
+    )
+    matches = find_group(allowed_group)
+    if len(matches) != 1:
+        raise SystemExit("The configured membership group must already exist")
+    group = matches[0]
+
+
+# Inspect every account before creating any; disabled or ambiguous users need review.
+existing = {}
+for name in names:
+    matches = find(name)
+    if len(matches) > 1 or (matches and not matches[0].get("enabled")):
+        raise SystemExit("A requested account is disabled or ambiguous; no users created")
+    if matches:
+        existing[name] = matches[0]
+
+created = []
+passwords_file = "initial-passwords.json"
+initial = {}
+if (root / passwords_file).exists():
+    initial = json.loads((root / passwords_file).read_text())
+users = []
+for name in names:
+    if name in existing:
+        user = existing[name]
+    else:
+        temporary_password = secrets.token_urlsafe(28)
+        # Persist before creation: a created account must never strand its password.
+        initial[name.lower()] = temporary_password
+        save(passwords_file, initial)
+        request(
+            admin + "/users",
+            {
+                "username": name.lower(),
+                "firstName": name,
+                "enabled": True,
+                "requiredActions": ["UPDATE_PASSWORD"],
+                "credentials": [
+                    {"type": "password", "value": temporary_password, "temporary": True}
+                ],
+            },
+            "POST",
+            token,
+        )
+        matches = find(name)
+        if len(matches) != 1:
+            raise RuntimeError("Created account could not be resolved; inspect before retry")
+        user = matches[0]
+        created.append(user["username"])
+        initial[user["username"]] = temporary_password
+        save(passwords_file, initial)
+    users.append({"requested": name, "username": user["username"], "id": user["id"]})
+    if group is not None:
+        memberships = request(admin + "/users/" + user["id"] + "/groups", token=token)
+        if group["id"] not in {entry["id"] for entry in memberships}:
+            request(
+                admin + "/users/" + user["id"] + "/groups/" + group["id"],
+                method="PUT",
+                token=token,
+            )
+
+save("normalized-users.json", [u["username"] for u in users])
+save("prepared-users.json", {"realm": realm, "users": users, "created": created})
+if initial:
+    save("initial-passwords.json", initial)
+print(
+    json.dumps(
+        {
+            "realm": realm,
+            "created": created,
+            "existingPasswordsChanged": False,
+            "initialPasswordsFile": "initial-passwords.json" if initial else None,
+        }
+    )
+)

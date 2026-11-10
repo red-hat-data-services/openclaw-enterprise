@@ -1,0 +1,50 @@
+# Egress for the dashboard's OIDC proxy: gateway, Keycloak through the router, and DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openshell-dashboard-egress
+  namespace: openshell-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openshell-dashboard
+      app.kubernetes.io/instance: openshell-dashboard
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: openshell-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-ingress
+          podSelector:
+            matchLabels:
+              ingresscontroller.operator.openshift.io/deployment-ingresscontroller: default
+        - ipBlock:
+            cidr: ${ROUTER_CIDR}
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+          podSelector:
+            matchLabels:
+              dns.operator.openshift.io/daemonset-dns: default
+        - ipBlock:
+            cidr: ${DNS_CIDR_0}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 5353
+        - protocol: TCP
+          port: 5353

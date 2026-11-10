@@ -1,0 +1,17 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openshell-dashboard-gateway-access
+  namespace: openshell-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: openshell-gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: openshell-dashboard
+              app.kubernetes.io/instance: openshell-dashboard
+      ports: [{ protocol: TCP, port: 8080 }]

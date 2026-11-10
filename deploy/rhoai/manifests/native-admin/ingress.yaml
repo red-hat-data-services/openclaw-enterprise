@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ${ENDPOINT_NAME}
+  namespace: ${TLS_NAMESPACE}
+spec:
+  ingressClassName: openshift-default
+  tls:
+    - hosts:
+        - ${ENDPOINT_HOST}
+      secretName: ${ENDPOINT_NAME}
+  rules:
+    - host: ${ENDPOINT_HOST}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ${ENDPOINT_SERVICE}
+                port:
+                  number: ${ENDPOINT_PORT}
