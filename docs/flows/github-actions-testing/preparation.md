@@ -13,7 +13,6 @@ Pagefind builds; installation can omit its optional native package.
 `run-ci-lane` restores that store for baseline part 1 and browser part 1.
 Keys include OS, architecture, Node.js, pnpm and lockfile hash. Prefix fallbacks
 can restore other lockfiles; frozen installation acquires missing packages.
-Root workspace cache saves are unchanged.
 
 First Agent Smoke and `run-ci-lane` use `setup-ci-tools` to restore yq and k3d
 downloads outside `PATH`. On Linux, `scripts/ci/setup-tools.sh` selects the
@@ -43,7 +42,7 @@ Diagnostic emission is best effort and cannot replace the terminal pull error.
 Docker suppresses numeric progress on non-terminal
 output, so these states provide partial evidence, not the current transfer phase. If no progress matches, the
 summary says so. These diagnostics do not change timeouts, backoff, concurrency, or digest verification.
-They do not establish registry health or explain why an attempt stalled.
+They do not establish registry health or stall causes.
 
 The PR advisory OpenShell job uses Ubuntu 24.04 for Landlock and selects packaged Google Chrome through `OCC_TEST_BROWSER_EXECUTABLE`. The OpenShell manifest lists this optional input so test children receive it. Before image builds, `scripts/ci/setup-tools.sh:install_browser_dependencies` checks a headless sandboxed renderer and logs its version; errors fail setup. The browser inherits only `PATH`, with private `HOME` and `TMPDIR`. Ubuntu’s existing AppArmor profile permits its user namespaces. Without an override, Playwright uses its default headless shell.
 
@@ -53,30 +52,33 @@ Gateway/Agent pairs before creating state. `prepareK3dRuntimeImages` builds the
 runtime when both are absent; selected pairs retain their immutable references.
 Controller build selection is independent.
 
-Gateway Routing, Slack Live, and Production TUI restore read-only BuildKit caches through
-`scripts/ci/prepare.mjs:imageBuildArgs`, preserving build budgets and test reserves.
-`scripts/ci/prepare.mjs:imageCacheObservation` reports numeric counts per phase,
-excluding raw output (`image-cache`; OpenShell: `first-agent-image-cache`).
-Step counts deduplicate IDs. `observesImageCache` enables plain progress, including
-alternate source builds. Import lines do not prove hits;
-loads may reuse probe work.
+`scripts/ci/prepare.mjs:imageBuildArgs` restores read-only caches, including
+`k3d-otel`. `prepareLane` primes selected `sourceBuildFiles`, including whole lanes;
+whole OpenShell lanes share one stack build. Tests inherit builder and epoch,
+never cache credentials; installers still build source.
+`imageCacheObservation` reports counts for Gateway Routing, Slack Live, Production
+TUI and OpenShell (`image-cache`; OpenShell: `first-agent-image-cache`), including
+alternate sources. Step counts deduplicate IDs; imports count lines.
+Imports do not prove hits; loads may reuse probe work.
 
-For the four ordinary image lanes and First Agent Smoke,
-`.github/actions/run-ci-lane/action.yml` and `.github/workflows/ci.yml` pass
-`actions/download-artifact` the job's GitHub token, repository, producer run ID,
-and exact artifact ID. The token selects REST lookup rather than the runtime's
-internal listing. CI grants these consumers `actions: read`; Full Integration
-already grants it.
+The four ordinary image lanes, First Agent Smoke, and Full Integration's Docker
+Model Runtime use REST lookup by repository, producer run ID and artifact ID.
+`.github/actions/run-ci-lane/action.yml` and `.github/workflows/ci.yml` pass the
+job's GitHub token to `actions/download-artifact`. Both workflows grant consumers
+`actions: read`.
 
-`scripts/ci/runtime-artifact.mjs:loadRuntimeArtifact` verifies the archive,
-source, run, producer attempt, platform and loaded image. It checks OCI index,
-manifest and config digests separately; Docker's image ID may equal the config digest.
-For ordinary image lanes, `scripts/ci/prepare.mjs:buildRuntimeImages` records
-tag ownership before loading for cleanup, refuses alternate sources and fallback
-builds, and sets runtime aliases. Startup lanes omit Buildx for artifacts;
-packaging and source builds retain their builders. Envoy and seccomp preparation
-remain separate. `scripts/ci/first-agent-smoke.mjs` calls the loader directly and
-builds its trust layer from the verified OCI layout at its platform manifest digest.
+Docker Model Runtime requires an artifact ID on producer success. A failed or
+skipped producer selects the standalone build. After download, local import
+cancellation starts three minutes before the lane deadline.
+
+`scripts/ci/runtime-artifact.mjs:loadRuntimeArtifact` verifies archive, source,
+run, attempt, platform and loaded image. OCI index, manifest and config digests
+are checked separately. Docker's image ID may equal the config digest.
+`scripts/ci/prepare.mjs:buildRuntimeImages` records tag ownership before load,
+rejects alternate sources and import fallback, and sets runtime aliases. Startup
+lanes omit Buildx on import. Packaging and source builds retain it. Envoy and
+seccomp stay separate. `scripts/ci/first-agent-smoke.mjs` calls the loader and
+builds its trust layer at the verified platform manifest digest.
 
 The preparation CLI records image resources in private state before tagging or import. GitHub Actions keeps it under `RUNNER_TEMP` for later steps, never artifact upload. Database tests use the limited application role with a fresh migrated database per file; each Agent revision worker test receives a migrated template copy (`prepareFile({ template })`). Failure and Kubernetes database names satisfy the existing test admission guards. An ordinary cluster lane selects an explicit loopback k3d context and a digest-pinned Kubernetes 1.35 K3s image. After node readiness, preparation rejects server versions outside Kubernetes 1.35. OpenShell retains its separately pinned K3s image. External images are pulled by their approved registry digest and exported for the selected platform; built and external images receive a run-owned reference at the imported platform manifest digest. Fresh preparation records sources and pins imported references against kubelet image garbage collection for the cluster's lifetime. The imported target must be an OCI or Docker image manifest. Every node must report its expected containerd digest and an exact CRI digest-list entry with boolean `pinned: true`. This retention excludes standalone manual or operator imports. The retired CLI-only installed repository lane is absent from the manifest: `assertLane` rejects it before state or resources are created. Its image and seccomp preparation below is unreachable. When either production TUI upgrade candidate is selected, preparation requires both candidate and baseline controller/runtime digests before allocating resources. It imports the four supplied sources, rejects a candidate resolving to the same local image as its baseline, and records their source and imported identities in private state. Per-file preparation checks the same selection against that state and passes the imported references to the test. Without candidate images, the lane builds the current source as before. Preparation failures still enter job cleanup. Cluster cleanup reads k3d inventory before and after deletion, then checks for matching Docker containers, networks, and volumes. An invalid inventory or possible surviving resource retains cleanup state.
 

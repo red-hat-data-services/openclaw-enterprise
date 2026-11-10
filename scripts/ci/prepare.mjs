@@ -601,9 +601,9 @@ function execFile(command, args, options = {}) {
   });
 }
 
-async function commandAvailable(command, args = ["--version"]) {
+async function commandAvailable(command, args = ["--version"], options) {
   try {
-    await execFile(command, args);
+    await execFile(command, args, options);
   } catch (error) {
     if (error.code === "ENOENT") {
       throw new Error(`Missing required command on PATH: ${command}`);
@@ -979,6 +979,7 @@ const imageCacheLanes = new Map([
   ["slack", { localStore: false }],
   ["production-tui", { localStore: false }],
   ["gateway-routing", { localStore: false }],
+  ["k3d-otel", { localStore: false }],
   ["openshell", { localStore: false }],
   ["dev-up-k3d", { localStore: false }],
   ["qa-matrix", { localStore: false }],
@@ -1091,13 +1092,18 @@ const imageBuildTestReserveMs =
     ? Number(process.env.OPENCLAW_CI_IMAGE_BUILD_TEST_RESERVE_MS)
     : 3 * 60_000;
 
-// What a lane image build may still take, or undefined outside a lane with a deadline.
-function imageBuildBudgetMs() {
+function imageBuildDeadlineMs() {
   const deadline = Number(process.env.CI_RUNNER_DEADLINE_MS ?? "");
   if (!Number.isSafeInteger(deadline) || deadline <= 0) {
     return undefined;
   }
-  return deadline - imageBuildTestReserveMs - Date.now();
+  return deadline - imageBuildTestReserveMs;
+}
+
+// What a lane image build may still take, or undefined outside a lane with a deadline.
+function imageBuildBudgetMs() {
+  const deadline = imageBuildDeadlineMs();
+  return deadline === undefined ? undefined : deadline - Date.now();
 }
 
 // The lane cannot pass once its image build has used the time its tests need, so it stops
@@ -1369,11 +1375,17 @@ async function buildRuntimeImages(
       );
     }
   };
-  await commandAvailable(process.env.OCC_DOCKER_BIN ?? "docker", [
-    "version",
-    "--format",
-    "{{.Server.Version}}",
-  ]);
+  const importDeadlineMs =
+    runtimeArtifact && state.lane === "docker-model" ? imageBuildDeadlineMs() : undefined;
+  const importBudgetMs = importDeadlineMs === undefined ? undefined : importDeadlineMs - Date.now();
+  if (importBudgetMs !== undefined && importBudgetMs < 1_000) {
+    throw new Error("No time remains to import the runtime artifact before the test reserve.");
+  }
+  await commandAvailable(
+    process.env.OCC_DOCKER_BIN ?? "docker",
+    ["version", "--format", "{{.Server.Version}}"],
+    { timeoutMs: importBudgetMs },
+  );
   const env = {};
   const resources = [];
   const label =
@@ -1435,11 +1447,11 @@ async function buildRuntimeImages(
         : { OCC_K3D_OPENCLAW_COMMIT: process.env.OCC_K3D_OPENCLAW_COMMIT }),
     };
     if (runtimeArtifact) {
-      assertRuntimeArtifactTagAvailable(tag);
+      assertRuntimeArtifactTagAvailable(tag, importDeadlineMs);
       const resource = addResource(state, "image-tag", { name: tag, owner: state.prefix });
       resources.push(resource);
       await writeState(statePath, state);
-      const loaded = await loadRuntimeArtifact({ ...runtimeArtifact, tag });
+      const loaded = await loadRuntimeArtifact({ ...runtimeArtifact, tag }, importDeadlineMs);
       try {
         await markResourceReady(statePath, state, resource);
         Object.assign(env, runtimeEnv);
@@ -3126,13 +3138,16 @@ async function prepareLane({ lane, statePath, file }) {
   if (runtimeArtifact) {
     if (
       ![
+        "docker-model",
         "images-packaging",
         "images-runtime-startup",
         "images-runtime-startup-2",
         "images-runtime-startup-3",
       ].includes(name)
     ) {
-      throw new Error("Runtime artifacts are supported only by the ordinary image lanes.");
+      throw new Error(
+        "Runtime artifacts are supported only by Docker Model Runtime and the ordinary image lanes.",
+      );
     }
     if (process.env.OCC_K3D_OPENCLAW_SOURCE) {
       throw new Error("A runtime artifact cannot be combined with OCC_K3D_OPENCLAW_SOURCE.");
@@ -3156,18 +3171,17 @@ async function prepareLane({ lane, statePath, file }) {
   const env = baseEnv(resolvedStatePath, state);
   await writeState(resolvedStatePath, state);
 
+  const sourceBuild = lanePrepare(name).sourceBuildFiles?.some((path) =>
+    relativeFile === undefined
+      ? laneDefinition(name).files.some((file) => file.path === path)
+      : path === relativeFile,
+  );
   const fullOpenShellSourceBuild =
     process.env.OCC_CI_IMAGE_CACHE === "1" &&
-    suiteView === "full-integration" &&
+    sourceBuild &&
     isOpenShellLane(name) &&
-    relativeFile === undefined &&
-    laneDefinition(name).files.some(({ path }) =>
-      lanePrepare(name).sourceBuildFiles?.includes(path),
-    );
-  if (
-    process.env.OCC_CI_IMAGE_CACHE === "1" &&
-    (fullOpenShellSourceBuild || lanePrepare(name).sourceBuildFiles?.includes(relativeFile))
-  ) {
+    relativeFile === undefined;
+  if (process.env.OCC_CI_IMAGE_CACHE === "1" && sourceBuild) {
     // Prime the selected builder, but keep the installer's actual source-build path.
     // Cache credentials remain in preparation; tests inherit only the builder name.
     const builder = process.env.BUILDX_BUILDER;
@@ -3493,7 +3507,8 @@ async function prepareLane({ lane, statePath, file }) {
     case "docker-model":
       Object.assign(
         env,
-        (await buildRuntimeImages(resolvedStatePath, state, { runtime: true })).env,
+        (await buildRuntimeImages(resolvedStatePath, state, { runtime: true, runtimeArtifact }))
+          .env,
       );
       await prepareLaneLogging(resolvedStatePath, state, env);
       break;

@@ -700,10 +700,20 @@ test("mixed code, Helm, workflow and tooling changes select full", async (t) => 
       ".github/workflows/ci.yml",
       "scripts/check.mjs",
       "docs/data.json",
+      "docs/assets/provider.png",
+      "tests/fixtures/provider.png",
+      "apps/controller/src/console/assets/provider.png",
+      "specs/plans/provider.png",
+      "specs/rfcs-extra/provider.png",
+      "specs/rfcs/0034-reusable-model-providers/provider.jpg",
+      "specs/rfcs/0034-reusable-model-providers/provider.svg",
+      "specs/rfcs/0034-reusable-model-providers/provider.PNG",
+      "specs/rfcs/0034-reusable-model-providers/provider.png.ts",
       "AGENTS.md",
     ].map((path) => [
       ({ put }) => {
         put("docs/change.md");
+        put("specs/rfcs/0034-reusable-model-providers/agent-selection.png");
         put(path);
       },
     ]),
@@ -767,6 +777,14 @@ test("renames across the allowlist boundary in either direction select full", as
   await expectAll(t, "full", [
     [rename("docs/old.md", "src/old.md"), { "docs/old.md": "same\n" }],
     [rename("src/old.md", "docs/old.md"), { "src/old.md": "same\n" }],
+    [
+      rename("specs/rfcs/0034-reusable-model-providers/old.png", "tests/fixtures/old.png"),
+      { "specs/rfcs/0034-reusable-model-providers/old.png": "same\n" },
+    ],
+    [
+      rename("tests/fixtures/old.png", "specs/rfcs/0034-reusable-model-providers/old.png"),
+      { "tests/fixtures/old.png": "same\n" },
+    ],
   ]);
 });
 
@@ -793,10 +811,14 @@ test("symlinks and executable documentation select full", async (t) => {
   await expectAll(
     t,
     "full",
-    ["docs/guide.md", "docs/docs.json"].flatMap((path) => [
+    [
+      "docs/guide.md",
+      "docs/docs.json",
+      "specs/rfcs/0034-reusable-model-providers/agent-selection.png",
+    ].flatMap((path) => [
       [
         ({ repo }) => {
-          mkdirSync(join(repo, "docs"));
+          mkdirSync(dirname(join(repo, path)), { recursive: true });
           symlinkSync("../base.txt", join(repo, path));
         },
       ],
@@ -805,6 +827,13 @@ test("symlinks and executable documentation select full", async (t) => {
           put(path);
           chmodSync(join(repo, path), 0o755);
         },
+      ],
+      [
+        ({ repo }) => {
+          rmSync(join(repo, path));
+          symlinkSync("../base.txt", join(repo, path));
+        },
+        { [path]: "old contents\n" },
       ],
     ]),
   );
@@ -1047,6 +1076,34 @@ function mainPushEvent(f, overrides = {}) {
   });
 }
 
+test("RFC PNG illustrations select documentation for pull requests and main pushes", async (t) => {
+  const directory = "specs/rfcs/0034-reusable-model-providers";
+  // Binary contents remain opaque: selection depends on the path and Git modes.
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const f = await fixture(
+    t,
+    async ({ put, repo, git }) => {
+      put(`${directory}/agent-selection.png`, png);
+      put(`${directory}/updated.png`, png);
+      rmSync(join(repo, directory, "deleted.png"));
+      await git("mv", `${directory}/old.png`, `${directory}/new.png`);
+    },
+    {
+      "scripts/ci/impact.mjs": policy,
+      [`${directory}/updated.png`]: "old image",
+      [`${directory}/deleted.png`]: png,
+      [`${directory}/old.png`]: png,
+    },
+  );
+  const shallow = await shallowBootstrap(f);
+  await settled([f.expect("docs", {}, "docs_only"), shallow.expect("docs", {}, "docs_only")]);
+  mainPushEvent(f);
+  await settled([
+    f.expect("docs", mainPushEnvironment, "docs_only"),
+    shallow.expect("docs", mainPushEnvironment, "docs_only"),
+  ]);
+});
+
 test("main push uses the before-tree policy to select and verify documentation", async (t) => {
   const navigation = await fixture(
     t,
@@ -1100,6 +1157,10 @@ test("main push compares every commit since before, not just the last commit", a
 
 test("main push keeps tests, policy changes, symlinks and executable docs in full mode", async (t) => {
   for (const change of [
+    ({ put }) => {
+      put("specs/rfcs/0034-reusable-model-providers/agent-selection.png");
+      put("apps/controller/src/changed.ts");
+    },
     ({ put }) => put("tests/integration/ci-impact.test.mjs"),
     ({ put }) => put(".github/workflows/ci.yml"),
     ({ put }) => put("scripts/ci/impact.mjs", policy + "\n// changed\n"),
@@ -1371,7 +1432,7 @@ test("CI Required always reports and fails at once when a dependency was cancell
 test("full-integration lanes read NODE_BASE_IMAGE from a variable their environment has", () => {
   // The shared integration-main environment defines NODE_BASE_IMAGE. Jobs without it
   // must read the repository variable, or they can never start (finding 662).
-  const path = ".github/workflows/full-integration.yml";
+  const path = ".github/workflows/full-integration-execution.yml";
   const lanes = Object.entries(loadYaml(path).jobs).filter(([, job]) => job.env?.NODE_BASE_IMAGE);
   const repository = "${{ vars.CONTAINER_NODE_BASE_IMAGE }}";
   const environment = "${{ vars.NODE_BASE_IMAGE }}";
@@ -1386,7 +1447,7 @@ test("full-integration lanes read NODE_BASE_IMAGE from a variable their environm
     lanes.filter(([, job]) => job.env.NODE_BASE_IMAGE === environment).length,
   );
   const names = lanes.map(([name]) => name);
-  for (const lane of ["gateway-routing", "slack", "openshell"]) {
+  for (const lane of ["gateway-routing", "slack", "openshell", "qa-matrix", "dev-up-k3d"]) {
     assert.ok(names.includes(lane), lane);
   }
 });
@@ -1395,9 +1456,10 @@ test("full-integration preserves qualified runners for kernel, sandbox, and imag
   // Hosted ubuntu-24.04 refuses Chromium's sandbox, which PostgreSQL Authentication's
   // sign-in cases turn on (finding 1383), and the k3d lanes need a kernel that enforces
   // NetworkPolicy. Keep the runner family; State retains its qualified eight-CPU
-  // Full Integration allocation while ordinary CI uses four CPUs. Observability
-  // and Network Isolation retain four CPUs here while ordinary CI qualifies two CPUs.
-  const jobs = loadYaml(".github/workflows/full-integration.yml").jobs;
+  // Full Integration allocation while ordinary CI uses four CPUs. Observability,
+  // Network Isolation and Plugin Status retain four CPUs here while ordinary CI
+  // qualifies two CPUs.
+  const jobs = loadYaml(".github/workflows/full-integration-execution.yml").jobs;
   const job = jobs["pr-safe-same-sha"];
   const runnerFor = (target, lane) => {
     const runner = target["runs-on"];
@@ -1425,7 +1487,7 @@ test("full-integration preserves qualified runners for kernel, sandbox, and imag
       runnerFor(job, lane),
       lane === "k3d-fixture-state"
         ? "blacksmith-8vcpu-ubuntu-2404"
-        : lane === "k3d-observability" || lane === "k3d-fixture-network"
+        : ["k3d-observability", "k3d-fixture-network", "k3d-fixture-plugins"].includes(lane)
           ? "blacksmith-4vcpu-ubuntu-2404"
           : ciRunners.get(lane),
       lane,
@@ -1622,6 +1684,7 @@ test("lane lists outside the lane table name every lane they must", async (t) =>
     pathToFileURL(join(repositoryRoot, "scripts/ci/prepare.mjs")).href
   );
   const cached = [...imageCacheLanes.keys()].sort();
+  assert.ok(cached.includes("k3d-otel"), "OTEL preparation restores the image cache");
   const exposeStep = action.runs.steps.find((step) => step.id === "image-cache");
   const prepareStep = action.runs.steps.find((step) => step.name === "Prepare lane");
   const mode = action.runs.steps.find(({ id }) => id === "image-mode");
@@ -1675,9 +1738,9 @@ test("lane lists outside the lane table name every lane they must", async (t) =>
           },
         );
       const expected = ["dev-up-k3d", "qa-matrix"].includes(lane)
-        ? { "dev-up-k3d": installation, "qa-matrix": qaMatrix }[
-            lane
-          ].prepare.sourceBuildFiles.includes(file)
+        ? { "dev-up-k3d": installation, "qa-matrix": qaMatrix }[lane].prepare.sourceBuildFiles.some(
+            (path) => !file || path === file,
+          )
         : cached.includes(lane);
       assert.equal(evaluate(exposeStep.if), expected, `${lane}: ${file}: cache credentials`);
       assert.equal(
@@ -1698,7 +1761,7 @@ test("lane lists outside the lane table name every lane they must", async (t) =>
   // A full-integration "all" run reports every same-SHA matrix lane, and with the
   // jobs it reads directly covers the whole full group. A lane missing here fails
   // only a manual full run, as "missing".
-  const fullIntegration = loadYaml(".github/workflows/full-integration.yml");
+  const fullIntegration = loadYaml(".github/workflows/full-integration-execution.yml");
   const aggregate = fullIntegration.jobs["full-aggregate"];
   const script = aggregate.steps.find((step) => step.name === "Write selected job state").run;
   const lists = [...script.matchAll(/for \(const name of (\[[^\]]*\])\)/g)].map((match) =>
@@ -1758,7 +1821,7 @@ test("every lane job stops its test files before its own timeout", (t) => {
         let minutes = [timeout];
         if (timeout === "${{ matrix.timeout }}") {
           const rows =
-            name === "full-integration.yml" && id === "pr-safe-same-sha"
+            name === "full-integration-execution.yml" && id === "pr-safe-same-sha"
               ? JSON.parse(read("scripts/ci/full-integration-lanes.json"))
               : job.strategy.matrix.include;
           minutes = (Array.isArray(rows) ? rows : laneTable()).map((row) => row.timeout);
@@ -1880,7 +1943,7 @@ test("workflow selection flows through the gate and full-mode source-bound aggre
     [
       "runtime-image-fixture",
       ...JSON.parse(read("scripts/ci/full-integration-lanes.json")).map((row) => row.lane),
-      ...matrixLanes(read(".github/workflows/full-integration.yml")),
+      ...matrixLanes(read(".github/workflows/full-integration-execution.yml")),
     ].sort(),
     [...expectedFullLanes, "k3d-observability-demo"].sort(),
   );
@@ -2753,7 +2816,7 @@ test("the lane matrix runs every lane in full mode and only selected lanes in te
     if (netfilter) {
       assert.equal(
         row.runner,
-        row.lane === "k3d-observability" || row.lane === "k3d-fixture-network"
+        ["k3d-observability", "k3d-fixture-network", "k3d-fixture-plugins"].includes(row.lane)
           ? "blacksmith-2vcpu-ubuntu-2404"
           : "blacksmith-4vcpu-ubuntu-2404",
         row.lane,
@@ -3073,7 +3136,7 @@ test("shared runtime consumers omit idle builders and preserve source builders",
 });
 
 test("full aggregate attributes lane coverage to its matrix and producer jobs", (t) => {
-  const workflow = loadYaml(".github/workflows/full-integration.yml");
+  const workflow = loadYaml(".github/workflows/full-integration-execution.yml");
   // This workflow uses !cancelled(), which disables GitHub's implicit success()
   // guard. A failed producer must therefore be rejected explicitly.
   const condition = workflow.jobs["image-lanes-same-sha"].if
