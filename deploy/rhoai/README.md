@@ -61,6 +61,21 @@ The Kustomize stages are documented in
 and Keycloak procedure is in
 [manifests/dashboard/README.md](manifests/dashboard/README.md).
 
+## Running the platform stages under Argo CD
+
+When the cluster is bootstrapped from the team GitOps repository,
+[`rh-oce-team/oce-ocp-setup`](https://github.com/rh-oce-team/oce-ocp-setup),
+Argo CD owns the operators, database, admission, openshell, and routing stages.
+Skip every step below that applies one of those stages by hand: Argo applies the
+equivalent manifests from that repository's stage profile, and self-heal reverts
+a hand edit within seconds. The OCE Helm release, the four system Secrets, SQL
+bootstrap, `grant-tenant-access`, the control plane, and the optional dashboard
+stay in this runbook.
+
+Record the release's OCE source commit and image digests in the private release
+record. Let stage track `main`; give prod its own branch or tag so a stage merge
+cannot reach it.
+
 ## Deployment order
 
 Complete the sections in order. Create dependencies before the resources that
