@@ -289,6 +289,16 @@ async function fakeCommand({
     // The cache-only probe reports each image's config digest. In the engine-*
     // scenarios the cache resolves to images the engine may hold: engine-holds-images
     // holds both; the others fail one step of the probe.
+    // Artifact validation can fail before a runtime tag is created. Model the
+    // Docker absence boundary; the real importer checks source/run/digest identity.
+    if (
+      scenario === "artifact-import" &&
+      ((equals(args.slice(0, 2), ["image", "inspect"]) && args[2]?.startsWith("localhost/")) ||
+        (equals(args.slice(0, 3), ["image", "rm", "-f"]) && args[3]?.startsWith("localhost/")))
+    ) {
+      stderr("Error response from daemon: No such image: " + args.at(-1) + "\n");
+      return exit(1);
+    }
     const heldImages = {
       controller: "sha256:" + "d".repeat(64),
       runtime: "sha256:" + "e".repeat(64),
@@ -806,12 +816,17 @@ async function fakeCommand({
       } else {
         assert.deepEqual(args.slice(5, 10), ["--servers", "1", "--agents", "0", "--api-port"]);
         assert.match(args[10], /^127\.0\.0\.1:\d+$/);
-        assert.deepEqual(args.slice(11), [
+        const options = [
           "--kubeconfig-update-default=false",
           "--kubeconfig-switch-context=false",
           "--no-lb",
           ...addonArgs,
-        ]);
+        ];
+        assert.ok(
+          equals(args.slice(11), options) ||
+            (env.CI_FIXTURE_LANE === "staging-signin" &&
+              equals(args.slice(11), [...options, "--no-rollback"])),
+        );
       }
       state.cluster = args[2];
       state.agents = Number(args[args.indexOf("--agents") + 1]);
