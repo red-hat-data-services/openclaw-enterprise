@@ -1,0 +1,7 @@
+gatewayConfig:
+  openshell.gateway.oidc:
+    issuer: https://${KEYCLOAK_HOST}/realms/openshell
+    audience: openshell-api
+    roles_claim: resource_access.openshell-api.roles
+    admin_role: openshell-admin
+    user_role: openshell-user

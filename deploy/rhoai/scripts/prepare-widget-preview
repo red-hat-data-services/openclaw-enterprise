@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Prepare private widget preview inputs; do not apply them or deploy Agents.
+set -euo pipefail
+umask 077
+: "${OCE_CHECKOUT:?Set the checkout matching the installed OCE release}"
+: "${OCC_INPUT_DIRECTORY:?Set the existing private Agent input directory}"
+: "${OCC_NAMESPACE:?Set the OCE Namespace ID for this Agent}"
+: "${AGENT_ID:?Set the existing Agent ID}"
+repository=$(cd "$(dirname "$0")/.." && pwd -P)
+python3 - "$repository" "$OCE_CHECKOUT" "${WIDGET_OUTPUT_DIRECTORY:-$OCC_INPUT_DIRECTORY/widget-preview}" "$OCC_NAMESPACE" "$AGENT_ID" <<'PY'
+import base64
+import hashlib
+import json
+import string
+import subprocess
+import sys
+from pathlib import Path
+
+repository, oce, output = map(lambda value: Path(value).resolve(), sys.argv[1:4])
+namespace_id, agent_id = sys.argv[4:6]
+if any(output.is_relative_to(root) for root in (repository, oce)):
+    raise SystemExit('Keep private widget inputs outside both repositories.')
+if output.exists():
+    raise SystemExit('Use a new widget output directory; preserve previous rollback inputs.')
+
+def get(*args):
+    return json.loads(subprocess.check_output(['oc', *args, '-o', 'json']))
+
+def write_yaml(path, value):
+    path.write_bytes(subprocess.check_output(['yq', '-P', '-p=json', '.', '-'], input=json.dumps(value).encode()))
+
+values = json.loads(subprocess.check_output(['helm', '-n', 'openclaw-system', 'get', 'values', 'oce', '-o', 'json']))
+if values.get('agentNativeAdmin', {}).get('sharedCookieDomain'):
+    raise SystemExit('This recipe uses the apps domain; choose a separate cookie-safe domain for shared-cookie installations.')
+routing = values.setdefault('gatewayRouting', {})
+gateway = get('-n', 'openclaw-system', 'get', 'gateway', routing.get('gatewayName') or 'oce-agent-gateways')
+gateway_name = gateway['metadata']['name']
+release_namespace = gateway['metadata']['namespace']
+envoy_namespace = routing.get('envoyNamespace', 'envoy-gateway-system')
+# The chart names the Envoy Service from the Gateway namespace and name. The
+# Route must reach that Service so Compute's sandbox HTTPRoute filters methods
+# and client identity headers before the sandbox listener.
+envoy_service = 'occ-gateway-' + hashlib.sha256(
+    (release_namespace + '/' + gateway_name).encode()).hexdigest()[:12]
+leaf = next(item for item in gateway['spec']['listeners'] if item['name'] == 'https')['tls']['certificateRefs'][0]['name']
+issuer_ref = get('-n', 'openclaw-system', 'get', 'certificate', leaf)['spec']['issuerRef']
+if issuer_ref.get('kind', 'Issuer') != 'Issuer':
+    raise SystemExit('This recipe requires the existing namespaced private CA Issuer.')
+startup = get('-n', 'openclaw-system', 'get', 'secret', values.get('installation', {}).get('secretName', 'occ-installation-startup'))
+key = values.get('installation', {}).get('key', 'installation.yaml')
+installation_bytes = base64.b64decode(startup['data'][key])
+installation = json.loads(subprocess.check_output(['yq', '-o=json', '.', '-'], input=installation_bytes))
+compute_configuration = (
+    installation.setdefault('drivers', {})
+    .setdefault('compute', {})
+    .setdefault('configuration', {})
+)
+domain = get('get', 'ingress.config.openshift.io', 'cluster')['spec']['domain']
+host = 'agent-' + hashlib.sha256((namespace_id + '/' + agent_id).encode()).hexdigest()[:32] + '.' + domain
+route_name = 'oce-widget-' + hashlib.sha256(agent_id.encode()).hexdigest()[:12]
+peer = {'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': 'openshift-ingress'}}, 'podSelector': {'matchLabels': {'ingresscontroller.operator.openshift.io/deployment-ingresscontroller': 'default'}}}
+workloads = get('get', 'services', '-A', '-l', 'openclaw.dev/agent=' + agent_id)['items']
+workloads = [item for item in workloads if item['metadata']['name'].startswith('gateway-') and item['metadata']['labels'].get('openclaw.dev/namespace') == namespace_id]
+if len(workloads) != 1:
+    raise SystemExit('Expected one deployed Gateway Service for this Agent and OCE Namespace.')
+workload = workloads[0]
+gateway_namespace = workload['metadata']['namespace']
+listener_port = 8443
+output.mkdir(mode=0o700)
+write_yaml(output / 'before-values.yaml', values)
+(output / 'before-installation.yaml').write_bytes(installation_bytes)
+values['gatewayRouting']['sandbox'] = {'enabled': True, 'domain': domain, 'tlsSecretName': 'oce-widget-preview-tls', 'listenerPort': listener_port, 'ingressPeers': [peer]}
+compute_configuration.setdefault('gatewayRouting', {})['sandbox'] = {'domain': domain, 'publicPort': 443}
+write_yaml(output / 'installation.yaml', installation)
+values.setdefault('controlPlane', {})['installationChecksum'] = hashlib.sha256((output / 'installation.yaml').read_bytes()).hexdigest()
+write_yaml(output / 'values.yaml', values)
+variables = {'WIDGET_DOMAIN': domain, 'WIDGET_ISSUER': issuer_ref['name'], 'WIDGET_HOST': host, 'WIDGET_ROUTE': route_name, 'ENVOY_NAMESPACE': envoy_namespace, 'ENVOY_SERVICE': envoy_service, 'LISTENER_PORT': str(listener_port)}
+for name in ('certificate.yaml', 'route.yaml', 'kustomization.yaml'):
+    text = string.Template((repository / 'manifests/widgets' / name).read_text()).substitute(variables)
+    (output / name).write_text(text)
+(output / 'metadata.json').write_text(json.dumps({'host': host, 'namespaceId': namespace_id, 'agentId': agent_id, 'routeName': route_name, 'gatewayNamespace': gateway_namespace, 'envoyNamespace': envoy_namespace, 'envoyService': envoy_service, 'listenerPort': listener_port}, indent=2) + '\n')
+print('Prepared private widget inputs in ' + str(output) + '. No cluster resources changed.')
+PY

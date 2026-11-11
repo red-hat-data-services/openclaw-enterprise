@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Set client-specific Keycloak scope claims from explicit Gateway identity grants."""
+import argparse
+import copy
+import hashlib
+import json
+import os
+import pathlib
+import runpy
+import urllib.parse
+
+os.umask(0o077)
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--configuration", type=pathlib.Path)
+args = parser.parse_args()
+root = pathlib.Path(os.environ["TEAM_LOGIN_DIRECTORY"]).expanduser().resolve()
+settings = json.loads((root / "settings.json").read_text())
+configuration = args.configuration or root / "configuration-keycloak.json"
+auth = json.loads(configuration.read_text())["values"]["gateway"]["auth"]
+issuer = settings["issuer"]
+prefix = "oidc:" + hashlib.sha256(issuer.encode()).hexdigest() + ":"
+client = settings.get("clientId", "team-claw-browser")
+attribute = "oce_gateway_scopes_" + hashlib.sha256(client.encode()).hexdigest()[:12]
+grants = {}
+for identity in auth["trustedProxy"]["allowUsers"]:
+    if identity == "occ-workspace-files":
+        continue
+    if not identity.startswith(prefix) or identity not in auth["identityScopes"]:
+        raise SystemExit("Every human needs an explicit grant from this issuer")
+    scopes = auth["identityScopes"][identity]
+    if not isinstance(scopes, list) or any(
+        not isinstance(scope, str)
+        or not scope.startswith("operator.")
+        or any(c in scope for c in ", \t\r\n")
+        for scope in scopes
+    ):
+        raise SystemExit("Supply explicit Gateway operator scopes")
+    grants[identity[len(prefix) :]] = ",".join(scopes) or "none"
+if not grants:
+    raise SystemExit("No human identity grants; nothing to configure")
+if (
+    os.environ["KEYCLOAK_URL"].rstrip("/")
+    + "/realms/"
+    + os.environ.get("KEYCLOAK_REALM", "team-claw")
+    != issuer
+):
+    raise SystemExit("Keycloak environment does not match the saved issuer")
+
+context = runpy.run_path(
+    str(pathlib.Path(__file__).with_name("create-team-login-realm")),
+    run_name="existing_realm",
+)
+if context["issuer"] != issuer:
+    raise SystemExit("Keycloak environment does not match the saved issuer")
+request = context["request"]
+token = context["token"]
+admin = context["admin"] + "/" + urllib.parse.quote(context["realm"], safe="")
+
+
+def api(path, data=None, method=None):
+    return request(admin + path, data, method, token)
+
+
+clients = api("/clients?" + urllib.parse.urlencode({"clientId": client}))
+if len(clients) != 1:
+    raise SystemExit("Expected exactly one existing Keycloak client")
+client_path = "/clients/" + clients[0]["id"]
+mappers = api(client_path + "/protocol-mappers/models")
+mapper_name = "oce-gateway-scope-cap"
+existing = [mapper for mapper in mappers if mapper["name"] == mapper_name]
+if len(existing) > 1 or any(
+    mapper.get("config", {}).get("claim.name") == "oce_gateway_scopes"
+    and mapper["name"] != mapper_name
+    for mapper in mappers
+):
+    raise SystemExit("Conflicting scope claim mapper; inspect before changing it")
+users = {subject: api("/users/" + subject) for subject in grants}
+if any(not user.get("enabled") for user in users.values()):
+    raise SystemExit("Every granted identity must be an existing enabled account")
+profile = api("/users/profile")
+(root / "scope-claims-before-private.json").write_text(
+    json.dumps({"profile": profile, "users": users, "mappers": mappers}, indent=2)
+    + "\n"
+)
+candidate = copy.deepcopy(profile)
+definition = {
+    "name": attribute,
+    "displayName": "OCE gateway scope cap",
+    "permissions": {"view": ["admin"], "edit": ["admin"]},
+}
+candidate["attributes"] = [
+    entry for entry in candidate["attributes"] if entry["name"] != attribute
+] + [definition]
+api("/users/profile", candidate, "PUT")
+for subject, value in grants.items():
+    # Shared accounts can belong to several Agent clients. Merge current attributes
+    # so configuring this client cannot remove another client's scope cap.
+    user = copy.deepcopy(users[subject])
+    user.setdefault("attributes", {})[attribute] = [value]
+    api("/users/" + subject, user, "PUT")
+mapper = {
+    "name": mapper_name,
+    "protocol": "openid-connect",
+    "protocolMapper": "oidc-usermodel-attribute-mapper",
+    "consentRequired": False,
+    "config": {
+        "user.attribute": attribute,
+        "claim.name": "oce_gateway_scopes",
+        "jsonType.label": "String",
+        "multivalued": "false",
+        "id.token.claim": "true",
+        "access.token.claim": "true",
+        "userinfo.token.claim": "true",
+    },
+}
+if existing:
+    mapper["id"] = existing[0]["id"]
+    api(client_path + "/protocol-mappers/models/" + mapper["id"], mapper, "PUT")
+else:
+    api(client_path + "/protocol-mappers/models", mapper, "POST")
+for subject, value in grants.items():
+    claims = api(
+        client_path
+        + "/evaluate-scopes/generate-example-id-token?"
+        + urllib.parse.urlencode({"userId": subject, "scope": "openid"})
+    )
+    if claims.get("oce_gateway_scopes") != value:
+        raise RuntimeError("Keycloak did not emit the exact configured scope cap")
+print(
+    json.dumps(
+        {"clientId": client, "identities": len(grants), "passwordsChanged": False}
+    )
+)

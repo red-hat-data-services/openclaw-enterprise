@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Archive a selected OpenClaw commit with explicit child-stage build arguments."""
+import gzip
+import hashlib
+import io
+import json
+import os
+import re
+import subprocess
+import tarfile
+from pathlib import Path
+
+os.umask(0o077)
+repository = Path(__file__).resolve().parent.parent
+checkout = Path(os.environ["OPENCLAW_CHECKOUT"]).expanduser().resolve(strict=True)
+output = Path(os.environ["OCC_INPUT_DIRECTORY"]).expanduser().resolve(strict=True)
+commit = os.environ["OPENCLAW_COMMIT"]
+if not re.fullmatch(r"[a-f0-9]{40}", commit):
+    raise SystemExit("OPENCLAW_COMMIT must be a full commit SHA")
+if output.is_relative_to(repository) or output.is_relative_to(checkout):
+    raise SystemExit("Keep build inputs outside both repositories")
+original = subprocess.check_output(["git", "-C", str(checkout), "show", f"{commit}:Dockerfile"])
+dockerfile = original
+# TODO: Remove this adaptation when the selected Dockerfile and OpenShift builder
+# preserve the plugin-directory argument in both child stages without it.
+for stage in ("production-deps", "build"):
+    start = f"FROM dependency-inputs AS {stage}\n".encode()
+    declaration = b"ARG OPENCLAW_BUNDLED_PLUGIN_DIR\n"
+    if dockerfile.count(start) != 1:
+        raise SystemExit(f"Review the changed upstream {stage} stage before building")
+    if start + declaration not in dockerfile:
+        dockerfile = dockerfile.replace(start, start + declaration, 1)
+archive = output / "openclaw-build-source.tar.gz"
+receipt = output / "native-build-inputs.json"
+if archive.exists() or receipt.exists():
+    raise SystemExit("Prepared native inputs already exist; inspect them before replacing anything")
+process = subprocess.Popen(["git", "-C", str(checkout), "archive", "--format=tar", commit], stdout=subprocess.PIPE)
+try:
+    with archive.open("xb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+        with tarfile.open(fileobj=process.stdout, mode="r|") as source, tarfile.open(fileobj=compressed, mode="w|") as target:
+            for member in source:
+                if member.name == "Dockerfile":
+                    member.size = len(dockerfile)
+                    target.addfile(member, io.BytesIO(dockerfile))
+                else:
+                    target.addfile(member, source.extractfile(member) if member.isfile() else None)
+    if process.wait() != 0:
+        raise SystemExit("git archive failed")
+except BaseException:
+    process.kill()
+    process.wait()
+    archive.unlink(missing_ok=True)
+    raise
+with archive.open("rb") as stream:
+    archive_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+receipt.write_text(json.dumps({
+    "openclawCommit": commit,
+    "originalDockerfileSha256": hashlib.sha256(original).hexdigest(),
+    "buildDockerfileSha256": hashlib.sha256(dockerfile).hexdigest(),
+    "explicitChildStageArgsAdded": original != dockerfile,
+    "archive": archive.name,
+    "archiveSha256": archive_hash,
+}, indent=2) + "\n")
+print(f"Prepared {archive.name} and {receipt.name}; checkout and cluster unchanged.")

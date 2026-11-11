@@ -1,0 +1,39 @@
+dashboard:
+  # Red Hat Konflux build of opendatahub-io/openshell-dashboard (odh-stable),
+  # matching the quay.io/opendatahub images used by the gateway chart.
+  image:
+    registry: quay.io
+    repository: opendatahub/odh-openshell-dashboard
+    digest: sha256:dcc59675c584d279dea1110649cd184c56dc02c57a1cf70e8ef0f3a559806de1
+authProxy:
+  image:
+    digest: sha256:aa0bd8dd5ab0c78e4c91c92755ad573a5f92241f88138b4141b8ec803463b4fd
+gateway:
+  serviceName: openshell-gateway
+  tls:
+    enabled: false
+  caSecretName: ""
+oidc:
+  provider: keycloak-oidc
+  issuer: https://${KEYCLOAK_HOST}/realms/openshell
+  adminRole: openshell-admin
+  userRole: openshell-user
+  codeChallengeMethod: S256
+  allowedRoles: [openshell-api:openshell-admin, openshell-api:openshell-user]
+  existingSecret: openshell-dashboard-oidc
+podSecurityContext: null
+securityContext:
+  runAsUser: null
+nodeSelector:
+  oce-role: control
+openshiftRoute:
+  enabled: true
+  host: ${DASHBOARD_HOST}
+networkPolicy:
+  ingressFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-ingress
+      podSelector:
+        matchLabels:
+          ingresscontroller.operator.openshift.io/deployment-ingresscontroller: default

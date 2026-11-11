@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Add one Agent client and access group to an existing realm; preserve users."""
+
+import hashlib
+import json
+import os
+import pathlib
+import runpy
+import secrets
+import urllib.parse
+
+# Reuse the realm helper's administrator authentication and protected input handling.
+context = runpy.run_path(
+    str(pathlib.Path(__file__).with_name("create-team-login-realm")),
+    run_name="existing_realm",
+)
+root = context["root"]
+request = context["request"]
+save = context["save"]
+token = context["token"]
+realm = context["realm"]
+admin = context["admin"] + "/" + realm
+issuer = context["issuer"]
+ui = context["ui"]
+client_id = os.environ["KEYCLOAK_CLIENT_ID"]
+group_name = os.environ["KEYCLOAK_GROUP_NAME"]
+names = json.loads(pathlib.Path(os.environ["TEAM_USERS_FILE"]).read_text())
+admins = json.loads(pathlib.Path(os.environ["TEAM_ADMIN_USERS_FILE"]).read_text())
+if (root / "settings.json").exists():
+    raise SystemExit(
+        "Saved login exists; inspect it rather than recreating credentials"
+    )
+if not names or len(set(names)) != len(names) or not set(admins).issubset(names):
+    raise SystemExit("Supply unique members and administrators from that list")
+if not group_name or "/" in group_name:
+    raise SystemExit("Use a nonempty top-level group name without slashes")
+request(admin, token=token)
+if any(c["clientId"] == client_id for c in request(admin + "/clients", token=token)):
+    raise SystemExit("Client already exists; inspect the partial setup")
+if any(g["name"] == group_name for g in request(admin + "/groups", token=token)):
+    raise SystemExit("Group already exists; inspect the partial setup")
+def find(name):
+    query = urllib.parse.urlencode({"username": name, "exact": "true"})
+    return [
+        user
+        for user in request(admin + "/users?" + query, token=token)
+        if user["username"].casefold() == name.casefold()
+    ]
+
+
+users = {}
+for name in names:
+    matches = find(name)
+    if len(matches) != 1 or not matches[0].get("enabled"):
+        raise SystemExit("Every member must already have one enabled realm account")
+    users[name] = matches[0]["id"]
+secret = secrets.token_urlsafe(40)
+client = {
+    "clientId": client_id,
+    "enabled": True,
+    "protocol": "openid-connect",
+    "publicClient": False,
+    "secret": secret,
+    "standardFlowEnabled": True,
+    "directAccessGrantsEnabled": False,
+    "redirectUris": [ui + "/oauth2/callback"],
+    "webOrigins": [ui],
+    "attributes": {"pkce.code.challenge.method": "S256"},
+    "protocolMappers": [
+        {
+            "name": "agent-username",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-usermodel-property-mapper",
+            "config": {
+                "user.attribute": "username",
+                "claim.name": "preferred_username",
+                "jsonType.label": "String",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true",
+            },
+        },
+        {
+            "name": "agent-membership",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-group-membership-mapper",
+            "config": {
+                "full.path": "true",
+                "claim.name": "groups",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true",
+            },
+        }
+    ],
+}
+save("client-bootstrap-private.json", client)
+save("client-secret", secret)
+request(admin + "/clients", client, "POST", token)
+request(admin + "/groups", {"name": group_name}, "POST", token)
+group = next(
+    g for g in request(admin + "/groups", token=token) if g["name"] == group_name
+)
+for subject in users.values():
+    request(
+        admin + "/users/" + subject + "/groups/" + group["id"],
+        method="PUT",
+        token=token,
+    )
+prefix = "oidc:" + hashlib.sha256(issuer.encode()).hexdigest() + ":"
+save(
+    "settings.json",
+    {
+        "issuer": issuer,
+        "host": context["host"],
+        "url": ui,
+        "realm": realm,
+        "namespace": context["ns"],
+        "gatewayService": context["gateway"],
+        "agentId": os.environ["AGENT_ID"],
+        "identityPrefix": prefix,
+        "identities": {name: prefix + subject for name, subject in users.items()},
+        "administrators": admins,
+        "clientId": client_id,
+        "allowedGroup": "/" + group_name,
+    },
+)
+print(
+    json.dumps(
+        {"clientCreated": client_id, "members": names, "passwordsChanged": False}
+    )
+)

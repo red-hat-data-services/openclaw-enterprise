@@ -1,0 +1,12 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ${ENDPOINT_NAME}
+  namespace: ${TLS_NAMESPACE}
+spec:
+  secretName: ${ENDPOINT_NAME}
+  dnsNames:
+    - ${ENDPOINT_HOST}
+  issuerRef:
+    name: occ-public-http01
+    kind: Issuer

@@ -1,0 +1,122 @@
+apiVersion: k8s.keycloak.org/v2beta1
+kind: Keycloak
+metadata:
+  name: openshell-keycloak
+  namespace: openshell-auth
+spec:
+  instances: 1
+  db:
+    vendor: postgres
+    host: oce-postgres-primary.openclaw-postgres.svc
+    database: openshell_keycloak
+    port: 5432
+    usernameSecret: { name: keycloak-database, key: username }
+    passwordSecret: { name: keycloak-database, key: password }
+  http:
+    httpEnabled: true
+  hostname:
+    hostname: https://${KEYCLOAK_HOST}
+  proxy:
+    headers: xforwarded
+  ingress:
+    enabled: false
+  # The explicit policy below restricts forwarded headers to router Pods.
+  networkPolicy:
+    enabled: false
+  additionalOptions:
+    - name: db-url-properties
+      value: "?sslmode=verify-full&sslrootcert=/etc/keycloak/database-ca/ca.pem"
+  unsupported:
+    podTemplate:
+      metadata:
+        labels:
+          app.kubernetes.io/name: openshell-keycloak
+      spec:
+        containers:
+          - name: keycloak
+            volumeMounts:
+              - name: database-ca
+                mountPath: /etc/keycloak/database-ca
+                readOnly: true
+        volumes:
+          - name: database-ca
+            secret:
+              secretName: keycloak-database-ca
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: openshell-keycloak
+  namespace: openshell-auth
+spec:
+  host: ${KEYCLOAK_HOST}
+  to: { kind: Service, name: openshell-keycloak-service }
+  port: { targetPort: http }
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keycloak-ingress
+  namespace: openshell-auth
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openshell-keycloak
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-ingress
+          podSelector:
+            matchLabels:
+              ingresscontroller.operator.openshift.io/deployment-ingresscontroller: default
+      ports: [{ protocol: TCP, port: 8080 }]
+    - from:
+        - podSelector: {}
+      ports: [{ protocol: TCP, port: 9000 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keycloak-egress
+  namespace: openshell-auth
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openshell-keycloak
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openclaw-postgres
+          podSelector:
+            matchLabels:
+              postgres-operator.crunchydata.com/cluster: oce-postgres
+        - ipBlock:
+            cidr: ${PG_POD_CIDR}
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+          podSelector:
+            matchLabels:
+              dns.operator.openshift.io/daemonset-dns: default
+        - ipBlock:
+            cidr: ${DNS_CIDR_0}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 5353
+        - protocol: TCP
+          port: 5353

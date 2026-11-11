@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Use the selected OCE release's upgrade workflow; do not duplicate its lifecycle.
+set -euo pipefail
+: "${OCE_CHECKOUT:?Set the clean OCE checkout for the selected release}"
+repository=$(cd "$(dirname "$0")/.." && pwd -P)
+cd "$OCE_CHECKOUT"
+exec scripts/upgrade-production-images --occ "$repository/bin/occ" "$@"

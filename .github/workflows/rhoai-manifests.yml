@@ -1,0 +1,106 @@
+name: RHOAI Manifests
+
+# deploy/rhoai holds the OpenShift deployment assets. Their scripts and
+# manifests reach into the OCE install path, so this check runs the directory's
+# tests, script checks, manifest parse, OCE path contract, and Kustomize
+# renders. Re-derive the render roots and the OCE path list when the layout
+# changes.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/rhoai-manifests.yml
+      - deploy/rhoai/**
+      - apps/controller/src/composition/installation-config.ts
+      - cmd/occ/**
+      - deploy/examples/production/**
+      - deploy/helm/openclaw-enterprise/templates/slack-proxy.yaml
+      - deploy/runtime/openclaw-source.json
+      - scripts/upgrade-production-images
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/rhoai-manifests.yml
+      - deploy/rhoai/**
+      - apps/controller/src/composition/installation-config.ts
+      - cmd/occ/**
+      - deploy/examples/production/**
+      - deploy/helm/openclaw-enterprise/templates/slack-proxy.yaml
+      - deploy/runtime/openclaw-source.json
+      - scripts/upgrade-production-images
+
+concurrency:
+  group: rhoai-manifests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check RHOAI deployment assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check scripts
+        run: |
+          mapfile -t bash_scripts < <(grep -l '^#!/usr/bin/env bash' deploy/rhoai/scripts/*)
+          mapfile -t python_scripts < <(grep -l '^#!/usr/bin/env python3' deploy/rhoai/scripts/*)
+          script_count=$(find deploy/rhoai/scripts -maxdepth 1 -type f | wc -l | tr -d ' ')
+          test "$(( ${#bash_scripts[@]} + ${#python_scripts[@]} ))" -eq "$script_count"
+          test "${#bash_scripts[@]}" -gt 0
+          test "${#python_scripts[@]}" -gt 0
+          shellcheck -S warning -x "${bash_scripts[@]}"
+          python3 -m py_compile "${python_scripts[@]}"
+      - name: Run unit tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s deploy/rhoai/tests -v
+      - name: Parse manifests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import yaml
+
+          root = pathlib.Path("deploy/rhoai/manifests")
+          json_files = sorted(root.rglob("*.json"))
+          # Helm chart templates use Go templating, so they are not plain YAML.
+          yaml_files = [
+              path
+              for path in sorted(root.rglob("*.yaml"))
+              if "chart/templates" not in path.as_posix()
+          ]
+          for path in json_files:
+              json.loads(path.read_text())
+          for path in yaml_files:
+              list(yaml.safe_load_all(path.read_text()))
+          print(f"parsed {len(json_files)} json and {len(yaml_files)} yaml files")
+          PY
+      - name: Check OCE checkout paths
+        run: |
+          for path in \
+            apps/controller/src/composition/installation-config.ts \
+            cmd/occ \
+            deploy/examples/production \
+            deploy/helm/openclaw-enterprise/templates/slack-proxy.yaml \
+            deploy/runtime/openclaw-source.json \
+            scripts/upgrade-production-images; do
+            test -e "$path" || { echo "missing OCE path: $path" >&2; exit 1; }
+          done
+      - name: Render Kustomize stages
+        run: |
+          for directory in \
+            deploy/rhoai/manifests/openshift/base \
+            deploy/rhoai/manifests/openshift/overlays/test \
+            deploy/rhoai/manifests/openshift/openshell-git \
+            deploy/rhoai/manifests/openshift/openshell-mtls \
+            deploy/rhoai/manifests/widgets; do
+            kustomize build "$directory" > /dev/null
+          done

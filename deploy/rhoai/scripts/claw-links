@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Print human Claw login links for private sharing; apply nothing."""
+import argparse
+import json
+import subprocess
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument(
+    "--name", action="append", default=[], metavar="NAMESPACE=NAME",
+    help="label a namespace's link with a display name (repeat for each Claw)",
+)
+args = parser.parse_args()
+names = {}
+for value in args.name:
+    namespace, separator, name = value.partition("=")
+    if not separator or not namespace.strip() or not name.strip():
+        parser.error("--name requires NAMESPACE=NAME")
+    if any(c in value for c in "\r\n\t"):
+        parser.error("--name must be a single line")
+    names[namespace] = name
+
+result = subprocess.run(
+    ["oc", "get", "routes", "-A", "-o", "json", "--request-timeout=30s"],
+    capture_output=True, text=True,
+)
+if result.returncode:
+    parser.exit(result.returncode, result.stderr)
+routes = [
+    route for route in json.loads(result.stdout)["items"]
+    if route["metadata"]["name"].startswith("oce-team-claw-oidc-")
+    and route["spec"].get("host")
+]
+if not routes:
+    parser.exit(1, "No human login Routes found in the selected cluster.\n")
+unknown = names.keys() - {r["metadata"]["namespace"] for r in routes}
+if unknown:
+    parser.error("no human login Route in namespace(s): " + ", ".join(sorted(unknown)))
+
+print("Claw human login links (private)")
+print("Sign in with your own Keycloak account; Claw membership is required.\n")
+for route in sorted(routes, key=lambda r: r["spec"]["host"]):
+    namespace = route["metadata"]["namespace"]
+    host = route["spec"]["host"]
+    print(f"{names.get(namespace, host)} — https://{host}/new")
+    print(f"  Namespace: {namespace}\n")
+print("OCC's admin launcher uses the separate occ-workspace-files identity.")

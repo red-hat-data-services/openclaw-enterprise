@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Pin the published OCE images to immutable amd64 digests; nothing is built or deployed.
+set -euo pipefail
+umask 077
+: "${OCC_INPUT_DIRECTORY:?Set an existing private input directory}"
+: "${OCE_CHECKOUT:?Set the OCE source checkout}"
+repository=$(cd "$(dirname "$0")/.." && pwd -P)
+source_checkout=$(cd "$OCE_CHECKOUT" && pwd -P)
+inputs=$(cd "$OCC_INPUT_DIRECTORY" && pwd -P)
+case "$inputs/" in
+  "$repository/"*|"$source_checkout/"*) echo 'Keep cluster inputs outside both repositories.' >&2; exit 1 ;;
+esac
+selection=${1:-both}
+case "$selection" in
+  controller) components=(controller) ;;
+  runtime) components=(runtime) ;;
+  both) components=(controller runtime) ;;
+  *) echo 'Usage: resolve-images [controller|runtime|both]' >&2; exit 1 ;;
+esac
+
+registry=quay.io
+namespace=aipcc/base-images/agentic
+index_types='application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json'
+manifest_types='application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json'
+body=$(mktemp)
+receipt=
+environment=
+trap 'rm -f "$body" "$receipt" "$environment"' EXIT
+
+fetch() {
+  curl --fail --silent --show-error --location --connect-timeout 10 --max-time 30 --retry 3 --retry-max-time 60 \
+    --proto '=https' --proto-redir '=https' -H "Accept: $2" -o "$body" "https://$registry/v2/$namespace/$1" ||
+    { echo "Could not fetch $1 from $registry/$namespace." >&2; exit 1; }
+}
+digest() { printf 'sha256:%s\n' "$(openssl dgst -sha256 -r "$body" | awk '{print $1}')"; }
+verify() { [[ "$(digest)" == "$2" ]] || { echo "Digest mismatch for $1@$2." >&2; exit 1; }; }
+
+# Follow tag -> manifest list -> amd64 manifest -> config, checking each digest, and set $record
+# to one JSON line with the pinned image and the commit recorded in <label>, stored as <field>.
+# Runs in the main shell: a command substitution would not inherit set -e.
+resolve() {
+  local component=$1 tag=$2 label=$3 field=$4 repo manifest config revision
+  repo=oce-$component
+  fetch "$repo/manifests/$tag" "$index_types"
+  manifest=$(jq -er --arg ref "$repo:$tag" '
+    if (.manifests | type) != "array" then error("expected a multi-arch manifest list for " + $ref)
+    else .manifests | map(select(.platform.os == "linux" and .platform.architecture == "amd64")) |
+      if length == 1 then .[0].digest else error("expected one linux/amd64 manifest in " + $ref) end end' "$body")
+  fetch "$repo/manifests/$manifest" "$manifest_types"
+  verify "$repo" "$manifest"
+  config=$(jq -er '.config.digest' "$body") || { echo "$repo@$manifest has no config digest." >&2; exit 1; }
+  fetch "$repo/blobs/$config" '*/*'
+  verify "$repo" "$config"
+  jq -e '.os == "linux" and .architecture == "amd64"' "$body" >/dev/null ||
+    { echo "$repo:$tag is not a linux/amd64 image." >&2; exit 1; }
+  revision=$(jq -r --arg label "$label" '.config.Labels[$label] // empty' "$body")
+  [[ "$revision" =~ ^[a-f0-9]{40}$ ]] || { echo "$repo:$tag has no $label commit label." >&2; exit 1; }
+  record=$(jq -cn --arg component "$component" --arg tag "$tag" --arg image "$registry/$namespace/$repo@$manifest" \
+    --arg field "$field" --arg revision "$revision" \
+    '{component:$component, tag:$tag, image:$image, architecture:"amd64"} + {($field):$revision}')
+}
+
+oce=
+oce_from=OCC_REV
+openclaw=
+records=()
+record=
+for component in "${components[@]}"; do
+  if [[ "$component" == controller ]]; then
+    resolve controller "${PUBLISHED_CONTROLLER_TAG:-latest}" io.openshell.harness.version oceCommit
+    oce=$(jq -r '.oceCommit' <<<"$record")
+    oce_from="the controller image's io.openshell.harness.version label"
+  else
+    resolve runtime "${PUBLISHED_RUNTIME_TAG:-latest}" org.openclaw.image.revision openclawCommit
+    openclaw=$(jq -r '.openclawCommit' <<<"$record")
+  fi
+  records+=("$record")
+done
+
+# A runtime-only run takes the OCE revision from the checkout being upgraded.
+[[ -n "$oce" ]] || oce=${OCC_REV:-}
+[[ "$oce" =~ ^[a-f0-9]{40}$ ]] || { echo 'Set OCC_REV to the OCE revision this runtime image belongs to.' >&2; exit 1; }
+git -C "$source_checkout" merge-base --is-ancestor "$oce" origin/main 2>/dev/null || {
+  echo "OCE revision $oce (from $oce_from) is not on origin/main in $OCE_CHECKOUT; run git fetch origin main, or build the images instead." >&2
+  exit 1
+}
+if [[ -n "$openclaw" ]]; then
+  source_metadata=$("$repository/scripts/resolve-runtime-source" "$source_checkout" "$oce")
+  pin=$(jq -er .openclawCommit <<<"$source_metadata")
+  [[ "$pin" == "$openclaw" ]] || {
+    echo "The runtime image carries OpenClaw $openclaw, but OCE $oce pins ${pin:-nothing}." >&2
+    echo 'Select matching tags with PUBLISHED_CONTROLLER_TAG and PUBLISHED_RUNTIME_TAG.' >&2
+    exit 1
+  }
+fi
+
+# Write both files only after every check passed.
+receipt=$(mktemp "$inputs/published-images.json.XXXXXX")
+environment=$(mktemp "$inputs/images.env.XXXXXX")
+printf '%s\n' "${records[@]}" | jq -s --arg oce "$oce" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+  {oceCommit:$oce, resolvedAt:$at} +
+  (map(if .component == "runtime" then . + {pinnedAt:$oce} else . end) |
+   map({key:.component, value:del(.component)}) | from_entries)' > "$receipt"
+for component in "${components[@]}"; do
+  variable=CONTROLLER_IMAGE
+  if [[ "$component" == runtime ]]; then variable=RUNTIME_IMAGE; fi
+  printf 'export %s=%q\n' "$variable" "$(jq -r --arg component "$component" '.[$component].image' "$receipt")"
+done > "$environment"
+mv "$receipt" "$inputs/published-images.json"
+mv "$environment" "$inputs/images.env"
+jq . "$inputs/published-images.json"
+printf 'Resolved OCE %s. Nothing was built or deployed.\n' "$oce"

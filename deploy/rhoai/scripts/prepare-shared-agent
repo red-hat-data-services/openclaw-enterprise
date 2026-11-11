@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Prepare custom-model requests; do not create or deploy cluster resources."""
+import json
+import os
+from pathlib import Path
+from urllib.parse import urlsplit
+
+os.umask(0o077)
+repository = Path(__file__).resolve().parent.parent
+output = Path(os.environ["OCC_INPUT_DIRECTORY"]).expanduser().resolve()
+model = os.environ["MODEL_ID"]
+base_url = os.environ["OPENAI_BASE_URL"]
+name = os.environ["AGENT_NAME"]
+endpoint = urlsplit(base_url)
+if (endpoint.scheme != "https" or not endpoint.hostname or endpoint.username
+        or endpoint.password or endpoint.query or endpoint.fragment
+        or endpoint.path.rstrip("/") != "/v1"):
+    raise SystemExit("OPENAI_BASE_URL must be an HTTPS /v1 endpoint without credentials, query or fragment")
+if not model.strip():
+    raise SystemExit("MODEL_ID must be the provider's nonempty native model ID")
+secret_response = json.loads(Path(os.environ["MODEL_SECRET_RESPONSE_FILE"]).read_text())
+secret = secret_response.get("data", secret_response)
+configuration = json.loads((repository / "manifests/openshift/codex-luna-configuration.json").read_text())
+values = configuration["values"]
+entry = values.setdefault("agents", {}).setdefault("entries", {}).setdefault("main", {})
+entry["name"] = name
+entry.setdefault("identity", {})["name"] = name
+qualified = "codex/" + model
+values["agents"]["defaults"]["model"] = qualified
+values["agents"]["defaults"]["models"] = {qualified: {"agentRuntime": {"id": "codex"}}}
+values["models"]["providers"]["codex"]["models"] = [{"id": model, "name": model}]
+source = json.loads((repository / "manifests/agents/custom-model-source.json").read_text())
+source["name"] = name + "-model"
+source["config"]["authorized_base_url"] = base_url
+source["secrets"]["api_key"] = secret["ref"]
+output.mkdir(mode=0o700, parents=True, exist_ok=True)
+paths = [output / "configuration.json", output / "credential-source.json"]
+if any(path.exists() for path in paths):
+    raise SystemExit("Prepared files already exist; inspect them before replacing anything")
+for path, value in zip(paths, [configuration, source]):
+    with path.open("x") as stream:
+        json.dump(value, stream, indent=2)
+        stream.write("\n")
+print("Prepared configuration.json and credential-source.json. No resources were changed.")

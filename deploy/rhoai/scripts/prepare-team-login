@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Render protected proxy manifests and Gateway Configuration; apply nothing."""
+import base64
+import hashlib
+import json
+import os
+import pathlib
+import secrets
+import subprocess
+
+os.umask(0o077)
+r = pathlib.Path(os.environ["TEAM_LOGIN_DIRECTORY"]).expanduser().resolve()
+s = json.loads((r / "settings.json").read_text())
+ns = s["namespace"]
+# One login per Agent; two Agents can share an OCC Namespace and tenant Namespace.
+name = "oce-team-claw-oidc-" + hashlib.sha256(s["agentId"].encode()).hexdigest()[:8]
+issuer = s["issuer"]
+ui = s["url"]
+env = dict(os.environ)
+if not env.get("KUBECONFIG"):
+    raise SystemExit("Set KUBECONFIG explicitly")
+
+
+def get(*args):
+    return json.loads(subprocess.check_output(["oc", *args, "-o", "json"], env=env))
+
+
+def save(name, d):
+    (r / name).write_text(json.dumps(d, indent=2) + "\n")
+
+
+router = get("-n", "openshift-ingress", "get", "service", "router-default")["spec"][
+    "clusterIP"
+]
+dns = get("-n", "openshift-dns", "get", "service", "dns-default")["spec"]["clusterIP"]
+headers = [
+    {
+        "name": "X-Occ-Identity",
+        "preserveRequestValue": False,
+        # The provider stores userIDClaim (sub) as the session user claim; header
+        # injection exposes only built-in session claims plus additionalClaims.
+        "values": [{"claimSource": {"claim": "user", "prefix": s["identityPrefix"]}}],
+    },
+    {
+        "name": "X-Openclaw-Scopes",
+        "preserveRequestValue": False,
+        "values": [{"claimSource": {"claim": "oce_gateway_scopes"}}],
+    },
+]
+for h in [
+    "Cookie",
+    "Authorization",
+    "X-Api-Key",
+    "X-Occ-Session-Key",
+    "X-Real-IP",
+    "Forwarded",
+    "X-Forwarded-For",
+    "X-Occ-Role",
+    "X-Occ-Policy-Hash",
+    "Cf-Access-Jwt-Assertion",
+    "Cf-Access-Authenticated-User-Email",
+    "Tailscale-User-Login",
+    "Tailscale-User-Name",
+    "Tailscale-User-Profile-Pic",
+    "Tailscale-Funnel-Request",
+]:
+    headers.append({"name": h, "preserveRequestValue": False, "values": []})
+alpha = {
+    "server": {"bindAddress": "0.0.0.0:4180", "secureBindAddress": "-"},
+    "providers": [
+        {
+            "id": "keycloak",
+            "provider": "oidc",
+            "clientID": s.get("clientId", "team-claw-browser"),
+            "clientSecretFile": "/config/client-secret",
+            "scope": "openid",
+            "additionalClaims": ["oce_gateway_scopes"],
+            "allowedGroups": [s.get("allowedGroup", "/team-claw-members")],
+            "code_challenge_method": "S256",
+            "oidcConfig": {
+                "issuerURL": issuer,
+                "userIDClaim": "sub",
+                "emailClaim": "preferred_username",
+                "insecureSkipNonce": False,
+                "insecureSkipIssuerVerification": False,
+            },
+        }
+    ],
+    "upstreamConfig": {
+        "upstreams": [
+            {
+                "id": "team-claw",
+                "path": "/",
+                "uri": "http://" + s["gatewayService"] + "." + ns + ".svc:8080",
+                "passHostHeader": True,
+                "proxyWebSockets": True,
+            }
+        ]
+    },
+    "injectRequestHeaders": headers,
+}
+p = r / "cookie-secret"
+if not p.exists():
+    p.write_text(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())
+core = (
+    "\n".join(
+        [
+            "redirect_url = " + json.dumps(ui + "/oauth2/callback"),
+            'email_domains = ["*"]',
+            "cookie_secret = " + json.dumps(p.read_text()),
+            'cookie_name = "__Host-team-claw-session"',
+            "cookie_secure = true",
+            'cookie_samesite = "lax"',
+            'cookie_expire = "8h"',
+            'cookie_refresh = "1m"',
+            "skip_provider_button = true",
+            "reverse_proxy = true",
+            "request_logging = false",
+            "auth_logging = false",
+            "standard_logging = true",
+        ]
+    )
+    + "\n"
+)
+
+
+def obj(kind, n, spec=None, api="v1"):
+    d = {
+        "apiVersion": api,
+        "kind": kind,
+        "metadata": {
+            "name": n,
+            "namespace": ns,
+            "labels": {"app.kubernetes.io/managed-by": "openclaw-enterprise"},
+        },
+    }
+    if spec is not None:
+        d["spec"] = spec
+    return d
+
+
+items = []
+x = obj("Secret", name)
+x["type"] = "Opaque"
+x["stringData"] = {
+    "alpha.json": json.dumps(alpha),
+    "core.cfg": core,
+    "client-secret": (r / "client-secret").read_text(),
+}
+config_checksum = hashlib.sha256(
+    json.dumps(x["stringData"], sort_keys=True).encode()
+).hexdigest()
+items.append(x)
+labels = {"app.kubernetes.io/name": name}
+secure = {
+    "allowPrivilegeEscalation": False,
+    "capabilities": {"drop": ["ALL"]},
+    "runAsNonRoot": True,
+    "seccompProfile": {"type": "RuntimeDefault"},
+}
+c = {
+    "name": "oidc-proxy",
+    "image": "quay.io/oauth2-proxy/oauth2-proxy@sha256:0d989b27d90d5e527fb2b045d864c4001c3104bdd763b3211b7e9ba2110380ea",
+    "args": ["--config=/config/core.cfg", "--alpha-config=/config/alpha.json"],
+    "ports": [{"name": "http", "containerPort": 4180}],
+    "securityContext": secure,
+    "resources": {
+        "requests": {"cpu": "10m", "memory": "64Mi"},
+        "limits": {"cpu": "250m", "memory": "256Mi"},
+    },
+    "readinessProbe": {"httpGet": {"path": "/ready", "port": "http"}},
+    "livenessProbe": {"httpGet": {"path": "/ping", "port": "http"}},
+    "volumeMounts": [{"name": "config", "mountPath": "/config", "readOnly": True}],
+}
+items.append(
+    obj(
+        "Deployment",
+        name,
+        {
+            "replicas": 1,
+            "selector": {"matchLabels": labels},
+            "template": {
+                "metadata": {
+                    "labels": labels,
+                    "annotations": {"openclaw-enterprise/config-sha256": config_checksum},
+                },
+                "spec": {
+                    "automountServiceAccountToken": False,
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "hostAliases": [
+                        {"ip": router, "hostnames": [issuer.split("/")[2]]}
+                    ],
+                    "containers": [c],
+                    "volumes": [{"name": "config", "secret": {"secretName": name}}],
+                },
+            },
+        },
+        "apps/v1",
+    )
+)
+items.append(
+    obj(
+        "Service",
+        name,
+        {
+            "selector": labels,
+            "ports": [{"name": "http", "port": 4180, "targetPort": "http"}],
+        },
+    )
+)
+items.append(
+    obj(
+        "Route",
+        name,
+        {
+            "host": s["host"],
+            "to": {"kind": "Service", "name": name},
+            "port": {"targetPort": "http"},
+            "tls": {"termination": "edge", "insecureEdgeTerminationPolicy": "Redirect"},
+        },
+        "route.openshift.io/v1",
+    )
+)
+# Only the router can reach this proxy; replace browser-supplied client addresses there.
+items[-1]["metadata"]["annotations"] = {
+    "haproxy.router.openshift.io/set-forwarded-headers": "replace"
+}
+routerPeer = {
+    "namespaceSelector": {
+        "matchLabels": {"kubernetes.io/metadata.name": "openshift-ingress"}
+    },
+    "podSelector": {
+        "matchLabels": {
+            "ingresscontroller.operator.openshift.io/deployment-ingresscontroller": "default"
+        }
+    },
+}
+dnsPeer = {
+    "namespaceSelector": {
+        "matchLabels": {"kubernetes.io/metadata.name": "openshift-dns"}
+    },
+    "podSelector": {
+        "matchLabels": {"dns.operator.openshift.io/daemonset-dns": "default"}
+    },
+}
+gatewayLabels = {
+    "openclaw.dev/agent": s["agentId"],
+    "openclaw.dev/workload-role": "gateway",
+}
+items.append(
+    obj(
+        "NetworkPolicy",
+        name,
+        {
+            "podSelector": {"matchLabels": labels},
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [{"from": [routerPeer], "ports": [{"port": 4180}]}],
+            "egress": [
+                {
+                    "to": [{"podSelector": {"matchLabels": gatewayLabels}}],
+                    "ports": [{"port": 8080}],
+                },
+                {
+                    "to": [routerPeer, {"ipBlock": {"cidr": router + "/32"}}],
+                    "ports": [{"port": 443}],
+                },
+                {
+                    "to": [dnsPeer, {"ipBlock": {"cidr": dns + "/32"}}],
+                    "ports": [
+                        {"port": 53, "protocol": "UDP"},
+                        {"port": 53, "protocol": "TCP"},
+                        # OpenShift DNS Pod ports after Service translation.
+                        {"port": 5353, "protocol": "UDP"},
+                        {"port": 5353, "protocol": "TCP"},
+                    ],
+                },
+            ],
+        },
+        "networking.k8s.io/v1",
+    )
+)
+items.append(
+    obj(
+        "NetworkPolicy",
+        name + "-gateway",
+        {
+            "podSelector": {"matchLabels": gatewayLabels},
+            "policyTypes": ["Ingress"],
+            "ingress": [
+                {
+                    "from": [{"podSelector": {"matchLabels": labels}}],
+                    "ports": [{"port": 8080}],
+                }
+            ],
+        },
+        "networking.k8s.io/v1",
+    )
+)
+save(
+    "proxy-manifests-private.json", {"apiVersion": "v1", "kind": "List", "items": items}
+)
+# The operator supplies the current OCC Configuration, including its values.
+d = json.loads(pathlib.Path(os.environ["CONFIGURATION_FILE"]).read_text())
+d = d.get("data", d)
+save("configuration-before.json", d)
+v = d["values"]
+g = v["gateway"]
+auth = g["auth"]
+tp = auth.setdefault("trustedProxy", {})
+tp["allowUsers"] = ["occ-workspace-files", *s["identities"].values()]
+approval = tp.setdefault("deviceAutoApprove", {})
+approval["enabled"] = True
+approval["scopes"] = list(
+    dict.fromkeys(
+        [
+            *(
+                scope
+                for scope in approval.get("scopes", [])
+                if scope != "operator.admin"
+            ),
+            "operator.read",
+            "operator.write",
+        ]
+    )
+)
+auth["identityScopes"] = {
+    "occ-workspace-files": ["operator.admin"],
+    **{
+        identity: ["operator.read", "operator.write"]
+        + (["operator.admin"] if n in s["administrators"] else [])
+        for n, identity in s["identities"].items()
+    },
+}
+controlUi = g.setdefault("controlUi", {})
+controlUi["allowedOrigins"] = list(
+    dict.fromkeys([*controlUi.get("allowedOrigins", []), ui])
+)
+save("configuration-keycloak.json", {"values": v})
+print(
+    "Prepared protected proxy manifests and explicit Gateway identity grants for "
+    + str(len(s["identities"]))
+    + " teammates."
+)

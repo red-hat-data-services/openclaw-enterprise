@@ -1,0 +1,38 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: oce-native-runtime-build
+parameters:
+  - name: OPENCLAW_COMMIT
+    description: Full commit SHA from the clean OpenClaw main checkout.
+    required: true
+objects:
+  - apiVersion: image.openshift.io/v1
+    kind: ImageStream
+    metadata:
+      name: oce-native-runtime
+  - apiVersion: build.openshift.io/v1
+    kind: BuildConfig
+    metadata:
+      name: oce-native-runtime
+    spec:
+      source:
+        type: Binary
+        binary: {}
+      strategy:
+        type: Docker
+        dockerStrategy:
+          dockerfilePath: Dockerfile
+          buildArgs:
+            - name: GIT_COMMIT
+              value: ${OPENCLAW_COMMIT}
+            - name: OPENCLAW_DOCKER_BUILD_SKIP_DTS
+              value: "1"
+      output:
+        to:
+          kind: ImageStreamTag
+          name: oce-native-runtime:${OPENCLAW_COMMIT}
+        imageLabels:
+          - name: org.opencontainers.image.revision
+            value: ${OPENCLAW_COMMIT}
+      triggers: []

@@ -1,0 +1,14 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ${WIDGET_ROUTE}
+  namespace: ${ENVOY_NAMESPACE}
+spec:
+  host: ${WIDGET_HOST}
+  to:
+    kind: Service
+    name: ${ENVOY_SERVICE}
+  port:
+    targetPort: ${LISTENER_PORT}
+  tls:
+    termination: passthrough
