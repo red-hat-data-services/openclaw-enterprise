@@ -12,7 +12,7 @@ import (
 
 // Down stops the selected Docker stack or the recorded Kubernetes stack.
 // Without a Compute Driver selection it follows the state directory; see
-// Profile.downComputeDriver.
+// chooseDownStack.
 func Down(ctx context.Context, opts Options) error {
 	r := newRunner(opts)
 	profile := resolveProfile(r.env)
@@ -20,15 +20,15 @@ func Down(ctx context.Context, opts Options) error {
 		return err
 	}
 	stateSetting := r.env["OCC_DEVELOPMENT_STATE_DIRECTORY"]
-	choice, err := profile.downComputeDriver(r.env["OCC_DEVELOPMENT_COMPUTE_DRIVER"] != "", len(opts.ComposeArgs) > 0, func() (string, bool, error) {
+	choice, err := chooseDownStack(r.env, len(opts.ComposeArgs) > 0, func() (string, bool, error) {
 		return recordedStateDirectory(stateSetting)
 	})
 	if err != nil {
 		return err
 	}
-	switch choice.ComputeDriver {
+	switch choice.Profile.ComputeDriver {
 	case "docker":
-		if err := profile.CheckDockerCompute(); err != nil {
+		if err := choice.Profile.CheckDockerCompute(); err != nil {
 			return err
 		}
 		// Docker Compute stacks are started by scripts/dev-up with standalone
@@ -64,6 +64,15 @@ func Down(ctx context.Context, opts Options) error {
 			args = append([]string{"compose"}, composeArgs...)
 		}
 		args = append([]string{"compose"}, dockerBrowserComposeArgs(args[1:], opts.Repository, r.env["COMPOSE_FILE"], r.env["COMPOSE_PATH_SEPARATOR"])...)
+		// Deleting the volumes deletes the Installation, so its Docker Compute
+		// Namespace networks would be orphaned: read its Namespaces while the
+		// database still runs. A plain down keeps the database, and the next
+		// start reuses those networks.
+		var namespaces []string
+		var namespacesErr error
+		if opts.Volumes {
+			namespaces, namespacesErr = r.dockerNamespaceIDs(ctx, args)
+		}
 		args = append(args, "down")
 		if opts.Volumes {
 			args = append(args, "--volumes")
@@ -71,6 +80,11 @@ func Down(ctx context.Context, opts Options) error {
 		if err := r.run(ctx, r.engine, args...); err != nil {
 			return err
 		}
+		if opts.Volumes {
+			r.removeDockerNamespaceNetworks(ctx, namespaces, namespacesErr)
+		}
+		// The service key belongs to the stopped stack; the next start copies a new one.
+		removeRecordedDevelopmentKeyDirectories(filepath.Dir(browserEnvironment["OCC_DEVELOPMENT_BROWSER_TLS_CERT"]), r.opts.Out, r.opts.Err)
 		if choice.Reason == downNoRecordedState {
 			// Say why down chose Docker when nothing selected it.
 			fmt.Fprintf(r.opts.Out, "Stopped Docker-compatible development stack (no recorded Kubernetes development state in %s).\n", choice.StateDirectory)
@@ -160,7 +174,7 @@ func Down(ctx context.Context, opts Options) error {
 		fmt.Fprintf(r.opts.Out, "Stopped Kubernetes development stack %s.\n", state.Cluster)
 		return nil
 	default:
-		return profile.CheckComputeDriver()
+		return choice.Profile.CheckComputeDriver()
 	}
 }
 
