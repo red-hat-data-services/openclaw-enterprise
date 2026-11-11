@@ -1524,9 +1524,6 @@ export type {
   ComputeRevisionContext,
   WorkloadLaunchContext,
   ComputeLifecycleHooks,
-  NamespaceLifecycleFailure,
-  NamespaceEnsureResult,
-  NamespaceDeleteResult,
   PluginDeploymentWarning,
   RuntimeFailureCause,
   RuntimeFailureEvidence,
@@ -1592,6 +1589,7 @@ export {
 
 export {
   CODEX_FAILURE_OUTPUT_CLASSES,
+  CRASH_LOOP_CHECK,
   PROCESS_EXIT_ERROR_CODES,
   PROCESS_EXIT_MAX_STATUS,
   PROCESS_EXIT_SIGNALS,
@@ -1629,3 +1627,13 @@ export type {
   RepositoryGitOnlineDecision,
   RepositoryGitSendPermit,
 } from "./protected-repository-git.ts";
+
+export type {
+  NamespaceLifecycleFailure,
+  NamespaceEnsureResult,
+  NamespaceDeleteResult,
+  NamespaceDeletionEligibility,
+  NamespaceLifecycleContext,
+  NamespaceLifecycleHooks,
+  NamespaceLifecycleParticipant,
+} from "./drivers/namespace-lifecycle.ts";

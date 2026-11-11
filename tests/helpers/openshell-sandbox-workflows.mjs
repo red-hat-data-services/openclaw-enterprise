@@ -1,4 +1,4 @@
-import { emitOpenShellProgress } from "../../scripts/ci/openshell-progress.mjs";
+import { runOpenShellStage } from "./openshell-stage.mjs";
 import { openShellTurnoverQualification } from "../../scripts/ci/reporter.mjs";
 import {
   openShellGatewayGrpcChannel,
@@ -257,7 +257,7 @@ const {
  * whose API server reaches a local Pod over the cni0 bridge, so the source is that bridge's
  * address, as `occ dev up` derives it. A configured lane value takes precedence.
  */
-async function apiServerPodProxySourceCidrs() {
+export async function apiServerPodProxySourceCidrs() {
   const configured = (process.env.OCC_TEST_KUBERNETES_PLUGIN_STATUS_PROXY_CIDRS ?? "")
     .split(",")
     .map((cidr) => cidr.trim())
@@ -286,7 +286,7 @@ async function apiServerPodProxySourceCidrs() {
   return [`${source}/32`];
 }
 
-async function createScopedController(context, identifier, platformNamespace, kubeconfig) {
+export async function createScopedController(context, identifier, platformNamespace, kubeconfig) {
   const suffix = hash(identifier);
   const account = "openclaw-production-controller";
   const namespaceRole = `oce-openshell-namespaces-${suffix}`;
@@ -1959,7 +1959,7 @@ function createIntegrationSandboxDriverFactory(
   return createDriver;
 }
 
-function withFirstPrepareRevisionFailureDiagnostic(computeDriver) {
+export function withFirstPrepareRevisionFailureDiagnostic(computeDriver) {
   let reported = false;
   return new Proxy(computeDriver, {
     get(target, property) {
@@ -7964,37 +7964,14 @@ const sandboxPhaseByStage = {
 // Exercise the regular dedicated Agent path with live inference and a real
 // administrator-origin chat. Direct tools.invoke probes are recorded separately:
 // an unavailable tool in a model response is not an invocation-denial proof.
-async function measureOpenShellStage(context, stage, operation) {
-  emitOpenShellProgress(stage, "started");
-  const started = performance.now();
-  let outcome = "failed";
-  try {
-    const result = await operation();
-    outcome = "passed";
-    return result;
-  } finally {
-    const elapsedMs = Math.round(performance.now() - started);
-    emitOpenShellProgress(stage, outcome);
-    if (stage !== "exposure-auth") {
-      context.diagnostic(
-        `openclaw-ci-measurement ${JSON.stringify({ kind: "openshell-stage", stage, outcome, elapsedMs })}`,
-      );
-    }
-    if (
-      selectedScenario === "full" &&
-      selectedHarness === "codex" &&
-      (!["untrusted-upstream", "model-outage"].includes(stage) || modelEndpointSupportsDnsProofs())
-    ) {
-      context.diagnostic(
-        `openclaw-ci-measurement ${JSON.stringify({
-          kind: "openshell-sandbox-phase",
-          stage: sandboxPhaseByStage[stage] ?? stage,
-          outcome,
-          elapsedMs,
-        })}`,
-      );
-    }
-  }
+function measureOpenShellStage(context, stage, operation) {
+  const sandboxPhase =
+    selectedScenario === "full" &&
+    selectedHarness === "codex" &&
+    (!["untrusted-upstream", "model-outage"].includes(stage) || modelEndpointSupportsDnsProofs())
+      ? (sandboxPhaseByStage[stage] ?? stage)
+      : undefined;
+  return runOpenShellStage(context, stage, operation, sandboxPhase);
 }
 
 export function registerGatewayToolPolicyTest() {

@@ -139,6 +139,8 @@ import { ControllerWorker } from "../../apps/controller/src/worker.ts";
 import { createRuntimeLogDriverFixture } from "./kubernetes-runtime-log-fixture.ts";
 import { createDedicatedDeployKubernetesFixture } from "./kubernetes-dedicated-deploy-fixture.ts";
 import { createEmbeddedReplacementKubernetesFixture } from "./kubernetes-embedded-replacement-fixture.ts";
+import { OPENCLAW_CONFIG_ENVIRONMENT_COMMIT } from "../../apps/controller/src/drivers/compute/kubernetes/openclaw-config-environment.ts";
+import { readOpenclawSource } from "../../scripts/lib/openclaw-source.mjs";
 
 const { kubeconfigPath, context: contextName } = conformanceKubeconfig;
 test("Kubernetes peer Pod selectors and node selectors reject labels the API refuses before provisioning", () => {
@@ -2189,9 +2191,9 @@ test("native OpenClaw preparation and activation use only outbound Sandbox enrol
   assert.deepEqual(withdrawals[0].requirements.labels, provisions[0].requirements.labels);
   assert.equal(provisions.at(-1).workspaceNodeEnrolled, false);
   // With the device recorded, later passes provision with the node enrolled and withdraw
-  // nothing more; the connected node makes the revision ready.
+  // nothing more; readiness still waits for the Gateway carrying that device.
   withdrawalFailure = undefined;
-  assert.equal((await prepare()).ready, true);
+  assert.equal((await prepare()).ready, false);
   const confirmedNodeSecret = read("Secret", driver.workspaceNodeName(revision));
   assert.equal(confirmedNodeSecret.data.setupReceiptDeviceId, undefined);
   assert.equal(Buffer.from(confirmedNodeSecret.data.deviceId, "base64").toString("utf8"), "node-1");
@@ -2205,6 +2207,7 @@ test("native OpenClaw preparation and activation use only outbound Sandbox enrol
   assert.deepEqual(deleted, []);
   await assert.rejects(driver.activateRevision(revision, context), /gateway is not ready/);
   markReady(gatewayName);
+  assert.equal((await prepare()).ready, true);
   await driver.activateRevision(revision, context);
 
   assert.deepEqual(deleted, [stale.metadata.name]);
@@ -2235,6 +2238,65 @@ test("native OpenClaw preparation and activation use only outbound Sandbox enrol
   );
   const harness = read("Service", `agent-${suffix}`);
   assert.equal(harness.spec.selector["app.kubernetes.io/name"], `agent-${suffix}-inactive`);
+});
+
+test("native Sandbox enrollment waits for the bound Gateway before reporting readiness", async () => {
+  const provisions = [];
+  const sandboxDriver = {
+    id: "native-sandbox",
+    implementation: "openshell",
+    capability: "sandbox",
+    supportsHarnessExecutionMode: DEDICATED_OPENCLAW_SUPPORT,
+    facets: ["networking", "filesystem", "process"],
+    async workspaceNodePeerLabels({ revision }) {
+      return provisions.length > 0 ? supervisorPeerLabels(revision.id) : undefined;
+    },
+    async provisionHarness(context) {
+      provisions.push(context);
+      return {
+        namespaceName: context.namespace.name,
+        resourceName: "native-harness",
+        agentId: context.revision.agentId,
+        revisionId: context.revision.id,
+      };
+    },
+  };
+  const fixture = dedicatedFirstDeployFixture({
+    sandboxDriver,
+    revision: {
+      harness: { id: "openclaw", version: "1.0.0", mode: "dedicated" },
+      sandboxDriverId: sandboxDriver.id,
+      configuration: createHarnessConfiguration("openclaw", "gpt-5"),
+      plugins: undefined,
+    },
+  });
+  const { state, namespace, gatewayName, markReady, prepare, read } = fixture;
+  assert.equal((await prepare()).ready, false);
+  markReady(gatewayName);
+  assert.equal((await prepare()).ready, false);
+  state.providerPod = {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name: "native-harness", namespace, labels: provisions.at(-1).requirements.labels },
+    status: { conditions: [{ type: "Ready", status: "True" }] },
+  };
+  assert.equal((await prepare()).pendingReason, "WORKSPACE_NODE_PENDING");
+  // The node enrolls after this pass rendered its initial Gateway. Pod readiness alone must
+  // not publish that unbound Gateway as a usable native Agent.
+  state.connected = true;
+  assert.equal(
+    (await prepare()).ready,
+    false,
+    "first enrollment must wait for the Gateway's native worker binding",
+  );
+  assert.equal((await prepare()).ready, false);
+  const gateway = read("Deployment", gatewayName).spec.template.spec.containers[0];
+  assert.equal(
+    gateway.env.find(({ name }) => name === "OPENCLAW_WORKSPACE_NODE_ID")?.value,
+    "node-1",
+  );
+  markReady(gatewayName);
+  assert.equal((await prepare()).ready, true);
 });
 
 // Finding 1642: a native worker under a Sandbox provider holds a failed model check and never
@@ -2406,6 +2468,8 @@ test("Kubernetes native Sandbox provisioning fails a revision on the worker's he
   // The device is recorded: the provider now provisions with the node enrolled, which has
   // it complete the withdrawal itself, and Compute asks for no second withdrawal.
   withdrawalFailure = undefined;
+  assert.equal((await prepare()).ready, false);
+  markReady(gatewayName);
   assert.equal((await prepare()).ready, true);
   assert.equal(provisions.at(-1).workspaceNodeEnrolled, true);
   assert.equal(withdrawals.length, 1);
@@ -2660,13 +2724,14 @@ test("Kubernetes native Sandbox redeploy reads the held failure before its own n
   assert.equal(recovered.objects.get(recoveredSecretKey).data.enrolledRevisionId, undefined);
   answer = { state: "starting" };
   recovered.state.connected = true;
-  assert.equal((await recovered.prepare()).ready, true);
+  assert.equal((await recovered.prepare()).ready, false);
   assert.equal(
     decode(recovered.objects.get(recoveredSecretKey).data.enrolledRevisionId),
     recovered.revision.id,
   );
   assert.equal(withdrawals.length, 1);
   assert.equal(withdrawals[0].workspaceNodeEnrolled, true);
+  recovered.markReady(recovered.gatewayName);
   assert.equal((await recovered.prepare()).ready, true);
   assert.equal(provisions.at(-1).workspaceNodeEnrolled, true);
   assert.equal(withdrawals.length, 1);
@@ -3939,6 +4004,151 @@ test("a pending dedicated deploy names a container image pull failure", async ()
   assert.equal((await prepare()).pendingReason, undefined);
 });
 
+// A Gateway or Harness container that exits at every start fails startup once the kubelet
+// backs off after its third consecutive unexplained exit, instead of waiting for the
+// convergence deadline (finding 3041). Only the role's own container on a live Pod of the
+// revision counts. The Gateway wrapper states the count in its termination message, and its
+// deliberate restart (exit 75, or its message) never counts; without a count the restart
+// count plus one stands in, as the kubelet counts a restart only once it starts it.
+for (const embedded of [true, false]) {
+  test(`a pending ${embedded ? "embedded" : "dedicated"} deploy fails a crash-looping runtime container`, async () => {
+    const { state, clients, prepare } = dedicatedFirstDeployFixture({
+      clock: { now: 0 },
+      ...(embedded
+        ? {
+            revision: {
+              harness: { id: "openclaw", version: "1.0.0", mode: "embedded" },
+              configuration: createHarnessConfiguration("openclaw", "gpt-5"),
+              plugins: undefined,
+            },
+          }
+        : {}),
+    });
+    // The kubelet's view of each role's Pod, merged into the fixture's running Pod.
+    let observed = {};
+    const list = clients.core.listNamespacedPod;
+    clients.core.listNamespacedPod = async (request) => {
+      const response = await list(request);
+      for (const pod of response.items) {
+        const status = observed[pod.metadata.labels["openclaw.dev/workload-role"]];
+        if (status !== undefined) {
+          pod.status = { ...pod.status, ...status };
+        }
+      }
+      return response;
+    };
+    const finishedAt = "2026-11-10T00:00:00Z";
+    const container = (
+      name,
+      { exitCode = 1, restartCount = 3, waiting = "CrashLoopBackOff", message } = {},
+    ) => ({
+      name,
+      ready: false,
+      restartCount,
+      state:
+        waiting === null
+          ? { running: { startedAt: finishedAt } }
+          : { waiting: { reason: waiting, message: "back-off 40s restarting failed container" } },
+      lastState: {
+        terminated: { exitCode, reason: "Error", finishedAt, ...(message ? { message } : {}) },
+      },
+    });
+    const exits = (count) => `consecutive unexplained exits: ${count}`;
+    const runtimeFailureWith = async (statuses) => {
+      observed = statuses;
+      const pass = await prepare();
+      observed = {};
+      assert.equal(pass.ready, false);
+      return pass;
+    };
+    for (const role of embedded ? ["gateway"] : ["gateway", "agent"]) {
+      // An unexplained exit, or an out-of-memory kill, at every start. The Gateway's third
+      // consecutive one fails it even after earlier deliberate restarts; a Harness never
+      // restarts on purpose, so an exit 75 counts too.
+      for (const options of [
+        { exitCode: 1 },
+        { exitCode: 137 },
+        // Three exits: in backoff the kubelet has restarted the container twice.
+        { restartCount: 2 },
+        ...(role === "gateway"
+          ? [{ restartCount: 5, message: exits(3) }]
+          : [{ exitCode: 75 }, { message: exits(1) }]),
+      ]) {
+        const failed = await runtimeFailureWith({
+          [role]: { containerStatuses: [container(role, options)] },
+        });
+        assert.deepEqual(failed.runtimeFailure, {
+          component: role,
+          check: "crash-loop",
+          code: "UNAVAILABLE",
+          checkedAt: finishedAt,
+        });
+        assert.equal(Object.hasOwn(failed, "pendingReason"), false, JSON.stringify(options));
+      }
+      for (const [scenario, statuses] of [
+        ...(role === "gateway"
+          ? [
+              // The wrapper stops its container on purpose, as for a changed Harness peer.
+              ["deliberate restarts", { containerStatuses: [container(role, { exitCode: 75 })] }],
+              // A deliberate restart killed while it stops exits with another status.
+              [
+                "a killed deliberate restart",
+                {
+                  containerStatuses: [
+                    container(role, {
+                      exitCode: 137,
+                      restartCount: 5,
+                      message: "deliberate restart: harness-peer-changed",
+                    }),
+                  ],
+                },
+              ],
+              // Two deliberate restarts, then two unexplained exits.
+              [
+                "two consecutive unexplained exits",
+                { containerStatuses: [container(role, { restartCount: 4, message: exits(2) })] },
+              ],
+            ]
+          : []),
+        ["two exits", { containerStatuses: [container(role, { restartCount: 1 })] }],
+        ["a running restart", { containerStatuses: [container(role, { waiting: null })] }],
+        [
+          "a pull back-off",
+          { containerStatuses: [container(role, { waiting: "ImagePullBackOff" })] },
+        ],
+        [
+          "an init container or sidecar",
+          {
+            initContainerStatuses: [container(role), container("prepare-private-state")],
+            containerStatuses: [container("workspace-node"), container(role, { waiting: null })],
+          },
+        ],
+      ]) {
+        const pass = await runtimeFailureWith({ [role]: statuses });
+        assert.equal(pass.runtimeFailure, undefined, `${role}: ${scenario}`);
+      }
+      // A Pod being deleted, as an old revision's during a rollout, never counts.
+      state.terminatingRole = role;
+      const terminating = await runtimeFailureWith({
+        [role]: { containerStatuses: [container(role)] },
+      });
+      state.terminatingRole = undefined;
+      assert.equal(terminating.runtimeFailure, undefined, `${role}: terminating`);
+    }
+    // A crash-looping container serves no runtime status: a refused status read still
+    // reports the crash loop.
+    const connect = clients.core.connectGetNamespacedPodProxyWithPath;
+    clients.core.connectGetNamespacedPodProxyWithPath = async () => {
+      throw Object.assign(new Error("container is not running"), { statusCode: 400 });
+    };
+    const unread = await runtimeFailureWith({
+      gateway: { containerStatuses: [container("gateway")] },
+    });
+    clients.core.connectGetNamespacedPodProxyWithPath = connect;
+    assert.equal(unread.runtimeFailure?.check, "crash-loop");
+  });
+}
+
 // A deploy whose Pods the Namespace's Pod quota refuses names the quota instead of a
 // bare wait (finding 1617). The Deployment controller copies its ReplicaSet's
 // ReplicaFailure condition onto the Deployment, which the driver reads, and the refused
@@ -5168,8 +5378,23 @@ test("Kubernetes namespace deletion waits for Sandbox namespace cleanup", async 
     objects: {},
   });
 
+  const { sandboxNamespaceLifecycleBinding } =
+    await import("../../apps/controller/src/composition/namespace-lifecycle.ts");
+  const { reconcileNamespaceLifecycle } =
+    await import("../../packages/occ/src/namespace-lifecycle.ts");
+  const binding = sandboxNamespaceLifecycleBinding(driver, sandboxDriver);
+  const remove = () =>
+    reconcileNamespaceLifecycle(
+      driver,
+      [{ id: sandboxDriver.id, hooks: binding.hooks }],
+      { ...tenant, status: "deleting" },
+      "deleted",
+      new AbortController().signal,
+      () => {},
+    );
+
   // A provider cleanup failure must leave the Kubernetes Namespace intact for a safe retry.
-  assert.deepEqual(await driver.deleteNamespace({ ...tenant, status: "deleting" }), {
+  assert.deepEqual(await remove(), {
     namespaceId: tenant.id,
     namespaceDeleted: false,
     failure: "retryable",
@@ -5177,7 +5402,7 @@ test("Kubernetes namespace deletion waits for Sandbox namespace cleanup", async 
   assert.equal(present, true);
   assert.deepEqual(calls, ["sandbox-cleanup"]);
 
-  assert.deepEqual(await driver.deleteNamespace({ ...tenant, status: "deleting" }), {
+  assert.deepEqual(await remove(), {
     namespaceId: tenant.id,
     namespaceDeleted: true,
   });
@@ -5806,20 +6031,7 @@ test("Namespace deletion removes only its owned Gateway target after data-plane 
   for (const external of [false, true]) {
     for (const foreign of [false, true]) {
       const calls = [];
-      const driver = new KubernetesComputeDriver(twoClusterOptions(), {
-        lifecycleDrivers: [
-          {
-            id: "configuration-selected",
-            capability: "configuration",
-            implementation: "local-selected",
-            computeLifecycleHooks: {
-              async beforeNamespaceDelete() {
-                calls.push("revoke");
-              },
-            },
-          },
-        ],
-      });
+      const driver = new KubernetesComputeDriver(twoClusterOptions());
       let gateway = driver.gatewayNamespaceManifest({ namespaceId: tenant.id });
       gateway.metadata.uid = "owned-gateway-namespace-uid";
       if (foreign) {
@@ -5851,17 +6063,42 @@ test("Namespace deletion removes only its owned Gateway target after data-plane 
         },
       });
       driver.executionApiClients = driver.apiClients;
-      const result = await driver.deleteNamespace({
-        ...tenant,
-        status: "deleting",
-        ...(external ? { existingNamespace: "customer-support" } : {}),
-      });
+      const { reconcileNamespaceLifecycle } =
+        await import("../../packages/occ/src/namespace-lifecycle.ts");
+      const result = await reconcileNamespaceLifecycle(
+        driver,
+        [
+          {
+            id: "provider",
+            hooks: {
+              async ensureNamespace() {
+                assert.fail("Deletion must not run setup.");
+              },
+              async deleteNamespace() {
+                calls.push("provider-cleanup");
+                return { namespaceId: tenant.id, namespaceDeleted: true };
+              },
+            },
+          },
+        ],
+        {
+          ...tenant,
+          status: "deleting",
+          ...(external ? { existingNamespace: "customer-support" } : {}),
+        },
+        "deleted",
+        new AbortController().signal,
+        () => {},
+      );
       assert.deepEqual(result, {
         namespaceId: tenant.id,
         namespaceDeleted: !foreign,
         ...(foreign ? { failure: "permanent" } : {}),
       });
-      assert.deepEqual(calls, foreign ? [] : ["revoke", "delete-gateway"]);
+      assert.deepEqual(
+        calls,
+        foreign ? [] : external ? ["delete-gateway"] : ["provider-cleanup", "delete-gateway"],
+      );
     }
   }
 });
@@ -10250,6 +10487,17 @@ test("Kubernetes Compute refuses another spelling of a plugin entry key it rende
   }
 });
 
+test("the OpenClaw Configuration environment mirror follows the runtime pin", async () => {
+  // A stale copy of OpenClaw's host environment policy could take a variable it drops as set,
+  // and admit a Gateway that exits at every start (finding 3059).
+  const { commit } = await readOpenclawSource();
+  assert.equal(
+    OPENCLAW_CONFIG_ENVIRONMENT_COMMIT,
+    commit,
+    "deploy/runtime/openclaw-source.json changed: review openclaw-config-environment.ts against it",
+  );
+});
+
 test("admission refuses a plugin secret input whose unset variable stops any Gateway", () => {
   // OpenClaw resolves an active plugin's Gateway-required secret inputs (no ownerKind in the
   // manifest: codex appServer.authToken and appServer.headers.*, google webSearch.headers.*) at
@@ -10630,6 +10878,43 @@ test("admission refuses a plugin secret input whose unset variable stops any Gat
   // an unset `${_NAME}` as written, never as a SecretRef.
   embeddedAdmission({ ...withBeam("${RELAY_TOKEN}"), ...allowlist(["RELAY_TOKEN"]) }, {});
   embeddedAdmission({ ...withBeam("${_RELAY}"), ...allowlist([]) }, {});
+  // OpenClaw applies the Configuration's own environment before it substitutes `${NAME}`
+  // (`applyConfigEnvVars`, finding 3059): a non-blank `env.vars` or other `env` string sets NAME
+  // (trimmed; Z_AI_API_KEY also sets ZAI_API_KEY), so these Gateways start unbound.
+  const withEnv = (configuration, env) => ({ ...configuration, env });
+  for (const configuration of [
+    withEnv(withSearchHeader("${RELAY_TOKEN}"), { vars: { RELAY_TOKEN: "literal" } }),
+    withEnv(withSearchHeader(" ${RELAY_TOKEN} "), { " RELAY_TOKEN ": "literal" }),
+    withEnv(withCodex({ config: { appServer: { headers: { "X-Relay": "${RELAY_TOKEN}" } } } }), {
+      vars: { RELAY_TOKEN: "$${ESCAPED}" },
+    }),
+    withEnv({ ...withBeam("${RELAY_TOKEN}"), ...allowlist(["OTHER"]) }, { RELAY_TOKEN: "x" }),
+    withEnv(withSearchHeader("${ZAI_API_KEY}"), { vars: { Z_AI_API_KEY: "literal" } }),
+  ]) {
+    embeddedAdmission(configuration, undefined);
+    embeddedAdmission(configuration, {});
+  }
+  // OpenClaw drops a blank value, one that holds a reference, a name outside the portable
+  // grammar and a name its host environment policy blocks (listed, or by prefix, or the Cargo
+  // runner pattern); the `$NAME` shorthand is an env SecretRef, left to the binding as before.
+  for (const [value, env, name = "RELAY_TOKEN"] of [
+    ["${RELAY_TOKEN}", { vars: { RELAY_TOKEN: " " } }],
+    ["${RELAY_TOKEN}", { vars: { RELAY_TOKEN: "${OTHER}" } }],
+    ["${RELAY_TOKEN}", { vars: { OTHER: "literal" } }],
+    ["${RELAY_TOKEN}", { vars: { RELAY_TOKEN: 1 } }],
+    ["$RELAY_TOKEN", { vars: { RELAY_TOKEN: "literal" } }],
+    ["${GITHUB_TOKEN}", { vars: { GITHUB_TOKEN: "literal" } }, "GITHUB_TOKEN"],
+    ["${AWS_SECRET_ACCESS_KEY}", { AWS_SECRET_ACCESS_KEY: "x" }, "AWS_SECRET_ACCESS_KEY"],
+    ["${GIT_CONFIG_RELAY}", { vars: { GIT_CONFIG_RELAY: "x" } }, "GIT_CONFIG_RELAY"],
+    ["${BASH_FUNC_RELAY}", { vars: { BASH_FUNC_RELAY: "x" } }, "BASH_FUNC_RELAY"],
+    ["${CARGO_TARGET_X_RUNNER}", { vars: { CARGO_TARGET_X_RUNNER: "x" } }, "CARGO_TARGET_X_RUNNER"],
+  ]) {
+    refusedUntilBound(embeddedAdmission, withEnv(withSearchHeader(value), env), [
+      searchHeader,
+      name,
+      "google",
+    ]);
+  }
   // An APP_SERVER_ name there is never set on an embedded or Dedicated OpenClaw Agent, and no
   // binding can set it, so the Agent's mode alone decides: deployment and Agent save refuse it
   // under an allowlist that omits it (finding 3060). A Dedicated Codex Gateway sets
@@ -14926,7 +15211,7 @@ test("Kubernetes lifecycle owners cannot be replaced after their first operation
     id: "configuration-selected",
     capability: "configuration",
     implementation: "local-selected",
-    computeLifecycleHooks: { async afterNamespacePrepared() {} },
+    computeLifecycleHooks: { async beforeWorkloadStart() {} },
   };
   const driver = new KubernetesComputeDriver(options(), { lifecycleDrivers: [selected] });
 
@@ -14944,7 +15229,7 @@ test("Kubernetes lifecycle owners cannot be replaced after their first operation
       driver.setLifecycleDrivers([
         {
           ...selected,
-          computeLifecycleHooks: { async afterNamespacePrepared() {} },
+          computeLifecycleHooks: { async beforeWorkloadStart() {} },
         },
       ]),
     /owners cannot change.*operations begin/i,
@@ -14959,17 +15244,11 @@ test("Kubernetes lifecycle hooks never run before cluster ownership and workload
     capability: "configuration",
     implementation: "local-selected",
     computeLifecycleHooks: {
-      async afterNamespacePrepared() {
-        calls.push("namespace-prepared");
-      },
       async beforeWorkloadStart() {
         calls.push("workload-start");
       },
       async beforeWorkloadStop() {
         calls.push("workload-stop");
-      },
-      async beforeNamespaceDelete() {
-        calls.push("namespace-delete");
       },
     },
   };
@@ -18027,6 +18306,21 @@ test("stopping a containment-only Kubernetes revision removes its workload befor
   }
 });
 
+function stopResourceNotFound() {
+  return Object.assign(new Error("Not found"), { code: 404 });
+}
+
+async function readAbsentStopResource() {
+  throw stopResourceNotFound();
+}
+
+const absentStopResourceReads = {
+  readNamespacedConfigMap: readAbsentStopResource,
+  readNamespacedSecret: readAbsentStopResource,
+  readNamespacedService: readAbsentStopResource,
+  readNamespacedServiceAccount: readAbsentStopResource,
+};
+
 // A dedicated revision whose Gateway and Agent Pods stay for `gatewayPodsLeft` and
 // `agentPodsLeft` observations. `events` records the Pod observations and the Agent Deployment's
 // deletion, in order; `gatewayReads` counts reads of the Gateway's Deployment, which its removal
@@ -18082,21 +18376,9 @@ function stopOrderFixture(id) {
     otherRevisionPod: false,
     gatewayReads: 0,
   };
-  const notFound = () => Object.assign(new Error("Not found"), { code: 404 });
   driver.apiClients = Promise.resolve({
     core: {
-      async readNamespacedConfigMap() {
-        throw notFound();
-      },
-      async readNamespacedSecret() {
-        throw notFound();
-      },
-      async readNamespacedService() {
-        throw notFound();
-      },
-      async readNamespacedServiceAccount() {
-        throw notFound();
-      },
+      ...absentStopResourceReads,
       ...namespaceReads,
       async listNamespacedPod(request) {
         const role = labelSelectorLabels(request.labelSelector)["openclaw.dev/workload-role"];
@@ -18124,7 +18406,7 @@ function stopOrderFixture(id) {
         if (name === deploymentName && fixture.deploymentPresent) {
           return structuredClone(deployment);
         }
-        throw notFound();
+        throw stopResourceNotFound();
       },
       async deleteNamespacedDeployment({ name }) {
         assert.equal(name, deploymentName);
@@ -18306,21 +18588,9 @@ test("stopping a provider-owned Kubernetes revision waits for Sandbox workload t
       },
     },
   };
-  const notFound = () => Object.assign(new Error("Not found"), { code: 404 });
   driver.apiClients = Promise.resolve({
     core: {
-      async readNamespacedConfigMap() {
-        throw notFound();
-      },
-      async readNamespacedSecret() {
-        throw notFound();
-      },
-      async readNamespacedService() {
-        throw notFound();
-      },
-      async readNamespacedServiceAccount() {
-        throw notFound();
-      },
+      ...absentStopResourceReads,
       ...namespaceReads,
       async listNamespacedPod(request) {
         const selected = labelSelectorLabels(request.labelSelector);
@@ -18338,7 +18608,7 @@ test("stopping a provider-owned Kubernetes revision waits for Sandbox workload t
     },
     apps: {
       async readNamespacedDeployment() {
-        throw notFound();
+        throw stopResourceNotFound();
       },
     },
     objects: {},
