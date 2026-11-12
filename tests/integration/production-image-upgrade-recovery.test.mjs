@@ -49,15 +49,16 @@ import {
   continuityPodReference,
   continuityRevision,
 } from "../helpers/production-upgrade-continuity-fixture.ts";
-import { registerDispatchRestoreTests } from "../helpers/production-upgrade-dispatch-restore.ts";
+import {
+  registerAcceptedAgentDeployNoticeTest,
+  registerDispatchRestoreTests,
+  registerUnknownAgentDeploymentResumeTest,
+} from "../helpers/production-upgrade-dispatch-restore.ts";
 import {
   preflightIdentities,
   registerPreflightCleanupTests,
 } from "../helpers/production-upgrade-preflight-cleanup.ts";
-import {
-  registerRetainedFleetPreflightTests,
-  restartInventory,
-} from "../helpers/production-upgrade-retained-fleet-preflight.ts";
+import { registerRetainedFleetPreflightTests } from "../helpers/production-upgrade-retained-fleet-preflight.ts";
 
 // Every case owns its command server, state, and evidence directory. Two sibling
 // cases can overlap while the existing nested groups keep their own limits.
@@ -747,6 +748,26 @@ await describe("production image upgrade recovery", { concurrency: 2 }, async ()
       if (args.includes("create") && args.includes("--raw")) {
         assert.equal(fileArg("--raw"), "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews");
         const review = JSON.parse(await io.readInput());
+        if (review.spec.resourceAttributes.resource === "deployments") {
+          assert.equal(review.apiVersion, "authorization.k8s.io/v1");
+          assert.equal(review.kind, "SelfSubjectAccessReview");
+          assert.deepEqual(review.spec.resourceAttributes, {
+            namespace: "system",
+            verb: "patch",
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "openclaw-enterprise-worker",
+          });
+          if (state.reviewUnavailable) {
+            return fail(1, "private self-review diagnostic");
+          }
+          if (state.wrongWorkerReview) {
+            review.spec.resourceAttributes.name = "openclaw-enterprise-api";
+          }
+          out({ ...review, status: { allowed: !state.denyWorkerPatch } });
+          return io.exit(0);
+        }
         assert.deepEqual(review, {
           apiVersion: "authorization.k8s.io/v1",
           kind: "SelfSubjectAccessReview",
@@ -755,6 +776,7 @@ await describe("production image upgrade recovery", { concurrency: 2 }, async ()
               namespace: "system",
               verb: "update",
               group: "",
+              version: "v1",
               resource: "secrets",
               name: state.secret.metadata.name,
             },
@@ -1241,6 +1263,9 @@ await describe("production image upgrade recovery", { concurrency: 2 }, async ()
           .find((a) => a.startsWith("deployment/"))
           .split("-")
           .at(-1);
+        if (args.includes("patch") && component === "worker" && state.denyWorkerPatch) {
+          return fail(1, "Forbidden: cannot patch the worker Deployment");
+        }
         if (take("fail-scale-" + component)) {
           if (take("block-failure-receipt")) {
             mkdirSync(join(root, "evidence", "native-command-failures.tsv"));
@@ -2998,6 +3023,7 @@ await describe("production image upgrade recovery", { concurrency: 2 }, async ()
     await writeFile(join(f.directory, "state.json"), JSON.stringify(state));
     const result = await f.run();
     assert.match(result.stderr, /Could not verify update access to the Installation Secret/);
+    assert.match(result.stderr, /Could not verify patch access to the worker Deployment/);
     assert.doesNotMatch(result.stderr, /private self-review diagnostic/);
     assert.deepEqual(await f.events(), [
       "scale-api",
@@ -3881,7 +3907,8 @@ await describe("production image upgrade recovery", { concurrency: 2 }, async ()
       /worker Deployment changed/,
     );
     assert.equal((await f.state()).helmSubmissions ?? 0, 0);
-    await writeFile(stateFile, JSON.stringify(stopped));
+    // The worker already stopped. Completing the handoff requires no further patch.
+    await writeFile(stateFile, JSON.stringify({ ...stopped, denyWorkerPatch: true }));
     await f.run("--resume", "--migration-history-checked");
     assert.equal((await f.state()).helmSubmissions, 1);
   });
@@ -3916,6 +3943,49 @@ await describe("production image upgrade recovery", { concurrency: 2 }, async ()
     ]);
     assert.equal((await f.state()).api, 1);
     assert.equal((await f.state()).worker, 1);
+  });
+
+  test("a named worker patch denial keeps the incumbent API serving", async (t) => {
+    if (!realHelm) {
+      t.skip("helm is unavailable to render the real chart");
+      return;
+    }
+    const f = await fixture(t, {
+      controllerOnly: true,
+      chart: { installation: (installation) => installation },
+    });
+    const initial = await f.state();
+    initial.denyWorkerPatch = true;
+    await writeFile(join(f.directory, "state.json"), JSON.stringify(initial));
+    const failure = await f.run().catch((error) => error);
+    const { api, worker, version } = await f.state();
+    const events = await f.events();
+    t.diagnostic(JSON.stringify({ api, worker, version, events }));
+    assert.deepEqual(
+      { api, worker, version, events },
+      { api: 1, worker: 1, version: 1, events: [] },
+    );
+    assert.match(
+      failure.stderr,
+      /Kubernetes denied patch on worker Deployment system\/openclaw-enterprise-worker/,
+    );
+    assert.equal(existsSync(join(f.evidence, "helm-started")), false);
+  });
+
+  test("a mismatched worker review leaves the live patch authoritative", async (t) => {
+    const f = await fixture(t);
+    const state = await f.state();
+    state.denyWorkerPatch = true;
+    state.wrongWorkerReview = true;
+    await writeFile(join(f.directory, "state.json"), JSON.stringify(state));
+    await assert.rejects(f.run(), (error) => {
+      assert.match(error.stderr, /Could not verify patch access to the worker Deployment/);
+      assert.match(error.stderr, /Forbidden: cannot patch the worker Deployment/);
+      return true;
+    });
+    assert.deepEqual(await f.events(), ["scale-api"]);
+    assert.equal((await f.state()).worker, 1);
+    assert.equal(existsSync(join(f.evidence, "helm-started")), false);
   });
 
   test("an interrupted quiescence never starts migration while the worker still runs", async (t) => {
@@ -4191,31 +4261,7 @@ await describe("production image upgrade recovery", { concurrency: 2 }, async ()
     assert.equal((await f.events()).filter((event) => event === "migration").length, 2);
   });
 
-  test("resume stops on an unknown Agent deployment until an accepted revision is confirmed", async (t) => {
-    // A normal runtime upgrade can replace a worker-bound revision, but a lost
-    // response must never turn that planned replacement into a second deployment.
-    const inventory = restartInventory("original-worker-required");
-    const f = await fixture(t, { agent: true, inventoryResponses: [inventory, inventory] });
-    await f.failNext("lost-agent-response");
-    await assert.rejects(f.run(), /deployment outcome is unknown/);
-    const calls = f.commands.length;
-    await assert.rejects(f.run("--resume"), /unknown deployment outcome/);
-    assert.equal(f.commands.length, calls);
-    assert.equal((await f.state()).dispatches, 1);
-    const receipt = join(f.evidence, "dispatch/ns_test--agt_test.json");
-    // An arbitrary or baseline revision cannot resolve the pending dispatch.
-    for (const id of ["rev_missing", "rev_old"]) {
-      await writeFile(receipt, JSON.stringify({ id }), { mode: 0o600 });
-      await assert.rejects(f.run("--resume"), /unknown deployment outcome/);
-      assert.equal((await f.state()).dispatches, 1);
-    }
-    // Simulate the operator confirming this revision in durable history and
-    // recording the accepted request before resuming the readiness checks.
-    await writeFile(receipt, JSON.stringify({ id: "rev_new" }), { mode: 0o600 });
-    await f.run("--resume");
-    assert.equal((await f.state()).dispatches, 1);
-    assert.equal((await f.state()).inventoryReadCount, 2);
-  });
+  registerUnknownAgentDeploymentResumeTest(fixture);
 
   describe("resume evidence directory ownership", { concurrency: 2 }, () => {
     test("resume binds stale prepared copies to the original evidence directory before live access", async (t) => {
@@ -4496,28 +4542,7 @@ await describe("production image upgrade recovery", { concurrency: 2 }, async ()
     });
   }
 
-  // occ's notices about an accepted deploy, such as a revision with no Harness overrides to
-  // retain, must reach the operator in the run output and not only the evidence directory.
-  // A control character in a notice must not reach the terminal.
-  test("an accepted Agent deploy shows occ's notices in the run output", async (t) => {
-    const f = await fixture(t, { agent: true });
-    const notice =
-      "revision rev_old has unreadable saved settings (SAVED_CONFIGURATION_UNREADABLE: configuration) and records no Harness overrides, so none are retained; the deployment uses current Installation defaults.";
-    const state = await f.state();
-    state.deployNotices = { agt_test: `notice: ${notice}\u001b[2J` };
-    await writeFile(join(f.directory, "state.json"), JSON.stringify(state));
-    const result = await f.run();
-    assert.ok(
-      result.stderr
-        .split("\n")
-        .includes(`upgrade-production-images: Agent agt_test in Namespace ns_test: ${notice}?[2J`),
-      result.stderr,
-    );
-    assert.equal(
-      await readFile(join(f.evidence, "dispatch/ns_test--agt_test.error"), "utf8"),
-      `notice: ${notice}\u001b[2J\n`,
-    );
-  });
+  registerAcceptedAgentDeployNoticeTest(fixture);
 
   // Doctor shares the serving gateway container's memory limit, and an out-of-memory
   // kill there stops the gateway too (finding 2697). Doctor, with a 384 MiB heap cap,
@@ -6697,6 +6722,9 @@ await describe("production image upgrade recovery", { concurrency: 2 }, async ()
       agent: true,
       chart: { installation: (installation) => installation },
     });
+    const state = await f.state();
+    state.denyWorkerPatch = true;
+    await writeFile(join(f.directory, "state.json"), JSON.stringify(state));
     await assert.rejects(f.run("--resume", "--preflight-only"), /cannot be combined/);
     assert.equal(existsSync(f.evidence), false);
     assert.match((await f.run("--preflight-only")).stdout, /Preflight passed/);

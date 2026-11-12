@@ -82,7 +82,7 @@ import {
   workerDiagnosticLines,
   workerFailureDetail,
   rethrowOpenShellFailure,
-} from "../helpers/k3d-failure-diagnostics.mjs";
+} from "../helpers/k3d-failure-diagnostics.ts";
 import {
   createEnvoyWorkspaceGatewayPlan,
   ensureEnvoyGatewayControllers,
@@ -152,7 +152,10 @@ const modelBaseUrl = (
     ? "https://chatgpt.com/backend-api/codex"
     : "https://api.openai.com/v1")
 ).replace(/\/$/u, "");
-const modelEndpoint = new URL(modelBaseUrl);
+const modelEndpoint = URL.parse(modelBaseUrl);
+if (!modelEndpoint) {
+  throw new Error("The OpenShell model endpoint must be a valid absolute URL.");
+}
 const modelPort = Number(modelEndpoint.port || 443);
 // Codex hands a long command back to the model, which may reply and end the turn before the
 // command ends. The tool upstream probe bounds its curl, and every turn waits for a command
