@@ -1272,6 +1272,7 @@
               "flows/configuration-driver",
               "flows/configuration-driver/persistence-and-revisions",
               "flows/local-password-authentication",
+              "flows/team-login-credit",
               "flows/namespace-iam-policy",
               "flows/native-service-account-credential-delivery",
               "flows/secret-storage-and-delivery",

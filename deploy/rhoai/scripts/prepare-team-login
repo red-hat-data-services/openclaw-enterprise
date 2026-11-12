@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Render protected proxy manifests and Gateway Configuration; apply nothing."""
+
 import base64
 import hashlib
 import json
@@ -47,6 +48,21 @@ headers = [
         "values": [{"claimSource": {"claim": "oce_gateway_scopes"}}],
     },
 ]
+# Dedicated claims leave the login identity and scope cap unchanged. Missing
+# credit claims remove caller-supplied headers and do not prevent authentication.
+credit_headers = {
+    "X-Coauthor-Name": "oce_git_coauthor_name",
+    "X-Coauthor-Email": "oce_git_coauthor_email",
+    "X-Coauthor-Email-Verified": "oce_git_coauthor_email_verified",
+}
+for header, claim in credit_headers.items():
+    headers.append(
+        {
+            "name": header,
+            "preserveRequestValue": False,
+            "values": [{"claimSource": {"claim": claim}}],
+        }
+    )
 for h in [
     "Cookie",
     "Authorization",
@@ -74,7 +90,7 @@ alpha = {
             "clientID": s.get("clientId", "team-claw-browser"),
             "clientSecretFile": "/config/client-secret",
             "scope": "openid",
-            "additionalClaims": ["oce_gateway_scopes"],
+            "additionalClaims": ["oce_gateway_scopes", *credit_headers.values()],
             "allowedGroups": [s.get("allowedGroup", "/team-claw-members")],
             "code_challenge_method": "S256",
             "oidcConfig": {
