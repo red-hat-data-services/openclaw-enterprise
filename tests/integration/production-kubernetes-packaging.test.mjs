@@ -34,6 +34,12 @@ import {
 } from "../helpers/production-chart-quantity-cases.ts";
 import { temporaryDirectory } from "../helpers/temporary-directory.mjs";
 
+import { createEnvoyWorkspaceGatewayPlan } from "../helpers/envoy-workspace-gateway.mjs";
+import { selfSigned } from "../helpers/certificates.mjs";
+import { RecordingContext } from "../conformance/kubernetes-teardown-cases.ts";
+import { withBoundedTeardown } from "../helpers/bounded-teardown.ts";
+import { withEnvironment } from "../helpers/environment.ts";
+
 const execute = promisify(execFile);
 
 test("console themes mount only on the API and restart it when the checksum changes", async () => {
@@ -1308,6 +1314,11 @@ test(
       ),
     );
     const installationPath = join(directory, "installation.yaml");
+    const load = () =>
+      loadInstallationConfiguration({
+        mode: "production",
+        environment: { OCC_CONFIG_PATH: installationPath },
+      });
     const invalid = [
       "192.168.1",
       "2130706433",
@@ -1350,11 +1361,6 @@ test(
         configuration.drivers.compute.configuration.gatewayRouting.hostname = hostname;
       }
       await writeFile(installationPath, JSON.stringify(configuration));
-      const load = () =>
-        loadInstallationConfiguration({
-          mode: "production",
-          environment: { OCC_CONFIG_PATH: installationPath },
-        });
       // Helm --set reads a bare integer or 0x hex as a number. Pass those spellings
       // with --set-string so the chart sees the hostname the Installation stores.
       const numericHostname =
@@ -1426,11 +1432,6 @@ test(
       const configuration = structuredClone(example);
       configuration.drivers.compute.configuration.gatewayRouting.sandbox = { domain };
       await writeFile(installationPath, JSON.stringify(configuration));
-      const load = () =>
-        loadInstallationConfiguration({
-          mode: "production",
-          environment: { OCC_CONFIG_PATH: installationPath },
-        });
       const rendered = () => render({ ...sandboxValues, "gatewayRouting.sandbox.domain": domain });
       if (domain === "192.0.2.1") {
         await assert.rejects(load(), (error) => {
@@ -1649,12 +1650,7 @@ test("production settings coexist in fresh and upgrade chart renders", tooling, 
       initializer.spec.template.metadata.annotations?.["openclaw.dev/upgrade-attempt"],
       isUpgrade ? settings["installation.upgradeAttemptId"] : undefined,
     );
-    const deployment = (component) =>
-      objects.find(
-        ({ kind, metadata }) =>
-          kind === "Deployment" && metadata.labels["app.kubernetes.io/component"] === component,
-      );
-    const api = deployment("api").spec.template.spec.containers[0];
+    const api = deploymentPodSpec(objects, "api").containers[0];
     assert.equal(api.image, controllerImage);
     assert.deepEqual(
       api.env.find(({ name }) => name === "OCC_CHANNEL_DIRECTORY_PROXY_URL"),
@@ -1664,7 +1660,7 @@ test("production settings coexist in fresh and upgrade chart renders", tooling, 
       api.env.find(({ name }) => name === "OCC_AGENT_NATIVE_ADMIN_ENABLED"),
       { name: "OCC_AGENT_NATIVE_ADMIN_ENABLED", value: "true" },
     );
-    const broker = deployment("worker").spec.template.spec.containers.find(
+    const broker = deploymentPodSpec(objects, "worker").containers.find(
       ({ name }) => name === "repository-credentials",
     );
     assert.deepEqual(broker.args, [
@@ -1787,14 +1783,9 @@ test(
   async () => {
     const { stdout } = await render(agentNativeAdminValues);
     const objects = await resources(stdout);
-    const deployment = (component) =>
-      objects.find(
-        ({ kind, metadata }) =>
-          kind === "Deployment" && metadata.labels["app.kubernetes.io/component"] === component,
-      );
 
-    const apiEnvironment = deployment("api").spec.template.spec.containers[0].env;
-    const workerEnvironment = deployment("worker").spec.template.spec.containers[0].env;
+    const apiEnvironment = deploymentPodSpec(objects, "api").containers[0].env;
+    const workerEnvironment = deploymentPodSpec(objects, "worker").containers[0].env;
     assert.deepEqual(
       apiEnvironment.filter(({ name }) => name.startsWith("OCC_AGENT_NATIVE_ADMIN_")),
       [
@@ -1831,12 +1822,7 @@ test(
     }
 
     const disabledObjects = await resources((await render()).stdout);
-    const disabledDeployment = (component) =>
-      disabledObjects.find(
-        ({ kind, metadata }) =>
-          kind === "Deployment" && metadata.labels["app.kubernetes.io/component"] === component,
-      );
-    const disabledApiEnvironment = disabledDeployment("api").spec.template.spec.containers[0].env;
+    const disabledApiEnvironment = deploymentPodSpec(disabledObjects, "api").containers[0].env;
     assert.deepEqual(
       disabledApiEnvironment.filter(({ name }) => name.startsWith("OCC_AGENT_NATIVE_ADMIN_")),
       [
@@ -1856,11 +1842,7 @@ test(
       objects.find(
         ({ kind, metadata }) => kind === "ClusterRole" && metadata.name.endsWith(suffix),
       );
-    const apiEnvironment = (objects) =>
-      objects.find(
-        ({ kind, metadata }) =>
-          kind === "Deployment" && metadata.labels["app.kubernetes.io/component"] === "api",
-      ).spec.template.spec.containers[0].env;
+    const apiEnvironment = (objects) => deploymentPodSpec(objects, "api").containers[0].env;
     const hasLogRules = (rules) =>
       rules.some(({ resources = [] }) => resources.includes("pods/log")) ||
       rules.some(({ resources = [] }) => resources.includes("events"));
@@ -2857,12 +2839,9 @@ test("the chart validates scalar and literal repository backend IDs", tooling, a
         )
       ).stdout,
     );
-    const broker = objects
-      .find(
-        ({ kind, metadata }) =>
-          kind === "Deployment" && metadata.labels["app.kubernetes.io/component"] === "worker",
-      )
-      .spec.template.spec.containers.find(({ name }) => name === "repository-credentials");
+    const broker = deploymentPodSpec(objects, "worker").containers.find(
+      ({ name }) => name === "repository-credentials",
+    );
     assert.equal(
       broker.args[broker.args.indexOf("--backend-id") + 1],
       argument,
@@ -5493,6 +5472,13 @@ test("default routing refuses missing operator configuration", tooling, async ()
   );
 });
 
+function deploymentPodSpec(objects, component) {
+  return objects.find(
+    ({ kind, metadata }) =>
+      kind === "Deployment" && metadata.labels["app.kubernetes.io/component"] === component,
+  ).spec.template.spec;
+}
+
 test(
   "private Envoy Gateway routing defaults on with automatic CA and deterministic hostnames",
   tooling,
@@ -5539,14 +5525,8 @@ test(
       ),
     );
 
-    const deployment = (component) =>
-      configured.find(
-        ({ kind, metadata }) =>
-          kind === "Deployment" && metadata.labels["app.kubernetes.io/component"] === component,
-      );
-
     for (const component of ["api", "worker"]) {
-      const pod = deployment(component).spec.template.spec;
+      const pod = deploymentPodSpec(configured, component);
       const apiKeyVolume = pod.volumes.find(({ name }) => name === "gateway-api-key");
       const caVolume = pod.volumes.find(({ name }) => name === "gateway-ca");
       const apiKeyMount = pod.containers[0].volumeMounts.find(
@@ -5805,14 +5785,8 @@ test(
     const gatewayName = "oce-agent-gateways";
     const gatewayNamespace = "openclaw-system";
     const serviceName = gatewayServiceName(gatewayNamespace, gatewayName);
-    const apiPod = configured.find(
-      ({ kind, metadata }) =>
-        kind === "Deployment" && metadata.labels["app.kubernetes.io/component"] === "api",
-    ).spec.template.spec;
-    const workerPod = configured.find(
-      ({ kind, metadata }) =>
-        kind === "Deployment" && metadata.labels["app.kubernetes.io/component"] === "worker",
-    ).spec.template.spec;
+    const apiPod = deploymentPodSpec(configured, "api");
+    const workerPod = deploymentPodSpec(configured, "worker");
 
     assert.deepEqual(apiPod.volumes.find(({ name }) => name === "gateway-ca").secret, {
       secretName: "occ-private-ca",
@@ -6951,3 +6925,78 @@ test(
     }
   },
 );
+
+test("OpenShell Envoy cleanup reports rejected deletes and continues remaining cleanup", async (t) => {
+  const directory = await temporaryDirectory(t, "envoy-cleanup-");
+  const certificate = await selfSigned(directory);
+  await withEnvironment(
+    {
+      OCC_TEST_GATEWAY_CA_CERT_PATH: certificate.certPath,
+      OCC_TEST_GATEWAY_CA_KEY_PATH: certificate.keyPath,
+    },
+    async () => {
+      for (const refused of ["gatewayclass", "networkpolicy"]) {
+        const attempted = [];
+        const testContext = new RecordingContext();
+        // The plugin fixture registers its aggregate first on the raw context.
+        testContext.after(async () => {
+          attempted.push("fixture aggregate");
+        });
+        // Run the real plan and its Helm rendering. Only cluster I/O is substituted;
+        // the regression concerns the actual registered cleanup's rejected command.
+        await createEnvoyWorkspaceGatewayPlan(
+          testContext,
+          { platformNamespace: "cleanup-fixture" },
+          {
+            applyManifest: async () => {},
+            waitFor: async (_description, read) => {
+              assert.ok(await read());
+            },
+            resource: async (kind) => {
+              if (kind === "secret") {
+                return { data: { "tls.crt": certificate.cert } };
+              }
+              return {
+                status: {
+                  conditions: ["Ready", "Accepted", "Programmed"].map((type) => ({
+                    type,
+                    status: "True",
+                  })),
+                  listeners: [
+                    { name: "https", conditions: [{ type: "Accepted", status: "True" }] },
+                  ],
+                },
+              };
+            },
+            kubectl: async (...args) => {
+              if (args[0] === "get") {
+                return JSON.stringify({ items: [{ spec: { podCIDR: "10.42.0.0/24" } }] });
+              }
+              assert.equal(args[0], "delete");
+              assert.ok(args.includes("--ignore-not-found=true"));
+              if (args[1] === "gatewayclass") {
+                assert.ok(args.includes("--wait=false"));
+              }
+              attempted.push(args[1]);
+              if (args[1] === refused) {
+                throw new Error("fixture delete rejected");
+              }
+              return "";
+            },
+          },
+        );
+        // Another helper receiving this raw context shares the Envoy cleanup group.
+        withBoundedTeardown(testContext).after(() => attempted.push("relay cleanup"));
+        await assert.rejects(async () => {
+          for (const hook of testContext.hooks) {
+            await hook();
+          }
+        }, /fixture delete rejected/);
+        assert.equal(attempted[0], "fixture aggregate");
+        assert.equal(attempted[1], "relay cleanup");
+        assert.ok(attempted.includes("gatewayclass"));
+        assert.ok(attempted.includes("networkpolicy"));
+      }
+    },
+  );
+});

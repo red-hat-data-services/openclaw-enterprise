@@ -25,6 +25,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { openclawBuildArguments, readOpenclawSource } from "../lib/openclaw-source.mjs";
 import { loadTestSuites } from "./test-suites.mjs";
 import { isOpenShellLane } from "./openshell-full-integration.ts";
+import { openShellHarnessError, openShellRequiredEnv } from "./openshell-model-inputs.mjs";
 import {
   assertRuntimeArtifactTagAvailable,
   loadRuntimeArtifact,
@@ -773,6 +774,28 @@ async function ensurePostgresServer(statePath, state) {
   if (!/^[a-f0-9]{64}$/.test(container)) {
     throw new Error("Expected one owned PostgreSQL container for port discovery.");
   }
+  const cluster = state.resources.find(
+    (entry) => entry.kind === "k3d-cluster" && entry.status === "ready",
+  );
+  if (cluster) {
+    // Linux Docker can reassign an automatic host port when a network attaches.
+    // Finish this topology before publishing the port or opening test pools.
+    const networks = JSON.parse(
+      (
+        await execFile(docker, [
+          "inspect",
+          "--format",
+          "{{json .NetworkSettings.Networks}}",
+          `k3d-${cluster.name}-server-0`,
+        ])
+      ).stdout,
+    );
+    const network = Object.keys(networks).find((name) => name.startsWith(`k3d-${cluster.name}`));
+    if (!network) {
+      throw new Error("The owned k3d network is unavailable for PostgreSQL.");
+    }
+    await execFile(docker, ["network", "connect", network, container]);
+  }
   const output = await execFile(docker, [
     "inspect",
     "--format",
@@ -979,34 +1002,19 @@ function assertImmutableOptionalEnvImages(names, env = process.env) {
   }
 }
 
-async function validateLaneInputsBeforeSideEffects(lane, { file } = {}) {
+async function validateLaneInputsBeforeSideEffects(lane, { file, modelSelectors } = {}) {
   const name = laneName(lane);
   const prepare = lanePrepare(name);
   const effectiveEnv = effectiveLaneEnv(name);
+  const modelEnv = modelSelectors ?? effectiveEnv;
+  const harnessError = openShellHarnessError(name, file, modelEnv);
+  if (harnessError) {
+    throw new Error(harnessError);
+  }
   if (prepare.k3d && !isOpenShellLane(name) && effectiveEnv.OPENCLAW_CI_K3S_IMAGE) {
     assertImmutableImageReference(effectiveEnv.OPENCLAW_CI_K3S_IMAGE, "OPENCLAW_CI_K3S_IMAGE");
   }
-  const openShellGatewayFile = [
-    "tests/integration/namespace-driver-openshell-k3d-real.test.ts",
-    "tests/integration/sandbox-driver-openshell-k3d-real.test.mjs",
-    "tests/integration/openshell-gateway-tool-policy-real.test.ts",
-    "tests/integration/openshell-refresh-real.test.ts",
-    "tests/integration/openshell-upstream-real.test.ts",
-    "tests/integration/openshell-credentials-real.test.ts",
-    "tests/integration/openshell-withdrawal-real.test.ts",
-  ].includes(file);
-  const openShellApiKey =
-    isOpenShellLane(name) &&
-    ((effectiveEnv.OCC_TEST_OPENSHELL_HARNESS === "openclaw" &&
-      (openShellGatewayFile ||
-        (file === undefined && effectiveEnv.OCC_K3D_HARNESS === "openclaw"))) ||
-      (openShellGatewayFile && Boolean(effectiveEnv.OCC_TEST_OPENSHELL_MODEL_BASE_URL?.trim())));
-  requireEnv(
-    (prepare.requireEnv ?? []).map((input) =>
-      openShellApiKey && input === "CODEX_ACCESS_TOKEN" ? "OPENAI_API_KEY" : input,
-    ),
-    effectiveEnv,
-  );
+  requireEnv(openShellRequiredEnv(name, file, prepare.requireEnv ?? [], modelEnv), effectiveEnv);
   if (prepare.nodeBaseImage) {
     assertNodeBaseImage(effectiveEnv.NODE_BASE_IMAGE);
   }
@@ -3143,7 +3151,16 @@ async function prepareK3dRuntimeImages(
   }
   // Replace the build tag with its imported digest before publishing the next step's inputs.
   env.OCC_TEST_KUBERNETES_RUNTIME_IMAGE = env.OCC_TEST_KUBERNETES_GATEWAY_IMAGE;
-  if (lanePrepare(state.lane).codexSeccomp && process.env.OCC_K3D_OPENCLAW_SOURCE === undefined) {
+  // This focused journey deploys only embedded OpenClaw Agents. The full lane
+  // still prepares Codex because its other files exercise dedicated execution.
+  const embeddedOidcOnly =
+    state.lane === "gateway-routing" &&
+    state.selectedFile === "tests/integration/oidc-agent-chat-k3d-real.test.ts";
+  if (
+    lanePrepare(state.lane).codexSeccomp &&
+    !embeddedOidcOnly &&
+    process.env.OCC_K3D_OPENCLAW_SOURCE === undefined
+  ) {
     progress(state.lane, "Deriving and installing the dedicated Codex seccomp profile.");
     const seccomp = await prepareCodexSeccompProfile({
       cluster,
@@ -3757,7 +3774,6 @@ async function prepareLane({ lane, statePath, file, cleanupOwner }) {
     case "k3d-otel":
     case "gateway-routing": {
       await commandAvailable(process.env.OCC_HELM_BIN ?? "helm", ["version", "--short"]);
-      await ensurePostgresServer(resolvedStatePath, state);
       const cluster = await prepareK3dModelLane(resolvedStatePath, state, env, {
         buildController: true,
         buildRuntime: true,
@@ -3963,6 +3979,9 @@ async function prepareLane({ lane, statePath, file, cleanupOwner }) {
 
 async function prepareK3dModelLane(statePath, state, env, options) {
   const cluster = await ensureK3dCluster(statePath, state);
+  // Register PostgreSQL after the cluster so cleanup removes its attached
+  // container before k3d removes the network. Test files preserve this attachment.
+  await ensurePostgresServer(statePath, state);
   env.OCC_TEST_KUBERNETES_KUBECONFIG = cluster.kubeconfig;
   env.OCC_TEST_KUBERNETES_CONTEXT = cluster.context;
   if (cluster.pluginStatusProxyCidrs !== undefined) {
@@ -3986,13 +4005,13 @@ async function prepareK3dModelLane(statePath, state, env, options) {
 // (CREATE DATABASE ... TEMPLATE) instead of a copy of the lane template. The worker
 // revision suite copies the database the runner prepared for its file, one copy per test.
 // Defaults remain overridable by a file; env contains preparation-owned outputs.
-async function prepareFile({ lane, file, statePath, template }) {
+async function prepareFile({ lane, file, statePath, template, modelSelectors }) {
   const name = assertLane(lane);
   if (!file) {
     throw new Error("prepareFile requires a file.");
   }
   const relativeFile = toRepositoryRelative(filePath(file));
-  await validateLaneInputsBeforeSideEffects(name, { file: relativeFile });
+  await validateLaneInputsBeforeSideEffects(name, { file: relativeFile, modelSelectors });
   const resolvedStatePath = normalizeStatePath(statePath);
   // A test may prepare databases from its own process while the runner prepares and
   // cleans other files. The lock keeps either side from writing back a stale state.
@@ -4104,6 +4123,7 @@ async function prepareFileWithState({ name, relativeFile, resolvedStatePath, tem
     if (
       [
         "tests/integration/sandbox-driver-openshell-k3d-real.test.mjs",
+        "tests/integration/sandbox-driver-openshell-scratch-k3d-real.test.ts",
         "tests/integration/openshell-plugin-install-real.test.ts",
         "tests/integration/openshell-gateway-tool-policy-real.test.ts",
         "tests/integration/openshell-refresh-real.test.ts",
