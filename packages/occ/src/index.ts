@@ -6879,11 +6879,16 @@ export class OpenClawController {
     if (this.defaultPresets.length === 0) {
       return;
     }
-    const existing = new Map(
-      (await state.presets.listPresets(namespace.id)).map((preset) => [preset.name, preset]),
-    );
+    const existing = this.refreshBundledDefaultPresets
+      ? new Map(
+          (await state.presets.listPresets(namespace.id)).map((preset) => [preset.name, preset]),
+        )
+      : undefined;
+    const existingNames = existing
+      ? undefined
+      : new Set((await state.presets.listPresetSummaries(namespace.id)).map(({ name }) => name));
     for (const preset of this.defaultPresets) {
-      const copy = existing.get(preset.name);
+      const copy = existing?.get(preset.name);
       if (copy !== undefined) {
         await this.refreshSupersededDefaultPreset(
           state,
@@ -6893,6 +6898,9 @@ export class OpenClawController {
           copy,
           refresh,
         );
+        continue;
+      }
+      if (existingNames?.has(preset.name)) {
         continue;
       }
       try {
@@ -6971,12 +6979,8 @@ export class OpenClawController {
       readonly skipped: SkippedDefaultPreset[];
     },
   ): Promise<void> {
-    // Only bundled defaults have a history. A `presets.files` entry is refreshed only while
-    // `includeDefaults` is on and the file equals the current bundled version of its name;
-    // a file that repeats a bundled default with `includeDefaults` off never is.
-    if (!this.refreshBundledDefaultPresets) {
-      return;
-    }
+    // Only bundled defaults have a history. Even with refresh enabled, a `presets.files`
+    // entry is refreshed only if it equals the current bundled version of its name.
     const current = this.bundledPresetVersions.find(
       (version) =>
         version.current &&
@@ -12119,7 +12123,6 @@ export class OpenClawController {
       input.gatewayManagedMode,
       this.gatewayManagedModeSupported(),
     );
-    const backendId = this.backendId(input.backendId);
     const plugins = normalizeAgentPlugins(input.plugins);
     const pluginApprovers = normalizeAgentPluginApprovers(input.pluginApprovers);
     this.namespaceIdentity(input.namespaceId);
@@ -12137,6 +12140,7 @@ export class OpenClawController {
       // AccessBinding deletes hold this lock: authorize again so a revocation that committed
       // while this write waited stops it before it leaves a durable Owner binding or grant.
       await this.authorize(principalId, "create", target);
+      const backendId = this.backendId(input.backendId);
       // Checked after authorization: the conflict names the Namespace state.
       if (namespace.status !== "provisioning" && namespace.status !== "ready") {
         throw new ResourceStateConflictError("The Namespace does not accept new Agents.");
@@ -12268,13 +12272,14 @@ export class OpenClawController {
 
   /**
    * Create Agent's preflight, for a Configuration the caller has not saved yet: createConfiguration's
-   * content rules, then createAgent's checks of plugin selections and initial workspace files
+   * content and Driver admission, then createAgent's checks of plugin selections and initial workspace files
    * against those values, with their messages, under createAgent's `agent:create` check. A
    * refusal is reported before the caller saves its Secret or Configuration. It writes nothing.
    * With `harnessAuth`, Agent save's Harness authentication check against the Compute Driver runs
    * too, so a refusal that depends only on the Agent's topology (finding 2391) is reported here.
-   * With `configuration.secretBindings`, a channel credential reference without a binding is
-   * refused as Configuration create would (finding 2319); the bound Secrets are not read.
+   * With `configuration.secretBindings`, a foreign-Namespace reference or a channel credential
+   * reference without a binding is refused as Configuration create would; the bound Secrets
+   * are not read.
    * Checks that need saved resources (the bound Secrets, the Harness authentication source and
    * credential sources) or live repository policy stay with those writes.
    * With `name`, a name another Agent in the Namespace has is refused last, with create's 409
@@ -12334,19 +12339,21 @@ export class OpenClawController {
             );
       // The form saves the Configuration first, so its content rules answer first, in
       // createConfiguration's order.
-      await this.configurationDriver().validateSize?.(values);
+      rejectCrossNamespaceSecretSources(namespace.id, secretBindings, undefined);
+      const configurationDriver = this.configurationDriver();
+      // Use one unsaved Configuration for Driver admission and Agent topology checks.
+      const configuration: Configuration = Object.freeze({
+        id: "cfg_00000000-0000-4000-8000-000000000000",
+        namespaceId: namespace.id,
+        kind: "agent",
+        generation: 1,
+        values,
+        createdAt: this.timestamp(),
+      });
+      await configurationDriver.validateSize?.(values);
       this.validateConfigurationContent(values, undefined, secretBindings);
+      await configurationDriver.validate(configuration);
       const driver = await this.validateAgentPlugins(plugins, pluginApprovers, () => values);
-      // Shaped like the saved Configuration createAgent reads; only its values are checked.
-      const configuration: () => Promise<Readonly<Configuration>> = async () =>
-        Object.freeze({
-          id: "cfg_00000000-0000-4000-8000-000000000000",
-          namespaceId: namespace.id,
-          kind: "agent" as const,
-          generation: 1,
-          values,
-          createdAt: this.timestamp(),
-        });
       rejectCrossNamespaceSecretSources(
         namespace.id,
         undefined,
@@ -12363,7 +12370,7 @@ export class OpenClawController {
           plugins,
           pluginDriver: driver,
         },
-        configuration,
+        async () => configuration,
       );
       // After `agent:create` in this Namespace, as create's 409 reveals the name (errors.ts).
       if (input.name !== undefined) {
