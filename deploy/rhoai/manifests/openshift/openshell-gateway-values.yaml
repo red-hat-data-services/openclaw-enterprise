@@ -1,4 +1,4 @@
-# OpenShift test-cluster profile for the pinned OpenShell v0.1.6 chart.
+# OpenShift test-cluster profile for the pinned OpenShell v0.1.9 chart.
 # The plaintext, unauthenticated gateway is for isolated single-tenant clusters.
 # Its NetworkPolicy boundary matches namespace and pod labels, and labels are not
 # an authentication boundary: a user who can set them can reach the gateway.
@@ -17,8 +17,12 @@ server:
       workspaceMode: operator
       operatorNamespaceLabel: openshell.ai/openclaw-workspace=true
 # OpenShell 0.1.5 rejects Sandbox template labels unless the operator allows them.
-# Images: Red Hat Konflux builds of the v0.1.6-rhaiv.3 midstream release
-# (opendatahub-io/openshell), published on quay.io/opendatahub.
+# Images: Red Hat Konflux builds of the v0.1.9-rhaiv.4 midstream release
+# (opendatahub-io/openshell, tag commit 814f3209), published on quay.io/opendatahub.
+# No version-tagged quay images exist for the 0.1.9 line; the digests are the
+# commit-tagged builds of 9e5bf3e6, the tag plus three CI-only carry commits,
+# runtime-identical to the release. The odh-stable tags drift per repository,
+# so never pin through them.
 gatewayConfig:
   openshell.drivers.kubernetes:
     allowed_pod_labels:
@@ -43,14 +47,14 @@ gateway:
   image:
     registry: quay.io
     repository: opendatahub/odh-openshell-gateway
-    digest: sha256:818aa0661fdf6a1e23a0484042aa5052a4ff3992eba196bc7a15837df1d1eb50
+    digest: sha256:2a78256a787c34220e0ff5d02a2d62804a43a63564789dbb5304e03b0733f965
 sandboxRuntime:
   image:
     registry: quay.io
     repository: opendatahub/odh-openshell-sandbox
-    digest: sha256:a26749a10cb0c68e56784486bc287a7a6ee5af0e65a6b3a2dc1c94d67cbcf144
+    digest: sha256:28393544e9b7c0cc901841843b8aa16a726694e3dce525a5d315c0ea458d8440
 supervisor:
   image:
     registry: quay.io
     repository: opendatahub/odh-openshell-supervisor
-    digest: sha256:7d9f48627abef8a7d9518a46b7e74875fa7187ca503bcd2e15533cb7d4fc745a
+    digest: sha256:8f7d6e64b3928f2e7b5af979171426595b252c992662110ddccac4340dcea638
