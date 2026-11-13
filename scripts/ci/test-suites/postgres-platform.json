@@ -16,10 +16,10 @@
     "tests/integration/compute-singleton-worker-postgres.test.ts",
     "tests/integration/postgres-backend-ownership.test.mjs",
     "tests/integration/postgres-restart-recovery.test.mjs",
-    "tests/integration/postgres-agent-deletion-audit.test.mjs",
+    "tests/integration/postgres-agent-deletion-audit.test.ts",
     "tests/integration/postgres-agent-gateway-managed-mode.test.ts",
     "tests/integration/postgres-default-users.test.ts",
-    "tests/integration/postgres-agent-runtime-logs.test.mjs",
+    "tests/integration/postgres-agent-runtime-logs.test.ts",
     "tests/integration/postgres-repository-broker-receipts.test.mjs",
     "tests/integration/postgres-worker-stale-claim.test.mjs",
     "tests/integration/postgres-namespace-iam-policy.test.mjs",
@@ -28,8 +28,8 @@
     "tests/integration/workspace-setup-worker.test.ts",
     "tests/integration/postgres-repository-sessions.test.mjs",
     "tests/integration/postgres-secret-state.test.mjs",
-    "tests/integration/postgres-service-account-deletion.test.mjs",
-    "tests/integration/postgres-service-account-issuance-recovery.test.mjs",
+    "tests/integration/postgres-service-account-deletion.test.ts",
+    "tests/integration/postgres-service-account-issuance-recovery.test.ts",
     "tests/integration/postgres-service-account-compensation.test.ts",
     "tests/integration/postgres-presets.test.mjs",
     "tests/integration/postgres-workspace-setup.test.ts",
@@ -225,14 +225,14 @@
       ]
     },
     {
-      "path": "tests/integration/postgres-service-account-deletion.test.mjs",
+      "path": "tests/integration/postgres-service-account-deletion.test.ts",
       "expectedTests": [
         "ServiceAccount deletion protects draft, queued, claimed, and active references before Driver effects",
         "a forced ServiceAccount delete without a Driver audits the unrevoked credential and decides on the locked account"
       ]
     },
     {
-      "path": "tests/integration/postgres-service-account-issuance-recovery.test.mjs",
+      "path": "tests/integration/postgres-service-account-issuance-recovery.test.ts",
       "expectedTests": [
         "an issuance that never committed is reclaimed by the next issuance under the account lock",
         "deleting an account after an issuance that never committed revokes its credential and removes its Secret",
@@ -291,7 +291,7 @@
       ]
     },
     {
-      "path": "tests/integration/postgres-agent-deletion-audit.test.mjs",
+      "path": "tests/integration/postgres-agent-deletion-audit.test.ts",
       "expectedTests": [
         "Agent delete audit lists every AccessBinding and Restriction the deletion finalizer removes"
       ]
@@ -313,7 +313,7 @@
       ]
     },
     {
-      "path": "tests/integration/postgres-agent-runtime-logs.test.mjs",
+      "path": "tests/integration/postgres-agent-runtime-logs.test.ts",
       "expectedTests": [
         "runtime log views and downloads persist audit rows before the read and fail closed without them"
       ]
