@@ -176,3 +176,7 @@ Collector or local Docker log forwarding. See [Observability](../../guides/obser
 - `OCC_DOCKER_LOGGING_ADDRESS` — Docker Compute log destination; local override default: `127.0.0.1:24224`.
 - `OCE_WORKER_OBSERVATIONS_FILE` — Exact private JSONL input read by the worker termination Collector; required. See [Worker termination observations](../../guides/observability/worker-terminations.md).
 - `OCE_WORKER_STATE_DIR` — Private persistent directory for worker termination Collector offsets and export queue; required. See [Worker termination observations](../../guides/observability/worker-terminations.md).
+
+## Deployment helpers
+
+- `TEAM_CREDIT_USERS_FILE` — Private JSON file of administrator-confirmed credit details for saved team-login users; used only by `configure-team-login-credit`. See [staged credit claims](../../../deploy/rhoai/TEAM-CREDIT.md) for the entry format and required login environment.

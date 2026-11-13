@@ -43,6 +43,23 @@ results. For triggers and failure consequences across workflows, use the
 | [Observability Demo](ci/observability-demo.md) | Verify fixture telemetry and rendered monitoring dashboards.                 |
 | [Local k3d Quickstart](ci/k3d-quickstart.md)   | Exercise browser onboarding, Linear, and Git on one Agent.                   |
 
+The downstream [RHOAI deployment workflow](../../.github/workflows/rhoai-manifests.yml)
+also checks deployment scripts and manifests. Its credit-claim integration launches
+disposable HTTPS Keycloak, runs the team-login helpers, and verifies code/PKCE
+sign-in, userinfo, credit updates and unchanged identity/scope grants. It does not
+prove an OpenShift rollout or runtime Git trailers. To run the same integration
+locally, provide a disposable HTTPS Keycloak with administrator username `admin`:
+
+```bash
+SSL_CERT_FILE='<test CA PEM>' \
+KEYCLOAK_TEST_URL='https://<disposable-keycloak>' \
+KEYCLOAK_TEST_ADMIN_PASSWORD='<test administrator password>' \
+python3 deploy/rhoai/tests/prove_team_login_credit.py
+```
+
+The test creates and deletes one uniquely named realm. The script substitutes
+only Kubernetes Secret and service discovery; Keycloak requests use the real API.
+
 For account-creation races, see the
 [PostgreSQL account provisioning checks](../flows/local-password-authentication.md#debugging-and-verification).
 
