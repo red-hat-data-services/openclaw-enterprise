@@ -1,10 +1,13 @@
 dashboard:
   # Red Hat Konflux build of opendatahub-io/openshell-dashboard (odh-stable),
   # matching the quay.io/opendatahub images used by the gateway chart.
+  # Built from the 0.1.6 gateway line (435331cf); the dashboard's 0.1.8
+  # bump has not landed yet, so the UI reports a 0.1.8 gateway as
+  # unsupported. Informational only: the BFF never refuses requests.
   image:
     registry: quay.io
     repository: opendatahub/odh-openshell-dashboard
-    digest: sha256:dcc59675c584d279dea1110649cd184c56dc02c57a1cf70e8ef0f3a559806de1
+    digest: sha256:a203d8f84ebdab41bb99ee61a64ad784db9dafbb2d3cc0320e3e50240a45a485
 authProxy:
   image:
     digest: sha256:aa0bd8dd5ab0c78e4c91c92755ad573a5f92241f88138b4141b8ec803463b4fd
