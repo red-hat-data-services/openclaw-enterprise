@@ -1,4 +1,5 @@
 import {
+  createRepositorySlugPattern,
   isGitHubRepositoryPermissions,
   parseGitHubNumericId,
   type GitHubRepositoryGrant,
@@ -71,7 +72,7 @@ export interface GitHubRepositoryRegistry {
 
 const selectorPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const backendPattern = /^(?!\s)(?!.*\s$).{1,200}$/;
-const repositoryPattern = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+const repositoryPattern = createRepositorySlugPattern();
 
 function invalid(): never {
   throw new Error("invalid-repository-registry");
@@ -341,6 +342,25 @@ const installationGrantPolicy = Object.freeze({
   deliveryPolicy: "github-installation-git-basic-api-bearer-online-authorization-v1",
 } as const);
 
+function registryGrantId(
+  registry: GitHubRepositoryRegistry,
+  fields: Readonly<Record<string, unknown>>,
+): string {
+  return `sha256:${createHash("sha256")
+    .update(
+      JSON.stringify({
+        version: registry.version,
+        backendId: registry.backendId,
+        providerInstanceId: registry.providerInstanceId,
+        appId: registry.appId,
+        githubInstallationId: registry.githubInstallationId,
+        maximumDurationSeconds: registry.maximumDurationSeconds,
+        ...fields,
+      }),
+    )
+    .digest("hex")}`;
+}
+
 export function resolveGitHubRepositoryBinding(
   registry: GitHubRepositoryRegistry,
   input: RepositoryBindingRequest & { readonly namespaceId: string },
@@ -354,37 +374,20 @@ export function resolveGitHubRepositoryBinding(
     if (request.profile !== githubInstallationProfile || policy?.accessMode !== "installation") {
       throw new Error("repository-binding-not-authorized");
     }
-    const {
-      version,
-      backendId,
-      providerInstanceId,
-      appId,
-      githubInstallationId,
-      maximumDurationSeconds,
-    } = registry;
-    const fingerprint = createHash("sha256")
-      .update(
-        JSON.stringify({
-          version,
-          backendId,
-          providerInstanceId,
-          appId,
-          githubInstallationId,
-          maximumDurationSeconds,
-          namespaceId,
-          repositoryRef,
-          profile: githubInstallationProfile,
-          ...installationGrantPolicy,
-        }),
-      )
-      .digest("hex");
+    const { backendId, providerInstanceId, githubInstallationId } = registry;
+    const grantId = registryGrantId(registry, {
+      namespaceId,
+      repositoryRef,
+      profile: githubInstallationProfile,
+      ...installationGrantPolicy,
+    });
     // The shared grant identity is opaque. This selector is not a GitHub repository ID.
     const repositoryId = `github-installation:${githubInstallationId}`;
     return Object.freeze({
       repositoryRef,
       backendId,
       profile: githubInstallationProfile,
-      grant: Object.freeze({ providerInstanceId, repositoryId, grantId: `sha256:${fingerprint}` }),
+      grant: Object.freeze({ providerInstanceId, repositoryId, grantId }),
     });
   }
   const repository = registry.repositories.find((entry) => entry.repositoryRef === repositoryRef);
@@ -400,38 +403,24 @@ export function resolveGitHubRepositoryBinding(
     throw new Error("repository-binding-not-authorized");
   }
   // Policy changes cannot preserve an earlier grant merely by retaining an operator label.
-  const fingerprint = createHash("sha256")
-    .update(
-      JSON.stringify({
-        version: registry.version,
-        backendId: registry.backendId,
-        providerInstanceId: registry.providerInstanceId,
-        appId: registry.appId,
-        githubInstallationId: registry.githubInstallationId,
-        maximumDurationSeconds: registry.maximumDurationSeconds,
-        repositoryRef,
-        repositoryId: repository.repositoryId,
-        repository: repository.repository,
-        namespaceId,
-        allowedProfiles: policy.profiles,
-        ...(policy.pushRefAllowlist === undefined
-          ? {}
-          : { pushRefAllowlist: policy.pushRefAllowlist }),
-        profile: selectedProfile,
-        ...(policy.pullRequestBase === undefined
-          ? {}
-          : { pullRequestBase: policy.pullRequestBase }),
-        ...(policy.draftPullLimit === undefined ? {} : { draftPullLimit: policy.draftPullLimit }),
-        permissions: repositoryTransportPermissions(policy, selectedProfile),
-        capabilityPolicy:
-          policy.transport === "git-only"
-            ? gitOnlyCapabilityPolicy
-            : policy.transport === "git-and-draft-pr"
-              ? draftPullCapabilityPolicy
-              : githubCapabilityPolicy,
-      }),
-    )
-    .digest("hex");
+  const grantId = registryGrantId(registry, {
+    repositoryRef,
+    repositoryId: repository.repositoryId,
+    repository: repository.repository,
+    namespaceId,
+    allowedProfiles: policy.profiles,
+    ...(policy.pushRefAllowlist === undefined ? {} : { pushRefAllowlist: policy.pushRefAllowlist }),
+    profile: selectedProfile,
+    ...(policy.pullRequestBase === undefined ? {} : { pullRequestBase: policy.pullRequestBase }),
+    ...(policy.draftPullLimit === undefined ? {} : { draftPullLimit: policy.draftPullLimit }),
+    permissions: repositoryTransportPermissions(policy, selectedProfile),
+    capabilityPolicy:
+      policy.transport === "git-only"
+        ? gitOnlyCapabilityPolicy
+        : policy.transport === "git-and-draft-pr"
+          ? draftPullCapabilityPolicy
+          : githubCapabilityPolicy,
+  });
   return Object.freeze({
     repositoryRef,
     profile: selectedProfile,
@@ -439,7 +428,7 @@ export function resolveGitHubRepositoryBinding(
     grant: Object.freeze({
       providerInstanceId: registry.providerInstanceId,
       repositoryId: repository.repositoryId,
-      grantId: `sha256:${fingerprint}`,
+      grantId,
     }),
   });
 }
