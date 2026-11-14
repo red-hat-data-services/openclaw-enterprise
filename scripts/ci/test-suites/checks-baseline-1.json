@@ -5,10 +5,12 @@
   "fileConcurrency": 8,
   "parallelFiles": [
     "tests/integration/dev-up.test.mjs",
+    "tests/integration/dev-up-compose-startup.test.ts",
     "tests/integration/dev-up-compose.test.mjs",
     "tests/integration/occ-api.test.mjs",
     "tests/integration/occ-api-joint-plugin-deployment.test.ts",
-    "tests/integration/stored-document-serialization.test.mjs",
+    "tests/integration/occ-service-account-lifecycle.test.ts",
+    "tests/integration/stored-document-serialization.test.ts",
     "tests/integration/precompiled-route-compilers.test.ts",
     "tests/integration/route-header-names.test.ts",
     "tests/integration/list-summaries.test.ts",
@@ -18,20 +20,21 @@
     "tests/integration/openshell-quickstart-policy.test.ts",
     "tests/conformance/codex-native-startup.test.mjs",
     "tests/conformance/occ-api-security.test.mjs",
+    "tests/conformance/occ-runtime-logs-security.test.ts",
     "tests/integration/configuration-startup.test.mjs",
     "tests/integration/installation-change-preflight.test.mjs",
-    "tests/conformance/kubernetes-secret-driver.test.mjs",
+    "tests/conformance/kubernetes-secret-driver.test.ts",
     "tests/docs/docs-site.test.mjs",
     "tests/conformance/kubernetes-compute.test.mjs",
     "tests/conformance/openshell-static-credential-attachment.test.ts",
     "tests/conformance/kubernetes-provider-harness.test.mjs",
     "tests/conformance/kubernetes-harness-workspace-volume.test.mjs",
-    "tests/conformance/workspace-node-supervisor.test.mjs",
+    "tests/conformance/workspace-node-supervisor.test.ts",
     "tests/integration/presets-controller.test.ts",
-    "tests/integration/plugin-discovery-api.test.mjs",
+    "tests/integration/plugin-discovery-api.test.ts",
     "tests/integration/openshell-plugin-source-reader.test.ts",
     "tests/integration/runtime-credentials-api.test.ts",
-    "tests/integration/secret-api.test.mjs",
+    "tests/integration/secret-api.test.ts",
     "tests/integration/model-discovery-shipped-api.test.ts",
     "tests/integration/console-api.test.ts",
     "tests/integration/caller-denial-api.test.ts",
@@ -293,10 +296,29 @@
       "expectedTests": ["sealed Namespace compares SDK-deserialized ingress exactly"]
     },
     {
-      "path": "tests/conformance/kubernetes-secret-driver.test.mjs"
+      "path": "tests/conformance/kubernetes-secret-driver.test.ts"
     },
     {
       "path": "tests/conformance/occ-api-security.test.mjs"
+    },
+    {
+      "path": "tests/conformance/occ-runtime-logs-security.test.ts",
+      "expectedTests": [
+        "runtime status and log reads enforce their permission tiers before any Driver call",
+        "a delegated read_logs principal reads and downloads logs without administer",
+        "an Agent-level read_logs grant covers every revision, including later deployments",
+        "runtime log cursors bind one principal and view and are re-authorized on every poll",
+        "minLevel filters log lines on the server and a cursor still resumes after hidden lines",
+        "an expired runtime log cursor starts a new audited view with a labelled gap",
+        "a cursor whose Pod is gone starts a new audited view of the Pod that is read",
+        "runtime routes reject the Agent draft and unknown revisions without a Driver call",
+        "log polls describe only the requested source and skip Event lists",
+        "runtime log failures are fixed, content-free and never read after an audit failure",
+        "a version without a Sandbox names the log sources and policy suggestions it lacks",
+        "runtime log reads retain allowance through backward and restored wall clocks",
+        "runtime routes answer 501 when the Driver, its logging owner or the operator switch opts out",
+        "runtime log downloads use the log tier and are audited once per download"
+      ]
     },
     {
       "path": "tests/conformance/runtime-logs-admission.test.ts"
@@ -391,7 +413,7 @@
       "path": "tests/conformance/workspace-files.test.ts"
     },
     {
-      "path": "tests/conformance/workspace-node-supervisor.test.mjs"
+      "path": "tests/conformance/workspace-node-supervisor.test.ts"
     },
     {
       "path": "tests/integration/presets-controller.test.ts"
@@ -462,7 +484,15 @@
       "path": "tests/integration/occ-api-joint-plugin-deployment.test.ts"
     },
     {
-      "path": "tests/integration/stored-document-serialization.test.mjs"
+      "path": "tests/integration/occ-service-account-lifecycle.test.ts",
+      "expectedTests": [
+        "a forced ServiceAccount delete without a ChatGPT Backend removes an account whose token nothing can revoke and audits it",
+        "native ServiceAccounts keep private credential references and cannot admit Harness authentication",
+        "native ServiceAccounts reject invalid references and enforce exact Namespace-scoped access"
+      ]
+    },
+    {
+      "path": "tests/integration/stored-document-serialization.test.ts"
     },
     {
       "path": "tests/integration/precompiled-route-compilers.test.ts"
@@ -486,7 +516,7 @@
       "path": "tests/integration/production-upgrade-chart-inputs.test.ts"
     },
     {
-      "path": "tests/integration/secret-api.test.mjs"
+      "path": "tests/integration/secret-api.test.ts"
     },
     {
       "path": "tests/integration/model-discovery-shipped-api.test.ts"
@@ -498,7 +528,7 @@
       ]
     },
     {
-      "path": "tests/integration/plugin-discovery-api.test.mjs"
+      "path": "tests/integration/plugin-discovery-api.test.ts"
     },
     {
       "path": "tests/integration/openshell-plugin-source-reader.test.ts",
@@ -565,7 +595,10 @@
       ]
     },
     {
-      "path": "tests/integration/dev-up-compose.test.mjs",
+      "path": "tests/integration/dev-up-compose.test.mjs"
+    },
+    {
+      "path": "tests/integration/dev-up-compose-startup.test.ts",
       "expectedTests": [
         "dev-up builds the default runtime only when real Compose leaves runtime images unselected",
         "dev-up preserves a selected custom runtime image and skips the quickstart build",
