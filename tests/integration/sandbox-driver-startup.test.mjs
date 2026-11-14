@@ -69,7 +69,7 @@ import { harnessTlsFixture } from "../helpers/harness-tls.mjs";
 import { listen } from "../helpers/listen.ts";
 import { temporaryDirectory } from "../helpers/temporary-directory.mjs";
 import { createSandboxProviderProfileChecks } from "./sandbox-driver-provider-profiles-cases.ts";
-import { createSandboxCredentialContractChecks } from "./sandbox-driver-credential-contract-cases.ts";
+import { registerSandboxCredentialContractCases } from "./sandbox-driver-credential-contract-cases.ts";
 import { createCredentialGatewayContexts } from "./sandbox-driver-credential-fixture.ts";
 import { createSandboxHarnessLifecycleChecks } from "./sandbox-driver-harness-lifecycle-cases.ts";
 import { createSandboxCodexHarnessChecks } from "./sandbox-driver-codex-harness-cases.ts";
@@ -132,7 +132,7 @@ import { registerSandboxDriverWorkspaceExpiryCases } from "./sandbox-driver-work
 import { registerSandboxDriverPreparerCleanupCases } from "./sandbox-driver-preparer-cleanup-cases.ts";
 import { registerSandboxDriverNativePreparationCases } from "./sandbox-driver-native-preparation-cases.ts";
 import { createOrphanedNativePreparation } from "./sandbox-driver-preparation-cases.ts";
-import { verifySandboxScratchStorage } from "./sandbox-driver-scratch-storage-case.ts";
+import { registerSandboxDriverScratchStorageCase } from "./sandbox-driver-scratch-storage-case.ts";
 import { verifyStockExtensionRoundTrips } from "./sandbox-driver-stock-readiness-cases.ts";
 
 const harnessLifecycleChecks = createSandboxHarnessLifecycleChecks({
@@ -154,15 +154,12 @@ const harnessLifecycleChecks = createSandboxHarnessLifecycleChecks({
 });
 const codexHarnessChecks = createSandboxCodexHarnessChecks({
   agentRuntimeEntrypoint: AGENT_RUNTIME_ENTRYPOINT,
-  backendFor,
   codexRequirements,
   conformanceKubernetesOptions,
   dedicatedRevision,
   harnessRuntimeCommand,
   namespaceContext,
-  openShellDriver,
   runtimeSandboxFixture,
-  sandboxInstallation,
   workspaceGatewayClient,
 });
 
@@ -1726,9 +1723,7 @@ test("OpenShell provisions dedicated Codex with bearer passthrough and provider 
   assert.equal(gatewayClient.profiles.has("oce-codex-runtime"), false);
 });
 
-test("OpenShell keeps scratch separate from its durable data mount", async () => {
-  await verifySandboxScratchStorage({ openShellDriver, runtimeSandboxFixture });
-});
+registerSandboxDriverScratchStorageCase({ openShellDriver, runtimeSandboxFixture });
 
 test("OpenShell holds withdrawn Codex authentication after a Harness restart", async (t) => {
   await codexHarnessChecks.holdWithdrawnCodexAuthentication(t);
@@ -2187,68 +2182,7 @@ function credentialGatewayOverProviders({
   };
 }
 
-const providerProfileChecks = createSandboxProviderProfileChecks({
-  credentialGatewayOverProviders,
-  ready,
-  ScopeViolationError,
-});
-const credentialContractChecks = createSandboxCredentialContractChecks({
-  credentialGatewayOverProviders,
-  ready,
-  structuralRefusal,
-});
-
-async function ready(operation) {
-  assert.deepEqual(await operation, { state: "ready" });
-}
-
-test("Codex PAT profiles restrict native startup and plugin routes", async () => {
-  await providerProfileChecks.restrictCodexPatNativeStartupAndPluginRoutes();
-});
-
-test("each Codex PAT source gets its own provider profile, stable across replays", async () => {
-  await providerProfileChecks.keepCodexPatProviderProfilesDistinctAcrossReplays();
-});
-
-test("the OpenShell Credential Gateway acts only on its own source's provider", async () => {
-  await providerProfileChecks.restrictGatewayToItsOwnedProvider();
-});
-
-test("OpenShell preserves the main-era owned profile lifecycle without a migration", async () => {
-  await providerProfileChecks.preserveOwnedProfileLifecycle();
-});
-
-test("OpenShell main-era interrupted registration survives restart without replaying credentials", async () => {
-  await providerProfileChecks.resumeInterruptedRegistrationWithoutCredentialReplay();
-});
-
-test("OpenShell main-era cleanup resumes after provider deletion without losing another source", async () => {
-  await providerProfileChecks.resumeCleanupWithoutLosingAnotherSource();
-});
-
-test("OpenShell concurrent registrations preserve the first provider's credentials", async () => {
-  await providerProfileChecks.preserveFirstProviderCredentialsDuringConcurrentRegistration();
-});
-
-test("OpenShell rejects a foreign provider appearing after preflight without erasing the profile", async () => {
-  await providerProfileChecks.rejectForeignProviderAfterPreflight();
-});
-
-test("OpenShell registration does not adopt an unknown provider create outcome", async () => {
-  await providerProfileChecks.rejectUnknownProviderCreateOutcome();
-});
-
-test("the OpenShell Credential Gateway never attaches a source of another Namespace", async () => {
-  await providerProfileChecks.rejectCrossNamespaceAttachment();
-});
-
-test("the OpenShell Credential Gateway refuses an empty secret before creating a provider", async () => {
-  await providerProfileChecks.rejectEmptySecretBeforeProviderCreation();
-});
-
-test("OpenShell credential source removal fails while the provider survives deletion", async () => {
-  await providerProfileChecks.failRemovalWhenProviderSurvivesDeletion();
-});
+createSandboxProviderProfileChecks({ credentialGatewayOverProviders, ScopeViolationError });
 
 test("Google requires an OAuth source whose effective binary list is exactly the pinned executable", async () => {
   const pinned = managedGoogleInstall.binaryPath;
@@ -2391,20 +2325,9 @@ test("a Slack MCP source stays independent and cannot acquire a broad REST crede
   );
 });
 
-test("the OpenShell bearer-token type exists only with toolBinaries and validates its endpoint", async () => {
-  await credentialContractChecks.validatesBearerTokenTypeAndEndpoint();
-});
-
-test("narrowing OpenShell toolBinaries narrows existing bearer-token sources on update and deployment", async () => {
-  await credentialContractChecks.narrowsExistingBearerTokenSources();
-});
-
-test("an OpenShell profile write that lost a race to the same profile still attaches", async () => {
-  await credentialContractChecks.attachesAfterMatchingProfileRace();
-});
-
-test("an OpenShell bearer-token source stays deletable after toolBinaries is removed", async () => {
-  await credentialContractChecks.removesBearerTokenSourceWithoutToolBinaries();
+registerSandboxCredentialContractCases({
+  credentialGatewayOverProviders,
+  structuralRefusal,
 });
 
 test("OpenShell observes the Codex Harness through its exact bearer-passthrough service", async () => {
