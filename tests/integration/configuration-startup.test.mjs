@@ -1,7 +1,15 @@
+import { registerStartupCredentialProxyCases } from "./configuration-startup-credential-proxy-cases.ts";
 import {
   registerStartupDiagnosticsCases,
   registerStartupPresetCases,
 } from "./configuration-startup-validation-cases.ts";
+import {
+  checkExternalObservabilityUrl,
+  checkNativeWorkerSupport,
+  registerDevelopmentMetricsStartupCase,
+  registerStartupInstallationInputCases,
+  registerStartupYamlInputCases,
+} from "./configuration-startup-input-cases.ts";
 import { reconcileNamespaceLifecycle } from "../../packages/occ/src/namespace-lifecycle.ts";
 import assert from "node:assert/strict";
 import {
@@ -26,7 +34,6 @@ import {
   isDevelopmentBrowserOrigin,
 } from "../../apps/controller/src/auth/configuration.ts";
 import { PresetFileError } from "../../apps/controller/src/composition/installation-presets.ts";
-import { openShellRepositoryConfiguration } from "../../apps/controller/src/drivers/egress-proxy/openshell-configuration.ts";
 import { DEVELOPMENT_HARNESS_DESCRIPTOR } from "../../apps/controller/src/composition/production-harness.ts";
 import { kubernetesNamespaceName } from "../../apps/controller/src/drivers/compute/kubernetes/index.ts";
 import { formatStartupConfigurationFailure } from "../../apps/controller/src/startup-failure.ts";
@@ -37,7 +44,7 @@ import {
 } from "../../packages/contracts/src/index.ts";
 import { validateSelectedBackendDrivers } from "../../packages/occ/src/index.ts";
 import { spawnSync } from "node:child_process";
-import { reservedPortArgs, reservePort } from "../helpers/available-port.mjs";
+import { reservedPortArgs, reservePort } from "../helpers/available-port.ts";
 import { captureChild, concurrencyLimit, settled } from "../helpers/child-processes.mjs";
 import { fileCompileCache } from "../helpers/compile-cache.mjs";
 import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs";
@@ -45,9 +52,8 @@ import {
   createCredentialProxyInstallationConfiguration as credentialProxyInstallation,
   createInstallationDriverConfiguration as installation,
 } from "../helpers/installation-driver-configuration.mjs";
-import { createTlsMaterial } from "../fixtures/repository-credentials/process.mjs";
-import { socketDirectory } from "../helpers/socket-directory.mjs";
-import { syntheticCredentialUrl } from "../fixtures/synthetic-credential-url.mjs";
+import { createTlsMaterial } from "../fixtures/repository-credentials/process.ts";
+import { socketDirectory } from "../helpers/socket-directory.ts";
 import { temporaryDirectory } from "../helpers/temporary-directory.mjs";
 
 function jsonLines(text) {
@@ -63,6 +69,13 @@ function startupDiagnostic(stderr, event) {
   assert.ok(diagnostic, stderr);
   return diagnostic;
 }
+
+const startupInputs = {
+  fixture,
+  loadInstallationConfiguration,
+  loadStartupConfigurationSnapshot,
+  ConfigurationValidationError,
+};
 
 // The startup cases boot the real API and worker processes with an allowlisted environment,
 // which drops NODE_COMPILE_CACHE, so it is passed explicitly: the lane's cache in CI, otherwise
@@ -136,6 +149,10 @@ before(async () => {
   }
 });
 
+/**
+ * @param {import("node:test").TestContext} t
+ * @param {Readonly<Record<string, unknown>>} configuration
+ */
 async function fixture(t, configuration = installation()) {
   const directory = await temporaryDirectory(t, "occ-installation-startup-");
   const path = join(directory, "installation.yaml");
@@ -255,163 +272,15 @@ test("Credential Proxy startup preserves the selection and refuses retired keys"
 });
 
 test("Installation startup validates the optional external observability URL", async (t) => {
-  const configuration = installation();
-  configuration.observability = { url: "https://metrics.example.test/d/operations" };
-  const path = await fixture(t, configuration);
-  const loaded = await loadInstallationConfiguration({
-    mode: "development",
-    environment: { OCC_CONFIG_PATH: path },
-  });
-  assert.equal(loaded.installation.observability.url, configuration.observability.url);
-
-  const url = configuration.observability.url;
-  const rewrittenIpv4ObservabilityUrl =
-    /observability\.url IPv4 host must be four decimal octets from 0 to 255 with no leading zeros; other spellings parse as a different address\./;
-  for (const [observability, message] of [
-    ...[
-      "javascript:alert(1)",
-      syntheticCredentialUrl({
-        username: "user",
-        password: "pass",
-        host: "example.test",
-      }),
-      "relative",
-      "https://x.example/#f",
-    ].map((invalid) => [{ url: invalid }, /observability\.url/]),
-    [{ url, extra: 1 }, /observability contains unsupported option extra/],
-  ]) {
-    configuration.observability = observability;
-    await writeFile(path, JSON.stringify(configuration), "utf8");
-    await assert.rejects(
-      loadInstallationConfiguration({
-        mode: "development",
-        environment: { OCC_CONFIG_PATH: path },
-      }),
-      (error) => {
-        assert.match(error.message, message);
-        assert.doesNotMatch(error.message, rewrittenIpv4ObservabilityUrl);
-        return true;
-      },
-    );
-  }
-  // URL parsing drops an empty user info and keeps the host alone; profile preflight refuses
-  // any @ before the host, and so does startup.
-  for (const userinfo of [
-    "http://@grafana.example.internal/d",
-    "https://:@grafana.example.internal/d",
-    "http:@grafana.example.internal/d",
-    "http:\t//@grafana.example.internal/d",
-    "http://@192.0.2.10:3000/d",
-  ]) {
-    configuration.observability = { url: userinfo };
-    await writeFile(path, JSON.stringify(configuration), "utf8");
-    await assert.rejects(
-      loadInstallationConfiguration({
-        mode: "development",
-        environment: { OCC_CONFIG_PATH: path },
-      }),
-      /observability\.url must not contain user info or an @ before the host\./,
-      JSON.stringify(userinfo),
-    );
-  }
-  for (const shorthand of ["http://192.168.1", "http://2130706433"]) {
-    configuration.observability = { url: shorthand };
-    await writeFile(path, JSON.stringify(configuration), "utf8");
-    await assert.rejects(
-      loadInstallationConfiguration({
-        mode: "development",
-        environment: { OCC_CONFIG_PATH: path },
-      }),
-      (error) => {
-        assert.match(error.message, rewrittenIpv4ObservabilityUrl);
-        assert.doesNotMatch(error.message, /must be an absolute HTTP or HTTPS URL/);
-        return true;
-      },
-    );
-  }
-  for (const raw of [
-    "http://good.example\tevil.com/x",
-    "http://evil.com\\.good.example/path",
-    "http://good.example\nevil.com/x",
-    "http://good.example\revil.com/x",
-  ]) {
-    configuration.observability = { url: raw };
-    await writeFile(path, JSON.stringify(configuration), "utf8");
-    await assert.rejects(
-      loadInstallationConfiguration({
-        mode: "development",
-        environment: { OCC_CONFIG_PATH: path },
-      }),
-      /observability\.url must not contain a tab or newline, or a backslash before the query; the URL parser drops or rewrites them into a different host\./,
-      JSON.stringify(raw),
-    );
-  }
-  configuration.observability = { url: "http://192.168.1.1" };
-  await writeFile(path, JSON.stringify(configuration), "utf8");
-  const canonical = await loadInstallationConfiguration({
-    mode: "development",
-    environment: { OCC_CONFIG_PATH: path },
-  });
-  assert.equal(canonical.installation.observability.url, "http://192.168.1.1/");
-  assert.equal(new URL(canonical.installation.observability.url).hostname, "192.168.1.1");
-  configuration.observability = {
-    url: "https://grafana.example.test/d/operations?var-pattern=\\d+",
-  };
-  await writeFile(path, JSON.stringify(configuration), "utf8");
-  const queryBackslash = await loadInstallationConfiguration({
-    mode: "development",
-    environment: { OCC_CONFIG_PATH: path },
-  });
-  assert.equal(
-    new URL(queryBackslash.installation.observability.url).hostname,
-    "grafana.example.test",
-  );
+  await checkExternalObservabilityUrl(t, startupInputs);
 });
 
 registerStartupDiagnosticsCases({ boot, fixture, readFile, settled });
 test("Installation startup declares native worker support only as a custom runtime image", async (t) => {
-  const configuration = installation();
-  const path = await fixture(t, configuration);
-  const load = () =>
-    loadInstallationConfiguration({ mode: "development", environment: { OCC_CONFIG_PATH: path } });
-  // The pinned runtime needs no operator declaration in the Installation file.
-  assert.equal((await load()).installation.runtime, undefined);
-  configuration.runtime = { nativeWorkerSupport: "custom-image" };
-  await writeFile(path, JSON.stringify(configuration), "utf8");
-  assert.deepEqual((await load()).installation.runtime, { nativeWorkerSupport: "custom-image" });
-  for (const [runtime, message] of [
-    [{ nativeWorkerSupport: true }, /runtime\.nativeWorkerSupport must be "custom-image"/],
-    [
-      { nativeWorkerSupport: "pinned-runtime" },
-      /runtime\.nativeWorkerSupport must be "custom-image"/,
-    ],
-    [{}, /runtime\.nativeWorkerSupport must be "custom-image"/],
-    [
-      { nativeWorkerSupport: "custom-image", image: "x" },
-      /runtime contains unsupported option image/,
-    ],
-  ]) {
-    configuration.runtime = runtime;
-    await writeFile(path, JSON.stringify(configuration), "utf8");
-    await assert.rejects(load(), message);
-  }
+  await checkNativeWorkerSupport(t, startupInputs);
 });
 
-test("development accepts a Metrics URL with its default Compose Drivers", async (t) => {
-  const url = "https://metrics.example.test/d/operations";
-  const path = await fixture(t, { observability: { url } });
-  const environment = { OCC_CONFIG_PATH: path };
-  const snapshot = await loadStartupConfigurationSnapshot({ mode: "development", environment });
-  assert.equal(snapshot.observability.url, url);
-  assert.equal(
-    await loadInstallationConfiguration({
-      mode: "development",
-      environment,
-      startupConfiguration: snapshot,
-    }),
-    undefined,
-  );
-});
+registerDevelopmentMetricsStartupCase(startupInputs);
 
 function chatgptInstallation() {
   const configuration = installation();
@@ -1341,47 +1210,7 @@ test("production embedded replacements preserve their active Service across fail
   heartbeat.mock.restore();
 });
 
-test("startup accepts actual block-style YAML instead of requiring JSON", async (t) => {
-  const path = await fixture(t);
-  const configuration = installation();
-  const yaml = `occ:\n  cluster: production-west\ndrivers:\n  configuration: ${JSON.stringify(configuration.drivers.configuration)}\n  iam: ${JSON.stringify(configuration.drivers.iam)}\n  compute: ${JSON.stringify(configuration.drivers.compute)}\n  secret: ${JSON.stringify(configuration.drivers.secret)}\n`;
-  await writeFile(path, yaml, "utf8");
-  const loaded = await loadInstallationConfiguration({
-    mode: "production",
-    environment: { OCC_CONFIG_PATH: path },
-  });
-  assert.equal(loaded.installation.occ.cluster, "production-west");
-});
-
-test("production requires one YAML while development may start without a ConfigurationDriver", async (t) => {
-  await assert.rejects(
-    loadInstallationConfiguration({ mode: "production", environment: {} }),
-    /OCC_CONFIG_PATH/,
-  );
-  assert.equal(
-    await loadInstallationConfiguration({ mode: "development", environment: {} }),
-    undefined,
-  );
-  // Unusable paths and unparsable files get fixed messages that never echo the path or the
-  // filesystem or parser error.
-  const invalidYaml = await fixture(t);
-  await writeFile(invalidYaml, "drivers: [\n", "utf8");
-  for (const [path, message] of [
-    [" ", "OCC_CONFIG_PATH must identify the Installation startup YAML."],
-    [
-      "relative/installation.yaml",
-      "OCC_CONFIG_PATH must identify an absolute Installation startup YAML path.",
-    ],
-    [`${invalidYaml}.missing`, "The configured Installation startup YAML is unavailable."],
-    [invalidYaml, "The configured Installation startup file must contain valid YAML."],
-  ]) {
-    await assert.rejects(
-      loadInstallationConfiguration({ mode: "production", environment: { OCC_CONFIG_PATH: path } }),
-      { message },
-      JSON.stringify(path),
-    );
-  }
-});
+registerStartupYamlInputCases(startupInputs);
 
 test("development OCC_AUTH_BASE_URL must be a loopback origin or an HTTPS localhost subdomain", async (t) => {
   for (const accepted of [
@@ -1570,136 +1399,7 @@ test("only the actual API process reads ChatGPT admin credentials and backend ac
   );
 });
 
-test("startup rejects caller-selected Installation IDs and obsolete Driver selectors", async (t) => {
-  const path = await fixture(t);
-  for (const [name, value] of [
-    ["OCC_INSTALLATION_ID", "ins_untrusted"],
-    ["OCC_COMPUTE_DRIVER", "kubernetes"],
-    ["OCC_KUBERNETES_CONFIG_PATH", "/tmp/obsolete.json"],
-    ["OCC_NATIVE_IAM_DRIVER_ID", "native-iam"],
-  ]) {
-    await assert.rejects(
-      loadInstallationConfiguration({
-        mode: "production",
-        environment: { OCC_CONFIG_PATH: path, [name]: value },
-      }),
-      new RegExp(name),
-    );
-  }
-
-  const injected = installation();
-  injected.drivers.compute.configuration.authentication.installation_id = "ins_untrusted";
-  await assert.rejects(
-    loadInstallationConfiguration({
-      mode: "production",
-      environment: { OCC_CONFIG_PATH: await fixture(t, injected) },
-    }),
-    /must not contain an Installation ID/,
-  );
-});
-
-test("startup rejects plaintext secrets, caller-authored identities, and unsupported schema options", async (t) => {
-  const refusal = (path, code, message) => [{ path, code, message }];
-  const structural = (path, keyword, code = "INVALID_VALUE") =>
-    refusal(path, code, `Configuration does not satisfy ${keyword}.`);
-  for (const [mutate, expected] of [
-    [(value) => (value.drivers.compute.configuration.apiKey = "plaintext"), /plaintext credential/],
-    [
-      (value) => (value.drivers.configuration.implementation = "occ/docker-config"),
-      /unsupported option.*implementation/,
-    ],
-    [
-      (value) =>
-        (value.drivers.configuration.configuration.authentication = { mode: "kubeconfig" }),
-      [
-        ...structural("/authentication/mode", "const"),
-        ...refusal(
-          "/authentication/kubeconfigPath",
-          "REQUIRED",
-          "This configuration field is required.",
-        ),
-        ...refusal("/authentication/context", "REQUIRED", "This configuration field is required."),
-        ...structural("/authentication", "oneOf"),
-      ],
-    ],
-    [
-      (value) => (value.drivers.iam.configuration.unexpected = true),
-      structural("", "additionalProperties", "UNKNOWN_FIELD"),
-    ],
-    [
-      (value) => (value.drivers.compute.configuration.resources.gateway.unexpected = true),
-      structural("/resources/gateway", "additionalProperties", "UNKNOWN_FIELD"),
-    ],
-    [
-      (value) => (value.drivers.compute.configuration.images.requireImmutableDigest = false),
-      /immutable image digests/,
-    ],
-    [
-      (value) =>
-        (value.drivers.compute.configuration.network.gatewayPort = Number.MAX_SAFE_INTEGER + 1),
-      /network\.gatewayPort must be a safe integer\.$/,
-    ],
-    [
-      (value) =>
-        (value.drivers.compute.configuration.images.gateway = "registry.example/gateway:latest"),
-      refusal(
-        "/images/gateway",
-        "INVALID_FORMAT",
-        "Gateway image must use an immutable SHA-256 digest.",
-      ),
-    ],
-    [
-      (value) =>
-        (value.drivers.compute.configuration.images.agent = "registry.example/agent:latest"),
-      refusal(
-        "/images/agent",
-        "INVALID_FORMAT",
-        "Agent image must use an immutable SHA-256 digest.",
-      ),
-    ],
-    [
-      (value) => delete value.drivers.compute.configuration.runtime,
-      /explicitly configured Codex runtime/,
-    ],
-    [
-      (value) =>
-        (value.drivers.compute.configuration.runtime.modelSecretPrefix =
-          value.drivers.compute.configuration.runtime.transportSecretPrefix),
-      structural("/runtime", "additionalProperties", "UNKNOWN_FIELD"),
-    ],
-    // The reader refuses these anywhere in the file, before any Driver schema runs.
-    [
-      (value) => (value.drivers.compute.configuration.unexpected = 2 ** 53 + 2),
-      /\.unexpected must be a safe integer\.$/,
-    ],
-    [
-      (value) => (value.drivers.compute.configuration.constructor = {}),
-      /contains an unsafe configuration key\.$/,
-    ],
-    [
-      (value) => (value.drivers.compute.configuration.secretRef = "installation-secret"),
-      /Installation-scoped secret references cannot be resolved safely\.$/,
-    ],
-  ]) {
-    const configuration = installation();
-    mutate(configuration);
-    await assert.rejects(
-      loadInstallationConfiguration({
-        mode: "production",
-        environment: { OCC_CONFIG_PATH: await fixture(t, configuration) },
-      }),
-      (error) => {
-        if (expected instanceof RegExp) {
-          assert.match(error.message, expected);
-        } else {
-          assert.ok(error instanceof ConfigurationValidationError);
-          assert.deepEqual(error.error.details, expected);
-        }
-        return true;
-      },
-    );
-  }
-});
+registerStartupInstallationInputCases(startupInputs);
 
 registerStartupPresetCases({
   boot,
@@ -1709,301 +1409,7 @@ registerStartupPresetCases({
   settled,
 });
 
-test("API and worker name a chart listener mismatch and both values in their startup error", async (t) => {
-  // On a fresh install no upgrade check runs, so startup's log is the operator's only clue
-  // that the Installation authority is not on the port the chart routes (finding 2213).
-  const configuration = credentialProxyInstallation();
-  configuration.drivers.credential_proxy.configuration.authority.host = "0.0.0.0";
-  const shared = {
-    PATH: process.env.PATH,
-    NODE_ENV: "production",
-    OCC_CONFIG_PATH: await fixture(t, configuration),
-    OCC_DATABASE_URL: "postgresql://127.0.0.1:1/occ",
-    OCC_EGRESS_AUTHORITY_PORT: "9555",
-    OCC_OPENSHELL_GIT_PORT: "disabled",
-  };
-  const [server, worker] = await settled([
-    boot("apps/controller/src/server.mjs", { ...shared, ...productionServer }),
-    boot("apps/controller/src/worker.mjs", shared),
-  ]);
-  for (const [result, event] of [
-    [server, "startup-error"],
-    [worker, "worker.startup-error"],
-  ]) {
-    assert.equal(result.status, 1, result.stderr);
-    const diagnostic = startupDiagnostic(result.stderr, event);
-    assert.equal(diagnostic.code, "CHART_LISTENER_MISMATCH");
-    assert.deepEqual(diagnostic.details, [
-      {
-        path: "/drivers/credential_proxy/configuration/authority/port",
-        code: "INVALID_VALUE",
-        message:
-          "drivers.credential_proxy.configuration.authority.port is 9444, but Helm egressAuthority.port is 9555.",
-      },
-    ]);
-  }
-});
-
-test("an authority block names each refused field and never its value", async (t) => {
-  // Finding 2216: nine faults shared one message about "a loopback development listener",
-  // and API and worker logs said only STARTUP_FAILED.
-  const field = "/drivers/credential_proxy/configuration/authority";
-  const sentinel = "sentinel-7c1e";
-  const block = (value) => (configuration) =>
-    (configuration.drivers.credential_proxy.configuration.authority = value);
-  const fieldOf = (mutate) => (configuration) =>
-    mutate(configuration.drivers.credential_proxy.configuration.authority);
-  const cases = [
-    ["production", block(undefined), [[field, "REQUIRED"]]],
-    ["production", block([]), [[field, "INVALID_TYPE"]]],
-    // An unknown key is reported at the block: the key itself could be anything.
-    ["production", fieldOf((a) => (a[`${sentinel}/~`] = 1)), [[field, "UNKNOWN_FIELD"]]],
-    ["production", fieldOf((a) => delete a.issuer), [[`${field}/issuer`, "REQUIRED"]]],
-    ["production", fieldOf((a) => (a.keyId = "")), [[`${field}/keyId`, "INVALID_VALUE"]]],
-    ["production", fieldOf((a) => (a.audience = 7)), [[`${field}/audience`, "INVALID_TYPE"]]],
-    ["production", fieldOf((a) => delete a.port), [[`${field}/port`, "REQUIRED"]]],
-    ["production", fieldOf((a) => (a.port = "9444")), [[`${field}/port`, "INVALID_TYPE"]]],
-    ["production", fieldOf((a) => (a.port = 65536)), [[`${field}/port`, "INVALID_RANGE"]]],
-    [
-      "production",
-      fieldOf((a) => {
-        a.certificatePath = `${sentinel}.crt`;
-        a.privateKeyPath = `${sentinel}.key`;
-        a.issuerPublicKeyPath = `${sentinel}.pub`;
-      }),
-      ["certificatePath", "privateKeyPath", "issuerPublicKeyPath"].map((key) => [
-        `${field}/${key}`,
-        "INVALID_FORMAT",
-      ]),
-    ],
-    ["development", fieldOf((a) => (a.host = "0.0.0.0")), [[`${field}/host`, "INVALID_VALUE"]]],
-  ];
-  for (const [mode, mutate, expected] of cases) {
-    const configuration = credentialProxyInstallation();
-    mutate(configuration);
-    await assert.rejects(
-      loadInstallationConfiguration({
-        mode,
-        environment: { OCC_CONFIG_PATH: await fixture(t, configuration) },
-      }),
-      (error) => {
-        // What the startup log and the upgrade check print, after the log filter.
-        const failure = formatStartupConfigurationFailure(error);
-        const prefix = "DRIVER_CONFIGURATION_INVALID: ";
-        assert.ok(failure?.startsWith(prefix), String(error));
-        assert.deepEqual(
-          JSON.parse(failure.slice(prefix.length)).map((detail) => [detail.path, detail.code]),
-          expected,
-          failure,
-        );
-        for (const value of [sentinel, "0.0.0.0", "9444"]) {
-          assert.ok(!failure.includes(value), failure);
-        }
-        return true;
-      },
-    );
-  }
-  // The same field and code reach both processes' startup logs.
-  const configuration = credentialProxyInstallation();
-  configuration.drivers.credential_proxy.configuration.authority.privateKeyPath = "tls.key";
-  const shared = {
-    PATH: process.env.PATH,
-    NODE_ENV: "production",
-    OCC_CONFIG_PATH: await fixture(t, configuration),
-    OCC_DATABASE_URL: "postgresql://127.0.0.1:1/occ",
-  };
-  const [server, worker] = await settled([
-    boot("apps/controller/src/server.mjs", { ...shared, ...productionServer }),
-    boot("apps/controller/src/worker.mjs", shared),
-  ]);
-  for (const [result, event] of [
-    [server, "startup-error"],
-    [worker, "worker.startup-error"],
-  ]) {
-    assert.equal(result.status, 1, result.stderr);
-    const diagnostic = startupDiagnostic(result.stderr, event);
-    assert.equal(diagnostic.code, "DRIVER_CONFIGURATION_INVALID", result.stderr);
-    assert.deepEqual(diagnostic.details, [
-      {
-        path: `${field}/privateKeyPath`,
-        code: "INVALID_FORMAT",
-        message:
-          "drivers.credential_proxy.configuration.authority.privateKeyPath must be an absolute mounted-file path.",
-      },
-    ]);
-  }
-});
-
-test("Credential Proxy request capacity keeps today's bounds and refuses each bad field by name", async (t) => {
-  const field = "/drivers/credential_proxy/requestCapacity";
-  const sentinel = 7_919;
-  const withCapacity = async (requestCapacity, mode = "development") => {
-    const configuration = credentialProxyInstallation();
-    if (requestCapacity !== undefined) {
-      configuration.drivers.credential_proxy.requestCapacity = requestCapacity;
-    }
-    return loadInstallationConfiguration({
-      mode,
-      environment: { OCC_CONFIG_PATH: await fixture(t, configuration) },
-    });
-  };
-  const today = {
-    operations: 1024,
-    authenticatingOperations: 256,
-    sandboxOperations: 256,
-    requestIds: 8192,
-    sandboxRequestIds: 2048,
-  };
-  assert.deepEqual((await withCapacity()).installation.credentialProxyCapacity, today);
-  assert.deepEqual((await withCapacity({})).installation.credentialProxyCapacity, today);
-  // An omitted share is a quarter of its configured pool, at least 1; a set share is kept.
-  assert.deepEqual(
-    (await withCapacity({ operations: 64, requestIds: 4096, sandboxRequestIds: 4096 })).installation
-      .credentialProxyCapacity,
-    {
-      operations: 64,
-      authenticatingOperations: 16,
-      sandboxOperations: 16,
-      requestIds: 4096,
-      sandboxRequestIds: 4096,
-    },
-  );
-  assert.deepEqual(
-    (await withCapacity({ operations: 3, requestIds: 1, sandboxOperations: 3 })).installation
-      .credentialProxyCapacity,
-    {
-      operations: 3,
-      authenticatingOperations: 1,
-      sandboxOperations: 3,
-      requestIds: 1,
-      sandboxRequestIds: 1,
-    },
-  );
-  assert.deepEqual(
-    (
-      await withCapacity({
-        operations: 8192,
-        authenticatingOperations: 8192,
-        sandboxOperations: 8192,
-        requestIds: 131_072,
-        sandboxRequestIds: 131_072,
-      })
-    ).installation.credentialProxyCapacity.sandboxRequestIds,
-    131_072,
-    "the documented maximum is accepted",
-  );
-  const cases = [
-    [[], [[field, "INVALID_TYPE"]]],
-    [null, [[field, "INVALID_TYPE"]]],
-    [7, [[field, "INVALID_TYPE"]]],
-    // An unknown key is reported at the block: the key itself could be anything.
-    [{ [`x${sentinel}/~`]: 1 }, [[field, "UNKNOWN_FIELD"]]],
-    [{ operations: "1024" }, [[`${field}/operations`, "INVALID_TYPE"]]],
-    [{ sandboxOperations: 2.5 }, [[`${field}/sandboxOperations`, "INVALID_TYPE"]]],
-    [{ requestIds: null }, [[`${field}/requestIds`, "INVALID_TYPE"]]],
-    [{ operations: 0 }, [[`${field}/operations`, "INVALID_RANGE"]]],
-    [{ authenticatingOperations: -1 }, [[`${field}/authenticatingOperations`, "INVALID_RANGE"]]],
-    [{ operations: 8193 }, [[`${field}/operations`, "INVALID_RANGE"]]],
-    [{ requestIds: 131_073 }, [[`${field}/requestIds`, "INVALID_RANGE"]]],
-    [{ sandboxRequestIds: 131_073 }, [[`${field}/sandboxRequestIds`, "INVALID_RANGE"]]],
-    // Each share is bounded by its pool, configured or default.
-    [{ sandboxOperations: 1025 }, [[`${field}/sandboxOperations`, "INVALID_RANGE"]]],
-    [
-      { operations: 64, authenticatingOperations: 65 },
-      [[`${field}/authenticatingOperations`, "INVALID_RANGE"]],
-    ],
-    [
-      { requestIds: 4096, sandboxRequestIds: 4097 },
-      [[`${field}/sandboxRequestIds`, "INVALID_RANGE"]],
-    ],
-    // Every fault is reported at once.
-    [
-      { [`${sentinel}`]: true, operations: 0, sandboxRequestIds: "all", requestIds: sentinel * 99 },
-      [
-        [field, "UNKNOWN_FIELD"],
-        [`${field}/operations`, "INVALID_RANGE"],
-        [`${field}/requestIds`, "INVALID_RANGE"],
-        [`${field}/sandboxRequestIds`, "INVALID_TYPE"],
-      ],
-    ],
-  ];
-  for (const [requestCapacity, expected] of cases) {
-    await assert.rejects(withCapacity(requestCapacity, "production"), (error) => {
-      // What the startup log and the upgrade check print, after the log filter.
-      const failure = formatStartupConfigurationFailure(error);
-      const prefix = "DRIVER_CONFIGURATION_INVALID: ";
-      assert.ok(failure?.startsWith(prefix), String(error));
-      assert.deepEqual(
-        JSON.parse(failure.slice(prefix.length)).map((detail) => [detail.path, detail.code]),
-        expected,
-        failure,
-      );
-      for (const value of [String(sentinel), String(sentinel * 99), "1024", "8193", "4097"]) {
-        assert.ok(!failure.includes(value), failure);
-      }
-      return true;
-    });
-  }
-  // The startup file loader already refuses any unsafe integer in the Installation.
-  await assert.rejects(
-    withCapacity({ requestIds: 2 ** 53 }, "production"),
-    /requestCapacity\.requestIds must be a safe integer/,
-  );
-  // API, worker and the chart's upgrade check refuse the same field before any other work.
-  const configuration = credentialProxyInstallation();
-  configuration.drivers.credential_proxy.requestCapacity = { requestIds: 0 };
-  const environment = {
-    PATH: process.env.PATH,
-    NODE_ENV: "production",
-    OCC_CONFIG_PATH: await fixture(t, configuration),
-    OCC_DATABASE_URL: "postgresql://127.0.0.1:1/occ",
-  };
-  const expected = [
-    {
-      path: `${field}/requestIds`,
-      code: "INVALID_RANGE",
-      message: "drivers.credential_proxy.requestCapacity.requestIds must be from 1 to 131072.",
-    },
-  ];
-  await settled(
-    [
-      ["apps/controller/src/server.mjs", "startup-error"],
-      ["apps/controller/src/worker.mjs", "worker.startup-error"],
-      ["deploy/helm/openclaw-enterprise/files/check-installation.mjs", null],
-    ].map(async ([script, event]) => {
-      const result = await boot(script, { ...environment, ...productionServer });
-      assert.equal(result.status, 1, result.stderr);
-      const diagnostic =
-        event === null
-          ? {
-              code: "DRIVER_CONFIGURATION_INVALID",
-              details: JSON.parse(result.stderr.trim().split("DRIVER_CONFIGURATION_INVALID: ")[1]),
-            }
-          : startupDiagnostic(result.stderr, event);
-      assert.equal(diagnostic.code, "DRIVER_CONFIGURATION_INVALID", result.stderr);
-      assert.deepEqual(diagnostic.details, expected);
-    }),
-  );
-});
-
-test("a repository OpenShell authority refusal names its own block", () => {
-  // The Installation and the repository transport share the validator, not the field path.
-  const authority = credentialProxyInstallation().drivers.credential_proxy.configuration.authority;
-  delete authority.keyId;
-  assert.throws(
-    () => openShellRepositoryConfiguration({ registrationName: "git", authority }, "production"),
-    (error) => {
-      assert.deepEqual(error.details, [
-        {
-          path: "/repository/openShell/authority/keyId",
-          code: "REQUIRED",
-          message: "repository.openShell.authority.keyId must be a nonempty string.",
-        },
-      ]);
-      return true;
-    },
-  );
-});
+registerStartupCredentialProxyCases({ boot, fixture, productionServer, settled });
 
 test("production Kubernetes Compute refuses disabled ServicePrincipal credentials unless a Sandbox is selected", async (t) => {
   // Finding 1753: #1400 dropped this production guard for every install, not only
