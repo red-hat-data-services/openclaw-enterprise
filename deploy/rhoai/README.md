@@ -526,6 +526,12 @@ The advisory `Check RHOAI deployment assets` workflow runs the script tests,
 shell-check, manifest parsing, and Kustomize renders when this directory
 changes.
 
+## Additional recipes
+
+- [Add GitHub CLI credentials to an Agent](docs/github-cli.md)
+- [Let a non-admin owner manage an existing Agent](docs/owner-access.md)
+- [Demo a denied request, approve its policy, and retry](docs/policy-demo.md)
+
 ## Limits
 
 - Example hostnames, IP addresses, and `${VARIABLE}` placeholders need private
