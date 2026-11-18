@@ -51,7 +51,7 @@ oc whoami --show-server
 | `manifests/dashboard/`    | Keycloak, dashboard and gateway OIDC values, and dashboard network access.                                     |
 | `manifests/native-admin/` | OCC admin launcher certificate, issuer, ingress, and network policy.                                           |
 | `manifests/widgets/`      | Dashboard widget preview Route and certificate.                                                                |
-| `manifests/agents/`       | Agent deployment procedure and the custom-model credential-source template.                                    |
+| `manifests/agents/`       | Agent deployment and credential-source procedures, and the custom-model credential-source template.            |
 | `manifests/presets/`      | Installation-wide team Agent Presets and their API, worker, and Job mount patches.                             |
 | `scripts/`                | Build, prepare, resolve, upgrade, validate, and team-login helpers; see [SCRIPTS.md](SCRIPTS.md).              |
 | `tests/`                  | Offline tests for the scripts.                                                                                 |
@@ -510,6 +510,15 @@ Follow [upgrading OCE on Kubernetes](../../docs/guides/deploy/production-upgrade
 and keep the saved `images.env`, Installation Secret, database Secrets, and
 signing key across releases. When you use the dashboard or mTLS profile, pass
 their values and post-renderer to every gateway upgrade.
+
+Before a runtime upgrade, stop each Agent bound to a source saved with the
+removed `config.base_url` (`occ agent stop`): the upgrade redeploys every running
+Agent and refuses those, and its candidate Installation cannot add the
+`modelProvider` a replacement may need. After the upgrade, those Agents cannot
+deploy until they use a replacement; see
+[Replace a source saved with `config.base_url`](manifests/agents/credential-sources.md#replace-a-source-saved-with-configbase_url).
+For an Agent the upgrade itself refuses, follow
+[Correct a refused Agent deployment](../../docs/guides/deploy/production-upgrade-recovery.md#correct-a-refused-agent-deployment).
 
 ## Verification
 
