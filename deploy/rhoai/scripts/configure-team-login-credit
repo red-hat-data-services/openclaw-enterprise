@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Configure client-specific Git credit details for existing team-login users."""
+
+import copy
+import hashlib
+import json
+import os
+import pathlib
+import runpy
+import urllib.parse
+
+os.umask(0o077)
+root = pathlib.Path(os.environ["TEAM_LOGIN_DIRECTORY"]).expanduser().resolve()
+settings = json.loads((root / "settings.json").read_text())
+entries = json.loads(pathlib.Path(os.environ["TEAM_CREDIT_USERS_FILE"]).read_text())
+if not isinstance(entries, dict) or not entries:
+    raise SystemExit("Supply credit entries keyed by saved teammate username")
+for name, entry in entries.items():
+    if name not in settings["identities"] or not isinstance(entry, dict):
+        raise SystemExit("Credit entries must name saved teammates")
+    if (
+        set(entry) != {"name", "email", "emailVerified"}
+        or type(entry["emailVerified"]) is not bool
+    ):
+        raise SystemExit(
+            "Each credit entry needs name, email, and boolean emailVerified"
+        )
+    for field in ["name", "email"]:
+        value = entry[field]
+        if (
+            not isinstance(value, str)
+            or not value
+            or value.strip() != value
+            or any(ord(c) < 32 or ord(c) == 127 for c in value)
+        ):
+            raise SystemExit(
+                "Credit name and email must be nonempty single-line values"
+            )
+    if (
+        entry["email"].count("@") != 1
+        or any(c.isspace() for c in entry["email"])
+        or any(c in entry["name"] + entry["email"] for c in "<>")
+        or not all(entry["email"].split("@"))
+    ):
+        raise SystemExit(
+            "Supply a Git credit name and email without trailer delimiters"
+        )
+issuer = settings["issuer"]
+if (
+    os.environ["KEYCLOAK_URL"].rstrip("/")
+    + "/realms/"
+    + os.environ.get("KEYCLOAK_REALM", "team-claw")
+    != issuer
+):
+    raise SystemExit("Keycloak environment does not match the saved issuer")
+prefix = "oidc:" + hashlib.sha256(issuer.encode()).hexdigest() + ":"
+if any(not settings["identities"][name].startswith(prefix) for name in entries):
+    raise SystemExit("Every credit entry needs an identity from the saved issuer")
+client = settings.get("clientId", "team-claw-browser")
+suffix = hashlib.sha256(client.encode()).hexdigest()[:12]
+claims = {
+    "name": "oce_git_coauthor_name",
+    "email": "oce_git_coauthor_email",
+    "emailVerified": "oce_git_coauthor_email_verified",
+}
+attributes = {field: claim + "_" + suffix for field, claim in claims.items()}
+context = runpy.run_path(
+    str(pathlib.Path(__file__).with_name("create-team-login-realm")),
+    run_name="existing_realm",
+)
+if context["realm"] == "master":
+    raise SystemExit("Use an application realm, not the administrator realm")
+admin = context["admin"] + "/" + urllib.parse.quote(context["realm"], safe="")
+
+
+def api(path, data=None, method=None):
+    return context["request"](admin + path, data, method, context["token"])
+
+
+clients = api("/clients?" + urllib.parse.urlencode({"clientId": client}))
+if len(clients) != 1:
+    raise SystemExit("Expected exactly one existing Keycloak client")
+client_path = "/clients/" + clients[0]["id"]
+mappers = api(client_path + "/protocol-mappers/models")
+for claim in claims.values():
+    owned = [m for m in mappers if m["name"] == claim]
+    if len(owned) > 1 or any(
+        m.get("config", {}).get("claim.name") == claim and m["name"] != claim
+        for m in mappers
+    ):
+        raise SystemExit("Conflicting credit mapper; inspect before changing it")
+users = {}
+for name in entries:
+    subject = settings["identities"][name][len(prefix) :]
+    user = api("/users/" + urllib.parse.quote(subject, safe=""))
+    if not user.get("enabled") or user["username"].casefold() != name.casefold():
+        raise SystemExit("Every credit entry must match its saved enabled account")
+    users[subject] = (user, entries[name])
+profile = api("/users/profile")
+# Preserve the first snapshot for recovery; retries must not replace it with partial state.
+backup = root / ("credit-claims-before-" + suffix + "-private.json")
+if not backup.exists():
+    backup.write_text(
+        json.dumps(
+            {
+                "profile": profile,
+                "users": {s: u for s, (u, _) in users.items()},
+                "mappers": mappers,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+candidate = copy.deepcopy(profile)
+candidate["attributes"] = [
+    a for a in candidate["attributes"] if a["name"] not in attributes.values()
+] + [
+    {
+        "name": attribute,
+        "displayName": "Git credit " + field,
+        "permissions": {"view": ["admin"], "edit": ["admin"]},
+    }
+    for field, attribute in attributes.items()
+]
+api("/users/profile", candidate, "PUT")
+for subject, (user, entry) in users.items():
+    updated = copy.deepcopy(user)
+    for field, attribute in attributes.items():
+        value = entry[field]
+        updated.setdefault("attributes", {})[attribute] = [
+            str(value).lower() if isinstance(value, bool) else value
+        ]
+    api("/users/" + subject, updated, "PUT")
+for field, claim in claims.items():
+    mapper = {
+        "name": claim,
+        "protocol": "openid-connect",
+        "protocolMapper": "oidc-usermodel-attribute-mapper",
+        "consentRequired": False,
+        "config": {
+            "user.attribute": attributes[field],
+            "claim.name": claim,
+            "jsonType.label": "String",
+            "multivalued": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+        },
+    }
+    existing = next((m for m in mappers if m["name"] == claim), None)
+    if existing:
+        mapper["id"] = existing["id"]
+        api(client_path + "/protocol-mappers/models/" + mapper["id"], mapper, "PUT")
+    else:
+        api(client_path + "/protocol-mappers/models", mapper, "POST")
+for subject, (_, entry) in users.items():
+    token = api(
+        client_path
+        + "/evaluate-scopes/generate-example-id-token?"
+        + urllib.parse.urlencode({"userId": subject, "scope": "openid"})
+    )
+    for field, claim in claims.items():
+        expected = (
+            str(entry[field]).lower()
+            if isinstance(entry[field], bool)
+            else entry[field]
+        )
+        if token.get(claim) != expected:
+            raise RuntimeError("Keycloak did not emit the configured credit claims")
+print(
+    json.dumps(
+        {
+            "clientId": client,
+            "usersConfigured": len(users),
+            "passwordsChanged": False,
+            "gatewayConsentChanged": False,
+        }
+    )
+)

@@ -106,6 +106,26 @@ class TeamLoginTests(unittest.TestCase):
             ],
         )
         self.assertIn("oce_gateway_scopes", alpha["providers"][0]["additionalClaims"])
+        # Staging claims must preserve login semantics and remain acceptable to
+        # the pinned runtime, which does not yet recognize gitCoauthor.
+        provider = alpha["providers"][0]
+        self.assertEqual(provider["oidcConfig"]["emailClaim"], "preferred_username")
+        self.assertEqual(provider["oidcConfig"]["userIDClaim"], "sub")
+        credit = {
+            "X-Coauthor-Name": "oce_git_coauthor_name",
+            "X-Coauthor-Email": "oce_git_coauthor_email",
+            "X-Coauthor-Email-Verified": "oce_git_coauthor_email_verified",
+        }
+        for header, claim in credit.items():
+            self.assertIn(claim, provider["additionalClaims"])
+            self.assertIn(
+                {
+                    "name": header,
+                    "preserveRequestValue": False,
+                    "values": [{"claimSource": {"claim": claim}}],
+                },
+                alpha["injectRequestHeaders"],
+            )
         # oauth2-proxy stores userIDClaim (sub) as the session user claim; a
         # claimSource for "sub" resolves only through additionalClaims.
         identity = [
@@ -140,6 +160,7 @@ class TeamLoginTests(unittest.TestCase):
         )
         gateway = configuration["values"]["gateway"]
         self.assertNotIn("roles", gateway)
+        self.assertNotIn("gitCoauthor", gateway["auth"]["trustedProxy"])
         self.assertNotIn(
             "operator.admin",
             gateway["auth"]["trustedProxy"]["deviceAutoApprove"]["scopes"],
@@ -180,6 +201,29 @@ class TeamLoginTests(unittest.TestCase):
             written["values"]["gateway"]["controlUi"]["allowedOrigins"],
             ["https://claw.example.test"],
         )
+
+    def test_invalid_credit_entries_refused_before_credentials_are_read(self):
+        path = self.root / "credit-users.json"
+        self.env["TEAM_CREDIT_USERS_FILE"] = str(path)
+        for entry in [
+            {"name": "Member", "email": "member@example.test", "emailVerified": "true"},
+            {
+                "name": "Member\r\nInjected",
+                "email": "member@example.test",
+                "emailVerified": True,
+            },
+            {
+                "name": "Member",
+                "email": "member@example.test>\n",
+                "emailVerified": True,
+            },
+        ]:
+            with self.subTest(entry=entry):
+                path.write_text(json.dumps({"member": entry}))
+                result = self.run_script("configure-team-login-credit")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("FileNotFoundError", result.stderr)
+                self.assertRegex(result.stderr, "boolean emailVerified|single-line")
 
     def test_missing_grant_refused_before_keycloak_access(self):
         result = self.run_script(

@@ -60,6 +60,35 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python3 -m unittest discover -s deploy/rhoai/tests -v
+      - name: Prove team credit claims with Keycloak
+        env:
+          KEYCLOAK_TEST_URL: https://localhost:19983
+          KEYCLOAK_TEST_ADMIN_PASSWORD: disposable-test-only
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          tls=$(mktemp -d)
+          chmod 755 "$tls"
+          trap 'docker rm -f oce-credit-keycloak >/dev/null 2>&1; rm -rf "$tls"' EXIT
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$tls/key.pem" -out "$tls/cert.pem" -days 1 \
+            -subj /CN=localhost -addext 'subjectAltName=DNS:localhost'
+          chmod 644 "$tls/key.pem"
+          export SSL_CERT_FILE="$tls/cert.pem"
+          docker run -d --name oce-credit-keycloak -p 127.0.0.1:19983:8443 \
+            -v "$tls:/tls:ro" \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+            -e KC_BOOTSTRAP_ADMIN_PASSWORD="$KEYCLOAK_TEST_ADMIN_PASSWORD" \
+            quay.io/keycloak/keycloak@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0 \
+            start-dev --https-certificate-file=/tls/cert.pem \
+            --https-certificate-key-file=/tls/key.pem --hostname="$KEYCLOAK_TEST_URL"
+          for attempt in $(seq 1 60); do
+            if curl --silent --fail --cacert "$SSL_CERT_FILE" \
+              "$KEYCLOAK_TEST_URL/realms/master/.well-known/openid-configuration" >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          python3 deploy/rhoai/tests/prove_team_login_credit.py
       - name: Parse manifests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
