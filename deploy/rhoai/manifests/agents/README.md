@@ -77,7 +77,8 @@ deploy/rhoai/bin/occ credential-source get "$SOURCE_ID"
 ```
 
 Expect `STATE` and `GATEWAY STATUS` to be `ready`. OCC does not update OpenShell
-automatically when the underlying Secret changes; rotate the source explicitly.
+automatically when the underlying Secret changes; rotate the source explicitly
+with [credential-sources.md](credential-sources.md#rotate-the-key).
 
 Omit the `modelProvider` object to use the standard OpenAI endpoint. For a
 custom OpenAI-compatible endpoint, set the Installation provider and authorize
