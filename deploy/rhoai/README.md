@@ -267,6 +267,15 @@ Review the generated `values.yaml` and `installation.yaml` before continuing.
 They assume `gp3-csi`, the `oce-role` labels, and the default OpenShift DNS and
 ingress selectors. Adjust them for another profile.
 
+Optional: to use Slack channels, install the Envoy Gateway controller before
+installing OCC (the pinned commands in
+[Enable private Agent routing](manifests/openshift/README.md#enable-private-agent-routing)),
+then run `deploy/rhoai/scripts/prepare-channel-egress`. It verifies the Envoy
+prerequisites and writes the matching `channelEgress` Helm and Installation
+settings from the cluster's discovered Pod, Service, and node ranges. The chart
+renders the channel Gateway and its egress fleet at install time, so these
+inputs must be in place before the OCC install.
+
 Prepare the bootstrap volume with a temporary SCC, then remove the temporary
 grants:
 
@@ -489,9 +498,30 @@ the per-person identity grants.
   [openshell-mtls](manifests/openshift/openshell-mtls/README.md) to require
   client certificates, mount OCE's certificate, and keep the post-renderer on
   later gateway upgrades.
-- **Slack**: `scripts/prepare-slack` writes the API and gateway proxy inputs.
-  Redeploy affected Agents after applying the changed Helm and Installation
-  values.
+- **Slack**: channel traffic leaves only through the managed Envoy egress
+  fleet; the retired chart-managed Slack proxy and its `runtime.channels`
+  proxy settings are gone. Install the Envoy Gateway controller before the OCC
+  chart, run `scripts/prepare-channel-egress` to write the `channelEgress`
+  Helm and Installation inputs, and install OCC with them. Configure the
+  Agent's `channels.slack` native settings with Secret-backed tokens as the
+  upstream channel egress guide documents. After the control plane is ready,
+  grant the fleet's Envoy ServiceAccount the nonroot SCC:
+
+  ```bash
+  CHANNEL_FLEET_DEPLOYMENT="$(oc -n envoy-gateway-system get deployments \
+    -l gateway.envoyproxy.io/owning-gateway-namespace=openclaw-system,gateway.envoyproxy.io/owning-gateway-name=openclaw-channel-egress \
+    -o name)"
+  CHANNEL_FLEET_SA="$(oc -n envoy-gateway-system get "$CHANNEL_FLEET_DEPLOYMENT" \
+    -o jsonpath='{.spec.template.spec.serviceAccountName}')"
+  oc -n envoy-gateway-system create rolebinding eg-channel-egress-nonroot \
+    --role=eg-nonroot-v2 --serviceaccount="envoy-gateway-system:$CHANNEL_FLEET_SA"
+  ```
+
+  The `eg-nonroot-v2` Role comes from the routing stage's
+  `envoy-controller-scc-rbac.yaml`. Known issue: with the OpenShell sandbox
+  Driver in operator workspace mode, channel-enabled Agents cannot deploy
+  until [openclaw/openclaw-enterprise#6769](https://github.com/openclaw/openclaw-enterprise/issues/6769)
+  is fixed.
 - **Widgets**: `scripts/prepare-widget-preview` prepares the preview inputs;
   apply `manifests/widgets/` for the public Route and its certificate. The Route
   reaches the Envoy sandbox listener, so Compute's method and header filters
