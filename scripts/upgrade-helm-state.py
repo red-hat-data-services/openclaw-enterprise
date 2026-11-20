@@ -314,11 +314,30 @@ def contains(actual, expected):
     return actual == expected
 
 
+# OpenShift SecurityContextConstraints admission adds an MCS SELinux level and
+# supplemental groups to Pods whose template leaves those fields unset. Accept
+# only those additive fields, and only when the template did not set them: every
+# supplied setting must still match exactly, and any other addition stays a
+# rewrite the caller refuses.
+SCC_ADMITTED_ADDITIONS = ("seLinuxOptions", "supplementalGroups")
+
+
 def same_security_context(actual, expected):
     # Kubernetes defaults an absent Pod context to {}; preserve every supplied
     # setting and refuse admission rewrites, even equivalent inherited settings.
-    left, right = actual.get("securityContext"), expected.get("securityContext")
-    return ({} if left is None else left) == ({} if right is None else right)
+    left = actual.get("securityContext")
+    right = expected.get("securityContext")
+    left = {} if left is None else left
+    right = {} if right is None else right
+    if left == right:
+        return True
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    if any(field in right for field in SCC_ADMITTED_ADDITIONS):
+        return False
+    admitted = {field: value for field, value in left.items()
+                if field not in SCC_ADMITTED_ADDITIONS}
+    return admitted == right
 
 
 def pod_matches(actual, expected):
