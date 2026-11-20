@@ -132,13 +132,20 @@ oc apply -f "$OCC_INPUT_DIRECTORY/agent-sandbox-v0.5.2.yaml"
 oc -n agent-sandbox-system rollout status \
   deployment/agent-sandbox-controller --timeout=5m
 
-helm pull oci://ghcr.io/nvidia/openshell/helm-chart \
-  --version 0.1.6 --destination "$OCC_INPUT_DIRECTORY/openshell-charts"
+# The gateway chart is packaged from the same midstream tag as the images:
+# the rhaiv release line carries chart changes that are not in the upstream
+# ghcr.io/nvidia chart, so pulling the upstream 0.1.8 chart would mix lines.
+curl -fL https://github.com/opendatahub-io/openshell/archive/refs/tags/v0.1.8-rhaiv.2.tar.gz \
+  -o "$OCC_INPUT_DIRECTORY/openshell-v0.1.8-rhaiv.2.tar.gz"
+tar -xzf "$OCC_INPUT_DIRECTORY/openshell-v0.1.8-rhaiv.2.tar.gz" \
+  -C "$OCC_INPUT_DIRECTORY" openshell-0.1.8-rhaiv.2/deploy/helm/openshell
+sed -i 's/^version: 0.0.0/version: 0.1.8/; s/^appVersion: "0.0.0"/appVersion: "0.1.8"/' \
+  "$OCC_INPUT_DIRECTORY/openshell-0.1.8-rhaiv.2/deploy/helm/openshell/Chart.yaml"
+helm package "$OCC_INPUT_DIRECTORY/openshell-0.1.8-rhaiv.2/deploy/helm/openshell" \
+  --destination "$OCC_INPUT_DIRECTORY/openshell-charts"
 helm pull oci://ghcr.io/nvidia/openshell/openshell-workspace \
   --version 0.1.6 --destination "$OCC_INPUT_DIRECTORY/openshell-charts"
 printf '%s  %s\n' \
-  0533ecf84f777954aaf6113a0813fbc9781ed2a5e6574fb807cebe9a818a1bd4 \
-  "$OCC_INPUT_DIRECTORY/openshell-charts/helm-chart-0.1.6.tgz" \
   10452d43dcf24ff795239dc5daa0fffd509a16ff57739019f0ec084bb7ca37c5 \
   "$OCC_INPUT_DIRECTORY/openshell-charts/openshell-workspace-0.1.6.tgz" \
   | sha256sum -c
@@ -147,7 +154,7 @@ oc create namespace openshell-system --dry-run=client -o yaml | oc apply -f -
 oc apply -f deploy/rhoai/manifests/openshift/base/openshell/openshell-gateway-network-policy.yaml
 oc apply -f deploy/rhoai/manifests/openshift/base/openshell/control-plane-openshell-egress.yaml
 helm upgrade --install openshell-gateway \
-  "$OCC_INPUT_DIRECTORY/openshell-charts/helm-chart-0.1.6.tgz" \
+  "$OCC_INPUT_DIRECTORY/openshell-charts/helm-chart-0.1.8.tgz" \
   --namespace openshell-system \
   -f deploy/rhoai/manifests/openshift/openshell-gateway-values.yaml \
   --wait --timeout 7m

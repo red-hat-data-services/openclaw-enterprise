@@ -1,4 +1,4 @@
-# OpenShift test-cluster profile for the pinned OpenShell v0.1.6 chart.
+# OpenShift test-cluster profile for the pinned OpenShell v0.1.8 chart.
 # The plaintext, unauthenticated gateway is for isolated single-tenant clusters.
 # Its NetworkPolicy boundary matches namespace and pod labels, and labels are not
 # an authentication boundary: a user who can set them can reach the gateway.
@@ -17,8 +17,10 @@ server:
       workspaceMode: operator
       operatorNamespaceLabel: openshell.ai/openclaw-workspace=true
 # OpenShell 0.1.5 rejects Sandbox template labels unless the operator allows them.
-# Images: Red Hat Konflux builds of the v0.1.6-rhaiv.3 midstream release
-# (opendatahub-io/openshell), published on quay.io/opendatahub.
+# Images: Red Hat Konflux builds of the v0.1.8-rhaiv.2 midstream release
+# (opendatahub-io/openshell, commit 9412bcf7), published on quay.io/opendatahub.
+# The sandbox digest is the commit-tagged build, not the later odh-stable tag,
+# so all three images come from the same release commit.
 gatewayConfig:
   openshell.drivers.kubernetes:
     allowed_pod_labels:
@@ -43,14 +45,14 @@ gateway:
   image:
     registry: quay.io
     repository: opendatahub/odh-openshell-gateway
-    digest: sha256:818aa0661fdf6a1e23a0484042aa5052a4ff3992eba196bc7a15837df1d1eb50
+    digest: sha256:8f1b5b4e00d7338856f6c9dafc7a5470af70c062a917ad55d6a757e36abd855c
 sandboxRuntime:
   image:
     registry: quay.io
     repository: opendatahub/odh-openshell-sandbox
-    digest: sha256:a26749a10cb0c68e56784486bc287a7a6ee5af0e65a6b3a2dc1c94d67cbcf144
+    digest: sha256:685e0fe9f82a497a2692655895f569044d1707d9c249abe9979f9dbe81b4a77b
 supervisor:
   image:
     registry: quay.io
     repository: opendatahub/odh-openshell-supervisor
-    digest: sha256:7d9f48627abef8a7d9518a46b7e74875fa7187ca503bcd2e15533cb7d4fc745a
+    digest: sha256:26aabf98eebaf2e64ec386bf013d25dc8439f51c52b01fa1a2d1dd1e911cb991
