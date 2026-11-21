@@ -479,6 +479,10 @@ status `succeeded`, then verify two different human logins. Remove the Agent's
 previous shared-admin OAuth proxy only after the new proxy works; it bypasses
 the per-person identity grants.
 
+To prepare credit claims before updating the runtime, follow
+[Stage Git co-authorship claims](TEAM-CREDIT.md). Keep the runtime image and its
+Configuration unchanged during that staging step.
+
 ## Other profiles
 
 - **OCC admin launcher**: keep `agentNativeAdmin` disabled during bootstrap.
