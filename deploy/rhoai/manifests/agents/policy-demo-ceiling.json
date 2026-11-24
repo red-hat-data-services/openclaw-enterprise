@@ -1,0 +1,46 @@
+[
+  {
+    "id": "demo-python-example",
+    "binary": "/usr/bin/python3.11",
+    "host": "example.com",
+    "ports": [
+      {
+        "from": 443,
+        "to": 443
+      }
+    ]
+  },
+  {
+    "id": "demo-python-google",
+    "binary": "/usr/bin/python3.11",
+    "host": "google.com",
+    "ports": [
+      {
+        "from": 443,
+        "to": 443
+      }
+    ]
+  },
+  {
+    "id": "demo-python-google-www",
+    "binary": "/usr/bin/python3.11",
+    "host": "www.google.com",
+    "ports": [
+      {
+        "from": 443,
+        "to": 443
+      }
+    ]
+  },
+  {
+    "id": "demo-curl-github-api",
+    "binary": "/usr/bin/curl",
+    "host": "api.github.com",
+    "ports": [
+      {
+        "from": 443,
+        "to": 443
+      }
+    ]
+  }
+]
