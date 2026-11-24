@@ -2722,6 +2722,20 @@ jq -e '.agentNativeAdmin | type == "object" and has("sharedCookieDomain") | not'
   die "the chart no longer accepts agentNativeAdmin.sharedCookieDomain; it derives the session cookie scope from auth.baseUrl and agentNativeAdmin.domain. Pass --candidate-values with a private copy of the values that omits only that key. No cluster changes were made."
 project_yaml "$evidence_dir/before-installation.yaml" '.' "$evidence_dir/installation-guard.json"
 project_yaml "${candidate_installation}.requested" '.' "$evidence_dir/candidate-installation-guard.json"
+# The managed OpenShell Workspaces release retired the sandbox Driver's
+# gateway.workspaceMode setting: the OpenShell Gateway now selects the workspace
+# mode in its own values, and OCE rejects the Installation key. A candidate may
+# omit the retired key the candidate no longer carries; nothing else changes.
+if jq -e --slurpfile candidate "$evidence_dir/candidate-installation-guard.json" '
+  ((.drivers.sandbox.configuration.gateway // {}) | has("workspaceMode")) and
+  ((($candidate[0].drivers.sandbox.configuration.gateway // {}) | has("workspaceMode")) | not)
+' "$evidence_dir/installation-guard.json" >/dev/null; then
+  project_yaml "$evidence_dir/before-installation.yaml" \
+    'del(.drivers.sandbox.configuration.gateway.workspaceMode)' "$evidence_dir/installation-guard.json"
+fi
+jq -e '((.drivers.sandbox.configuration.gateway // {}) | has("workspaceMode")) | not' \
+  "$evidence_dir/candidate-installation-guard.json" >/dev/null ||
+  die "the new release no longer accepts drivers.sandbox.configuration.gateway.workspaceMode; the OpenShell Gateway values select the workspace mode. Pass --candidate-installation with a private copy of the Installation that omits only that key. No cluster changes were made."
 if ! cmp -s "$evidence_dir/installation-guard.json" "$evidence_dir/candidate-installation-guard.json"; then
   # Compare the explicit candidate with the existing registration in canonical
   # form. Do not rewrite the baseline or silently convert an installed object.
@@ -2745,7 +2759,7 @@ if ! cmp -s "$evidence_dir/installation-guard.json" "$evidence_dir/candidate-ins
       (.drivers.plugin |= sort_by(.id)) == ($candidate[0] | .drivers.plugin |= sort_by(.id))
     end
   ' "$evidence_dir/installation-guard.json" >/dev/null ||
-    die "candidate Installation changes a protected setting; only an unchanged Plugin Driver registration wrapped in an array or the curated Plugin Driver selection may change."
+    die "candidate Installation changes a protected setting; only an unchanged Plugin Driver registration wrapped in an array, the curated Plugin Driver selection, or removal of the retired drivers.sandbox.configuration.gateway.workspaceMode key may change."
 fi
 fi
 mv "${candidate_values}.requested" "$candidate_values"
