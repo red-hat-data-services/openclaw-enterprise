@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Prepare managed channel egress inputs for Slack; never apply resources.
+set -euo pipefail
+umask 077
+
+: "${OCC_INPUT_DIRECTORY:?Set the existing private installation input directory}"
+: "${OCE_CHECKOUT:?Set the checkout matching the installed OCE release}"
+repository=$(cd "$(dirname "$0")/.." && pwd -P)
+OCE_CHECKOUT=$(cd "$OCE_CHECKOUT" && pwd -P)
+export OCC_INPUT_DIRECTORY
+OCC_INPUT_DIRECTORY=$(cd "$OCC_INPUT_DIRECTORY" && pwd -P)
+case "$OCC_INPUT_DIRECTORY/" in
+  "$repository/"*|"$OCE_CHECKOUT/"*) echo 'Keep deployment inputs outside both checkouts.' >&2; exit 1 ;;
+esac
+
+for name in values installation; do
+  test -f "$OCC_INPUT_DIRECTORY/$name.yaml"
+done
+test -f "$OCE_CHECKOUT/deploy/helm/openclaw-enterprise/templates/channel-egress.yaml" || {
+  echo 'The selected OCE release does not include the managed channel egress fleet.' >&2
+  exit 1
+}
+if [[ -n "$(yq -r '.drivers.compute.configuration.runtime.channels.proxyUrl // ""' "$OCC_INPUT_DIRECTORY/installation.yaml")" ]] ||
+   [[ -n "$(yq -r '.drivers.compute.configuration.runtime.channels.managedProxy // ""' "$OCC_INPUT_DIRECTORY/installation.yaml")" ]]; then
+  echo 'Retired Slack proxy settings are present; remove runtime.channels before enabling managed channel egress.' >&2
+  exit 1
+fi
+
+# The chart renders the channel Gateway and fleet at install time, so the Envoy
+# Gateway controller, its CRDs, and the GatewayClass must exist first. Install
+# them with the pinned commands in the routing stage; see
+# deploy/rhoai/manifests/openshift/README.md#enable-private-agent-routing.
+oc get crd envoypatchpolicies.gateway.envoyproxy.io >/dev/null
+test "$(oc -n envoy-gateway-system get deployment envoy-gateway -o jsonpath='{.status.readyReplicas}')" -ge 1
+oc get gatewayclass eg >/dev/null
+
+# Provider rules cannot reach cluster-internal addresses, so the exclusions
+# must cover the actual Pod, Service, and node ranges, including public node
+# addresses. Discover them like prepare-inputs discovers its addresses.
+oc get network.config.openshift.io cluster -o json | jq -er '
+  .spec.clusterNetwork | map(.cidr) |
+  if length > 0 and all(contains(":") | not) then . else error("expected IPv4 cluster networks") end' \
+  > "$OCC_INPUT_DIRECTORY/channel-pod-cidrs.json"
+oc get network.config.openshift.io cluster -o json | jq -er '
+  .spec.serviceNetwork |
+  if length > 0 and all(contains(":") | not) then . else error("expected IPv4 service networks") end' \
+  > "$OCC_INPUT_DIRECTORY/channel-service-cidrs.json"
+oc get nodes -o json | jq -er '
+  [.items[].status.addresses[] |
+    select(.type == "InternalIP" or .type == "ExternalIP") | .address] | unique |
+  if length > 0 and all(contains(":") | not) then map(. + "/32")
+  else error("expected IPv4 node addresses") end' \
+  > "$OCC_INPUT_DIRECTORY/channel-node-cidrs.json"
+export CHANNEL_EXCLUDED_CIDRS
+CHANNEL_EXCLUDED_CIDRS=$(jq -c -s 'add' \
+  "$OCC_INPUT_DIRECTORY/channel-pod-cidrs.json" \
+  "$OCC_INPUT_DIRECTORY/channel-service-cidrs.json" \
+  "$OCC_INPUT_DIRECTORY/channel-node-cidrs.json")
+
+yq -i '.channelEgress.enabled = true |
+  .channelEgress.excludedCidrs = (strenv(CHANNEL_EXCLUDED_CIDRS) | from_json)' \
+  "$OCC_INPUT_DIRECTORY/values.yaml"
+yq -i '.drivers.compute.configuration.runtime.channelEgress = {
+    "gatewayName": "openclaw-channel-egress",
+    "gatewayNamespace": "openclaw-system",
+    "envoyNamespace": "envoy-gateway-system",
+    "serviceName": "openclaw-channel-egress",
+    "listenerPortStart": 10001,
+    "listenerPortEnd": 10062,
+    "occListenerPort": 10000,
+    "inspectionPort": 19004,
+    "excludedCidrs": (strenv(CHANNEL_EXCLUDED_CIDRS) | from_json)}' \
+  "$OCC_INPUT_DIRECTORY/installation.yaml"
+export OCC_INSTALLATION_CHECKSUM
+OCC_INSTALLATION_CHECKSUM=$(sha256sum "$OCC_INPUT_DIRECTORY/installation.yaml" | cut -d ' ' -f 1)
+yq -i ".controlPlane.installationChecksum = strenv(OCC_INSTALLATION_CHECKSUM)" \
+  "$OCC_INPUT_DIRECTORY/values.yaml"
+
+printf 'Prepared managed channel egress inputs. No cluster resources changed.\n'
+printf 'Install OCC with these values, then grant the egress fleet the nonroot SCC:\n'
+printf '  see deploy/rhoai/README.md#other-profiles (Slack).\n'
+printf 'Channel-enabled Agents need the Slack native Configuration settings and\n'
+printf 'Secret-backed tokens; see the upstream channel egress guide.\n'
