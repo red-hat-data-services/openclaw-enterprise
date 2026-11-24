@@ -270,6 +270,9 @@ RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce
 # Remove after the pinned core includes upstream #196972 and its final-write handoff prerequisite.
 RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce-runtime \
     git apply /tmp/oce-runtime/openclaw-planned-completion.patch
+# Link a single chat-completions input to its server-assigned completion ID.
+RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce-runtime \
+    git apply /tmp/oce-runtime/openclaw-http-chat-input.patch
 
 # Run the bridge tests alongside the build using the same patched source.
 # Packaging mounts this stage so a failed test still blocks the runtime image.
@@ -296,8 +299,9 @@ RUN --mount=type=bind,source=deploy/runtime/Dockerfile,target=/tmp/oce/Dockerfil
 # up. Allow 30 seconds in this test-only stage, which the image never copies
 # from. The worker provider identity transport cases also fail intermittently in
 # CI with a missing identity-turn.identity.json, so each of them gets two
-# retries. The chained run follows the fork's Dockerfile: it runs only the
-# named run-loop case and reuses the compiled tree.
+# retries. The chained runs follow the fork's Dockerfile and reuse the compiled
+# tree: the named run-loop case, then the Gateway-only chat regression, which
+# does not need worker deployment artifacts.
 RUN --network=none chmod 1777 /tmp && test -k /tmp && rm -rf .artifacts && mkdir .artifacts \
     && grep -q '^  timeout: number | AbortSignal = 10_000,$' test/helpers/gateway-websocket.ts \
     && sed -i 's/^  timeout: number | AbortSignal = 10_000,$/  timeout: number | AbortSignal = 30_000,/' \
@@ -312,6 +316,9 @@ RUN --network=none chmod 1777 /tmp && test -k /tmp && rm -rf .artifacts && mkdir
     && OPENCLAW_VITEST_RUNTIME=node OPENCLAW_VITEST_MAX_WORKERS=1 pnpm_config_verify_deps_before_run=false \
     node --import ./scripts/tsx.mjs scripts/test-projects.mts src/cli/gateway-cli/run-loop.test.ts \
     -t "keeps the fenced process alive until the supervisor sends SIGTERM" \
+    && OPENCLAW_BUILD_WORKER_DEPLOY_BUNDLE=0 OPENCLAW_RUN_NODE_SKIP_DTS_BUILD=1 \
+    OPENCLAW_VITEST_RUNTIME=node OPENCLAW_VITEST_MAX_WORKERS=1 pnpm_config_verify_deps_before_run=false \
+    node --import ./scripts/tsx.mjs scripts/test-projects.mts src/gateway/server.chat-recovered-output.test.ts \
     && rm -rf .artifacts
 # Type-check production and the native/UI test graphs touched by the bridges.
 # The upstream runner generates database types and compiler cache under .artifacts.
