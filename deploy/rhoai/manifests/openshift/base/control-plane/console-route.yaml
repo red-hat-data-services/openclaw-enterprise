@@ -4,6 +4,11 @@ kind: Route
 metadata:
   name: openclaw-enterprise-console
   namespace: openclaw-system
+  annotations:
+    # Streaming agent chat can stay silent longer than the router's 30-second
+    # default server timeout. Upstream requires at least 660 seconds per
+    # request (docs/guides/agent-http-chat.md).
+    haproxy.router.openshift.io/timeout: 660s
 spec:
   host: console.oce.example.invalid
   to:
