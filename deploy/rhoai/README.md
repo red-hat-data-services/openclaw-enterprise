@@ -48,7 +48,7 @@ oc whoami --show-server
 | `manifests/dashboard/`    | Keycloak, dashboard and gateway OIDC values, and dashboard network access.                                     |
 | `manifests/native-admin/` | OCC admin launcher certificate, issuer, ingress, and network policy.                                           |
 | `manifests/widgets/`      | Dashboard widget preview Route and certificate.                                                                |
-| `manifests/agents/`       | Agent deployment procedure and the custom-model credential-source template.                                    |
+| `manifests/agents/`       | Agent deployment procedure.                                                                                    |
 | `manifests/presets/`      | Installation-wide team Agent Presets and their API, worker, and Job mount patches.                             |
 | `scripts/`                | Build, prepare, resolve, upgrade, validate, and team-login helpers; see [SCRIPTS.md](SCRIPTS.md).              |
 | `tests/`                  | Offline tests for the scripts.                                                                                 |

@@ -81,6 +81,11 @@ Expect `STATE` to be `ready`. To replace the stored key, send the new value as
 `config` keeps its saved value. `occ credential-source rotate` requests an OAuth
 refresh from the Source's TokenService owner and does not replace a static key.
 
+Managed static sources reach the standard OpenAI endpoint only. A custom
+OpenAI-compatible endpoint has no supported source on this release; binding a
+Secret directly with `harnessAuth: {method: "api_key", source: ...}` remains
+the manual path, and deployment refuses it while `token_service` is selected.
+
 ## Create the Configuration and Agent
 
 The dedicated Codex Configuration selects `codex/gpt-6-luna` with a fail-closed
