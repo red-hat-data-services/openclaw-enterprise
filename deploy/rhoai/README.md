@@ -15,6 +15,9 @@ tested on OpenShift 4.22 with two `linux/amd64` workers, `gp3-csi` storage, the
 Red Hat cert-manager Operator, and the certified Crunchy Data PostgreSQL
 Operator.
 
+> Verified runbook for this checkout:
+> [RHOAI 3.6 deployment guide](RHOAI-3.6-DEPLOYMENT-GUIDE.md).
+
 ## Before you begin
 
 - Cluster administrator access to the target OpenShift cluster. Commands use the

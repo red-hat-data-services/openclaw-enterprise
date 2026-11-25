@@ -181,6 +181,37 @@ Then complete
 skipping the existing-Agent redeployment steps when there is no Agent yet. Finish
 with ready API and worker Deployments and `Programmed=True` on the Gateway.
 
+## Verify a dedicated Codex Agent turn
+
+OpenShell provisions the Harness Pod and enforces network policy for each
+binary. An unregistered probe process is denied DNS even when the Agent works, so
+do not infer a missing route from such a probe. The credential path carries the
+model request; add no per-Agent grant for the model host. The credential
+provider already inspects TLS for `api.openai.com`, and an uninspected rule for
+that host conflicts: Sandbox creation refuses the addition (`CreateSandbox`
+gRPC status 9) and the revision fails.
+
+Send one HTTP chat turn with the service key. A reply proves OCC, Envoy, the
+Agent Gateway, and the Sandbox:
+
+```bash
+key="$(jq -er '.data.key' "$OCC_SERVICE_KEY_FILE")"
+printf 'x-api-key: %s\n' "$key" |
+  curl --fail-with-body --silent --show-error --no-buffer --max-time 660 \
+    --header @- --header 'Content-Type: application/json' \
+    --data '{"messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":true}' \
+    "$OCC_URL/agents/$AGENT_ID/chat"
+unset key
+```
+
+A turn can outlive the router's default 30-second timeout. Raise it on the OCC
+Route before the first turn:
+
+```bash
+oc -n openclaw-system annotate route openclaw-enterprise-console \
+  haproxy.router.openshift.io/timeout=660s --overwrite
+```
+
 ## Control UI Route
 
 Run this after the Agent deployment reports `succeeded`. The OAuth proxy
