@@ -89,6 +89,9 @@ if [[ "$mode" == bootstrap ]]; then
       "clientAddressHeader":"x-forwarded-for"} |
     .cluster.cidrs = [strenv(API_SERVICE_CIDR)] + load(strenv(OCC_INPUT_DIRECTORY) + "/api-cidrs.json") |
     .controlPlane.nodeSelector = {"oce-role":"control"} |
+    # The null k8s-app is the Helm delete-default idiom: it removes the
+    # inherited k8s-app: kube-dns chart label so DNS peer selectors match
+    # OpenShift DNS pods. Do not "fix" it; see tests/test_prepare_inputs.py.
     .dns = {"namespace":"openshift-dns","podLabels":{
       "dns.operator.openshift.io/daemonset-dns":"default","k8s-app":null}}' \
     "$OCC_INPUT_DIRECTORY/values.yaml"
