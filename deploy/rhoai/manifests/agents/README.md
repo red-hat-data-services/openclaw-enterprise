@@ -49,50 +49,37 @@ oc label namespace "$TENANT_NAMESPACE" \
 
 ## Register the model credential
 
-Use an OpenAI API key authorized for the model in the Agent Configuration. OCC
-stores the value in a managed Secret in the tenant namespace, and the Credential
-Gateway stores a copy in OpenShell. Keep the key out of shell history, command
-arguments, and repository files.
+Use an OpenAI API key authorized for the model in the Agent Configuration. The
+selected TokenService keeps the credential and pushes a delivery copy to the
+OpenShell gateway as a provider profile. This profile's gateway connection is
+plaintext, so keep the cluster single-tenant. Keep the key out of shell history,
+command arguments, and repository files. Source names are unique per Namespace
+and share the Agent name's 200-character limit, so this guide derives them from
+the Agent's display name; keep it short enough that `$AGENT_NAME-openai` fits.
 
 ```bash
+# REQUIRED: display name for this Agent and its OpenClaw assistant.
+export AGENT_NAME='<Agent display name>'
 umask 077
 read -r -s -p 'OpenAI API key: ' OPENAI_API_KEY
 printf '\n'
 printf '%s' "$OPENAI_API_KEY" |
-  jq -Rs '{name: "openai-model-key", value: .}' \
-  > "$OCC_INPUT_DIRECTORY/model-secret.json"
+  jq -Rs --arg name "$AGENT_NAME-openai" '{name: $name, type: "static",
+    config: {provider_preset: "openai"}, secret: gsub("\n"; "")}' \
+  > "$OCC_INPUT_DIRECTORY/credential-source.json"
 unset OPENAI_API_KEY
 
-export SECRET_REF="$(deploy/rhoai/bin/occ secret create \
-  --file "$OCC_INPUT_DIRECTORY/model-secret.json" -o json | jq -c .ref)"
-rm -f "$OCC_INPUT_DIRECTORY/model-secret.json"
-test -n "$SECRET_REF" && test "$SECRET_REF" != null
-
-jq -n --argjson ref "$SECRET_REF" \
-  '{name: "openai", type: "openai", secrets: {api_key: $ref}}' \
-  > "$OCC_INPUT_DIRECTORY/credential-source.json"
 export SOURCE_ID="$(deploy/rhoai/bin/occ credential-source create \
   --file "$OCC_INPUT_DIRECTORY/credential-source.json" -o json | jq -r .id)"
+rm -f "$OCC_INPUT_DIRECTORY/credential-source.json"
+test -n "$SOURCE_ID" && test "$SOURCE_ID" != null
 deploy/rhoai/bin/occ credential-source get "$SOURCE_ID"
 ```
 
-Expect `STATE` and `GATEWAY STATUS` to be `ready`. OCC does not update OpenShell
-automatically when the underlying Secret changes; rotate the source explicitly.
-
-Omit the `modelProvider` object to use the standard OpenAI endpoint. For a
-custom OpenAI-compatible endpoint, set the Installation provider and authorize
-the same base URL. The credential source's `config.authorized_base_url` must
-match this base URL exactly.
-
-```yaml
-drivers.compute.configuration.runtime.modelProvider:
-  protocol: openai-responses
-  baseUrl: https://models.example.com/v1
-```
-
-Apply the change to the Installation startup Secret and restart the API and
-worker before deploying the Agent. Without it, deployment rejects the credential
-source because its authorized destination does not match the revision provider.
+Expect `STATE` to be `ready`. To replace the stored key, send the new value as
+`secret` to `occ credential-source update "$SOURCE_ID" --file ...`. An omitted
+`config` keeps its saved value. `occ credential-source rotate` requests an OAuth
+refresh from the Source's TokenService owner and does not replace a static key.
 
 ## Create the Configuration and Agent
 
@@ -102,8 +89,6 @@ OpenShell. Do not put the API key in the Configuration.
 
 ```bash
 export CONFIGURATION_FILE=deploy/rhoai/manifests/openshift/codex-luna-configuration.json
-# REQUIRED: display name for this Agent and its OpenClaw assistant.
-export AGENT_NAME='<Agent display name>'
 
 jq --arg name "$AGENT_NAME" \
   '.values.agents.entries.main.name = $name |
@@ -163,6 +148,41 @@ oc -n openclaw-system create rolebinding "oce-runtime-pull-${AGENT_SA#agent-}" \
   --dry-run=client -o yaml | oc apply -f -
 ```
 
+## Allow the model endpoint for the Agent
+
+The Configuration keeps the Codex provider at the unreachable
+`http://127.0.0.1:9`, and the Codex Harness calls `api.openai.com` over a route
+the Agent admits. Deployment needs exactly one grant for the bundled Codex
+executable to `api.openai.com` port 443.
+
+The Installation fragment already delegates that grant through its top-level
+`sandboxNetworkPolicyCeiling` (`codex-model-egress` for the `linux/amd64`
+runtime; add the arm64 `aarch64-unknown-linux-musl` Codex path there on arm64
+nodes). Save the matching addition on the Agent before you deploy it. Policy
+editing needs Installation and Agent `administer`; saving an addition needs
+Agent `manage_policy` and SandboxPolicy `update`.
+
+The binary path embeds the runtime's Codex version. When a runtime image bumps
+that version, update the ceiling in the Installation fragment and re-save this
+addition with the new path on every deployed Agent; the offline test suite
+fails on a fragment that no longer matches the runtime Dockerfile's pinned
+version. The update replaces the whole additions list, so include any saved
+additions in the same request when an Agent already has them.
+
+```bash
+export CODEX_BINARY='/app/node_modules/openclaw/node_modules/.pnpm/@openai+codex@0.164.0-linux-x64/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/bin/codex'
+deploy/rhoai/bin/occ agent policy editing "$AGENT_ID" --enabled=true
+export POLICY_VERSION="$(deploy/rhoai/bin/occ agent policy get "$AGENT_ID" -o json |
+  jq -er .policy.version)"
+jq -n --argjson version "$POLICY_VERSION" --arg binary "$CODEX_BINARY" '{
+  expectedVersion: $version,
+  additions: [{id: "model-egress", binary: $binary, host: "api.openai.com",
+    ports: [{from: 443, to: 443}]}]}' \
+  > "$OCC_INPUT_DIRECTORY/model-egress.json"
+deploy/rhoai/bin/occ agent policy update "$AGENT_ID" \
+  --file "$OCC_INPUT_DIRECTORY/model-egress.json"
+```
+
 ## Admit the Agent Gateway
 
 The Agent Gateway runs as UID/GID 1000 in the tenant namespace. Grant its exact
@@ -175,7 +195,10 @@ oc -n "$GATEWAY_NAMESPACE" create role oce-fixed-uid-1000-agent-gateway \
   --verb=use --resource=securitycontextconstraints.security.openshift.io \
   --resource-name=oce-fixed-uid-1000 \
   --dry-run=client -o yaml | oc apply -f -
-oc -n "$GATEWAY_NAMESPACE" create rolebinding oce-fixed-uid-1000-agent-gateway \
+# Name the RoleBinding for this Agent's Gateway ServiceAccount: applying a
+# same-named binding for another Agent would replace its subjects and strip
+# this Gateway's SCC grant.
+oc -n "$GATEWAY_NAMESPACE" create rolebinding "oce-fixed-uid-1000-$GATEWAY_SA" \
   --role=oce-fixed-uid-1000-agent-gateway \
   --serviceaccount="$GATEWAY_NAMESPACE:$GATEWAY_SA" \
   --dry-run=client -o yaml | oc apply -f -

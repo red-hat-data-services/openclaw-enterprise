@@ -417,9 +417,9 @@ Enable private Envoy routing before creating an Agent. Follow
 
 Deploy one dedicated Codex Agent as described in
 [manifests/agents/README.md](manifests/agents/README.md). It selects the tenant,
-attaches it to the private Gateway, registers the model credential, creates the
-Configuration and Agent, grants the exact credential source and Gateway SCC, and
-verifies the deployment.
+attaches it to the Gateway, enrolls the model Source, creates the Configuration
+and Agent, saves its model network policy, admits the Gateway SCC, and verifies
+the deployment.
 
 After the Agent reports `succeeded`, add its authenticated Control UI Route:
 [Control UI Route](manifests/openshift/README.md#control-ui-route). Apply the

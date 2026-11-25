@@ -297,12 +297,34 @@ deploy/rhoai/bin/occ configuration get "$CONFIGURATION_ID" -o json |
     > "$OCC_INPUT_DIRECTORY/control-ui-configuration.json"
 deploy/rhoai/bin/occ configuration update "$CONFIGURATION_ID" \
   --file "$OCC_INPUT_DIRECTORY/control-ui-configuration.json"
+```
+
+A managed credential source cannot replace an active revision (409
+`RESOURCE_STATE_CONFLICT`), so stop the Agent before deploying the update.
+The stop is asynchronous; run it, confirm the Agent reports no running
+version, then deploy:
+
+```bash
+deploy/rhoai/bin/occ agent stop "$AGENT_ID"
+```
+
+```bash
+deploy/rhoai/bin/occ agent get "$AGENT_ID" -o json |
+  jq -e '.desiredRuntimeState == "stopped" and
+    (.activeRevisionId == null or .activeRevisionId == "")'
+```
+
+```bash
 deploy/rhoai/bin/occ agent deploy "$AGENT_ID"
 ```
 
 Record the returned revision, wait for `succeeded`, then open
 `$CONTROL_UI_ORIGIN/new` and complete a model turn. On a fresh Gateway,
 `/chat/main` may show **Conversation unavailable**; start at `/new`.
+
+The Route and its proxy use fixed names, so this procedure supports one
+Control UI Route per tenant Namespace: running it for a second Agent repoints
+the shared Deployment and Route at that Agent's Gateway.
 
 `deviceAutoApprove` approves `operator.admin` devices automatically for every
 login that passes the Route's Service check. Enable it only when every permitted
