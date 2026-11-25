@@ -517,23 +517,13 @@ the per-person identity grants.
 
 ## Upgrade
 
-Use the selected OCE release's upgrade workflow; do not reapply bootstrap.
-
-```bash
-deploy/rhoai/scripts/upgrade --help
-```
-
-The wrapper delegates to `$OCE_CHECKOUT/scripts/upgrade-production-images`.
-Follow [upgrading OCE on Kubernetes](../../docs/guides/deploy/production-upgrade.md)
-and keep the saved `images.env`, Installation Secret, database Secrets, and
-signing key across releases. When you use the dashboard or mTLS profile, pass
-their values and post-renderer to every gateway upgrade.
-
-**Known issue:** With Helm 4, `scripts/upgrade-production-images` can refuse with `the Helm release changed before submission` after it
-stops the API and worker, because Helm 4's `helm status` includes live resources. Affected versions can leave the
-Installation Secret switched with the old controller, so the console stays down until restoration. Use a Helm 3 binary first on
-`PATH` until openclaw/openclaw-enterprise#6593 lands and is synced here. To recover, first confirm with `helm history` that the release revision is unchanged (no other upgrade ran); then restore the Installation Secret from the run's
-evidence directory, then scale the API and worker back up.
+Use `occ installation upgrade` from the reviewed release checkout; do not
+reapply bootstrap. Follow [Upgrade the RHOAI deployment](UPGRADE.md) to
+resolve the published images, check out their source revision, render the
+owner-only profile with `deploy/rhoai/scripts/prepare-upgrade-profile`, then
+run `plan`, `migration check`, and `apply`. The CLI ships with
+openclaw/openclaw-enterprise#6504 (commit `81428d441`); older releases keep
+the [`scripts/upgrade` fallback](UPGRADE.md#releases-without-the-upgrade-cli).
 
 ## Verification
 

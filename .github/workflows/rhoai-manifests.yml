@@ -16,6 +16,7 @@ on:
       - cmd/occ/**
       - deploy/examples/production/**
       - deploy/runtime/openclaw-source.json
+      - scripts/upgrade-production
       - scripts/upgrade-production-images
   push:
     branches: [main]
@@ -26,6 +27,7 @@ on:
       - cmd/occ/**
       - deploy/examples/production/**
       - deploy/runtime/openclaw-source.json
+      - scripts/upgrade-production
       - scripts/upgrade-production-images
 
 concurrency:
