@@ -35,6 +35,11 @@ are unavailable. Choose **Refresh** in the page header and check that **Edit
 Slack** is available again and the access-check message clears. Reload the
 preview to repeat.
 
+After Cancel, scroll to the bottom with **Channels** in view. Switch browser
+tabs and return twice to see the failed check and recovery. Each time, the
+Channels tab should stay in the same place on screen unless the page is too
+short to allow it.
+
 For retained Harness settings, open **Pages / Agent detail / Retained Harness
 history** (`retainedHarnessHistory`). Load older versions, select v1 and read the
 saved-settings warning,
@@ -102,6 +107,13 @@ button's accessible description names the Secret in the refusal. Switch to
 another tab and return. The simulated grant clears the refusal and enables
 Deploy on the same draft. Returning to the tab sends no Deploy request.
 Use **Deployment needs Secret operate** to check access that stays denied.
+
+Use **Current version's Sandbox lost** to check the warning while returning to the same version.
+
+In **Bootstrap failure with cleanup pending**, stay on the page as the replacement
+fails. The selected version stays the same. **Sandbox running** changes to
+**Sandbox lost** with **Deploy a new version** after one fresh Sandbox check.
+Cleanup updates do not trigger more checks. The story simulates both responses.
 
 1. Separately, open **Pages / Agent detail / New version activated**
    (`deploymentSucceeded`, Storybook ID `pages-agent-detail--deployment-succeeded`).
