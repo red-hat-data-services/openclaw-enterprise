@@ -85,6 +85,18 @@ checksum.
 The `Konflux OCE Pins` workflow runs the same check on pull requests and on
 pushes to main.
 
+The `Konflux OCE Pins Refresh` workflow runs `refresh-pins.sh` after every push
+to main, daily, and on demand. It refreshes the derived pins, records the
+upstream commit of the latest sync in `OCE_UPSTREAM_COMMIT` in both build-args
+files, and opens or updates one pull request from the `konflux/oce-pins-refresh`
+branch. Every sync changes both build-args files, so merging that pull request
+rebuilds both images. The pull request is a draft with the `--check` output
+when a recipe change still needs a manual port; port it in a separate pull
+request, and the job closes its own once main has the pins. Pushes made with
+the workflow token start no workflows, so the job dispatches the pins check on
+its branch, and the Konflux builds on that pull request may need a maintainer
+to close and reopen it.
+
 ## Status
 
 The builds are not hermetic yet (`hermetic: "false"`): they download pnpm, the

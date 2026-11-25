@@ -24,6 +24,9 @@ on:
       - deploy/konflux/**
       - deploy/runtime/**
       - package.json
+  # deploy/konflux/refresh-pins.sh dispatches the check on its branch, because
+  # pushes made with the workflow token start no workflows.
+  workflow_dispatch:
 
 concurrency:
   group: konflux-oce-pins-${{ github.workflow }}-${{ github.ref }}

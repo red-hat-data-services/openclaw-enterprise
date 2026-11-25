@@ -1,0 +1,42 @@
+name: Konflux OCE Pins Refresh
+
+# Upstream syncs merge into main without touching the Konflux build args, so
+# the OCE images do not rebuild and the derived pins go stale. After every push
+# to main, deploy/konflux/refresh-pins.sh refreshes the pins and opens or
+# updates one pull request whose merge rebuilds both images.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: konflux-oce-pins-refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: Refresh OCE Konflux pins
+    if: github.repository == 'red-hat-data-services/openclaw-enterprise'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      # Push the refresh branch, open its pull request and dispatch the pins check.
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          # oce_pins.py reads the review baseline and the sync merges from history.
+          fetch-depth: 0
+      - name: Refresh pins and propose them
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash deploy/konflux/refresh-pins.sh
