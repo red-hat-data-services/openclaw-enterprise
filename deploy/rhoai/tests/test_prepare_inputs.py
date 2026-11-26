@@ -106,6 +106,23 @@ class PrepareInputsTests(unittest.TestCase):
         result = self.run_command(str(RHOAI / "scripts/prepare-inputs"), "bootstrap")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_tag_only_image_refuses_before_discovery(self):
+        # A mutable tag must never reach the Helm values or the Installation:
+        # the refusal has to fire before any oc discovery runs, so the stub's
+        # call log stays empty.
+        mutable = "registry.example.test/oce/controller:latest"
+        result = self.run_command(
+            str(RHOAI / "scripts/prepare-inputs"),
+            "bootstrap",
+            environment=dict(self.env, CONTROLLER_IMAGE=mutable),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CONTROLLER_IMAGE", result.stderr)
+        self.assertFalse(
+            self.log.exists() and self.log.read_text(),
+            "oc discovery ran before the image refusal",
+        )
+
     def merge_fragment(self):
         """Apply the README section 4 merge steps to the bootstrap Installation."""
         rendered = self.inputs / "openshell-workspace-rendered.yaml"
@@ -196,8 +213,9 @@ class PrepareInputsTests(unittest.TestCase):
         self.assertEqual(len(source_control), 1)
         # gh and the git HTTP helpers carry the HTTPS Git and GitHub traffic
         # the sandbox admits; gh also resolves API operations against
-        # api.github.com. The runtime image is Debian-based, so the helpers
-        # live under /usr/lib/git-core and https URLs use git-remote-https.
+        # api.github.com. The helpers live under /usr/lib/git-core on
+        # Debian-based images and /usr/libexec/git-core on RPM-based runtimes,
+        # and both locations are admitted, as the controller's own policy does.
         # Dropping any entry here silently removes egress for Agents.
         self.assertEqual(
             source_control[0]["binaries"],
@@ -206,6 +224,8 @@ class PrepareInputsTests(unittest.TestCase):
                 {"path": "/usr/local/bin/gh"},
                 {"path": "/usr/lib/git-core/git-remote-http"},
                 {"path": "/usr/lib/git-core/git-remote-https"},
+                {"path": "/usr/libexec/git-core/git-remote-http"},
+                {"path": "/usr/libexec/git-core/git-remote-https"},
             ],
         )
         self.assertEqual(
@@ -315,6 +335,10 @@ class PrepareInputsTests(unittest.TestCase):
     def test_chart_renders_openshift_dns_peer_selector(self):
         helm = shutil.which("helm")
         if helm is None:
+            # A silent skip would drop the null k8s-app guard in CI, where
+            # nothing re-checks it; fail there so the lane stays honest.
+            if os.environ.get("CI"):
+                self.fail("helm is not on PATH; the chart render guard cannot run")
             self.skipTest("Install helm on PATH to render the chart's DNS peers.")
         self.prepare()
         result = self.run_command(

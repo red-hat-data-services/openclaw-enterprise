@@ -73,12 +73,16 @@ drivers:
                 ports: [443]
                 protocol: tcp
                 tls: skip
-            # The runtime image is Debian-based: git HTTP helpers live under /usr/lib/git-core.
+            # git HTTP helpers live under /usr/lib/git-core on Debian-based images
+            # and /usr/libexec/git-core on RPM-based runtimes; list both, as the
+            # controller's own git credential policy does.
             binaries:
               - path: /usr/bin/git
               - path: /usr/local/bin/gh
               - path: /usr/lib/git-core/git-remote-http
               - path: /usr/lib/git-core/git-remote-https
+              - path: /usr/libexec/git-core/git-remote-http
+              - path: /usr/libexec/git-core/git-remote-https
       sandboxNamePrefix: os
   token_service:
     id: occ
