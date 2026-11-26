@@ -31,15 +31,22 @@ The system Podman socket behaves closest to the Docker daemon that the test
 lanes expect: containers run with root cgroups, which provide every
 controller, and with the privileges the OCI runtime needs.
 
+Keep the exposure session-scoped. Access to a rootful Podman socket is
+root-equivalent without a sudo password for anything that already runs as
+your user, the same property as Docker group membership. Start the socket
+only while you run lanes:
+
 ```bash
-sudo systemctl enable --now podman.socket
+sudo systemctl start podman.socket
 sudo setfacl -m u:"$(id -un)":x /run/podman
 sudo setfacl -m u:"$(id -un)":rw /run/podman/podman.sock
 OCC_K3D_CONTAINER_ENGINE=podman-rootful ./scripts/k3d test --harness openclaw
 ```
 
-The access grants revert at reboot. Re-run them after reboot, or grant a
-group access to the socket instead.
+The access grants revert at reboot, so the standing exposure is zero until
+you grant them again. Use `sudo systemctl enable --now podman.socket` only
+when you accept a socket that survives reboots; without the access grant an
+enabled socket stays root-only.
 
 ## Rootless prerequisites
 
