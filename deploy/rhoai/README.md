@@ -2,13 +2,12 @@
 
 Deployment assets for running OpenClaw Enterprise (OCE) and its OpenClaw
 Control Plane (OCC) on Red Hat OpenShift, including the OpenShell gateway, the
-OpenShell dashboard with Keycloak login, an authenticated Control UI Route, and
-Keycloak-backed team-claw identities for Codex Agents.
+OpenShell dashboard, an authenticated Control UI Route, and Keycloak-backed
+team-claw identities for Codex Agents.
 
 These assets are opinionated for OpenShift. The OCE Helm chart, CLI, database
 migrations, and upgrade workflow remain the supported installation path; this
-directory adapts them with OpenShift admission, networking, routing, and
-identity resources.
+directory adapts them for OpenShift.
 
 This is a development deployment profile, not a production qualification. It is
 tested on OpenShift 4.22 with two `linux/amd64` workers, `gp3-csi` storage, the
@@ -17,18 +16,16 @@ Operator.
 
 ## Before you begin
 
-- Cluster administrator access to the target OpenShift cluster. Commands use the
+- Cluster administrator access to the target OpenShift cluster, using the
   current kubeconfig context.
 - OpenShift 4.22 or later, with at least two ready `amd64` nodes.
 - A CNI that enforces NetworkPolicies, and a block-backed RWO storage class.
-- The tool versions pinned by the repository's `mise.toml`: Go 1.27.3,
-  Node.js 24.22.1, Helm 3.19.2, `kubectl` 1.35.0, and `yq` v4.48.1. Run
-  `mise install` to install the pinned tools. `jq`, Git, OpenSSL, `curl`, and
-  `envsubst` come from the workstation.
+- The tool versions pinned by the repository's `mise.toml`, installed with
+  `mise install`. `jq`, Git, OpenSSL, `curl`, and `envsubst` come from the
+  workstation.
 - The OCE workspace dependencies installed in `OCE_CHECKOUT` with
   `pnpm install --frozen-lockfile`.
-- A clean OCE checkout for the release you deploy. When you deploy this
-  repository's mainline, use this clone.
+- A clean OCE checkout for the release you deploy; use this clone for mainline.
 
 Create a private input directory outside every checkout. Keep kubeconfigs,
 passwords, rendered overlays, and Secrets there.
@@ -51,9 +48,9 @@ oc whoami --show-server
 | `manifests/dashboard/`    | Keycloak, dashboard and gateway OIDC values, and dashboard network access.                                     |
 | `manifests/native-admin/` | OCC admin launcher certificate, issuer, ingress, and network policy.                                           |
 | `manifests/widgets/`      | Dashboard widget preview Route and certificate.                                                                |
-| `manifests/agents/`       | Agent deployment procedure and the custom-model credential-source template.                                    |
+| `manifests/agents/`       | Agent deployment procedure.                                                                                    |
 | `manifests/presets/`      | Installation-wide team Agent Presets and their API, worker, and Job mount patches.                             |
-| `scripts/`                | Build, prepare, resolve, upgrade, validate, and team-login helpers; see [SCRIPTS.md](SCRIPTS.md).              |
+| `scripts/`                | Build, prepare, resolve, validate, and team-login helpers; see [SCRIPTS.md](SCRIPTS.md).                       |
 | `tests/`                  | Offline tests for the scripts.                                                                                 |
 
 The Kustomize stages are documented in
@@ -63,13 +60,12 @@ and Keycloak procedure is in
 
 ## Deployment order
 
-Complete the sections in order. Create dependencies before the resources that
-use them, and wait for readiness between stages.
+Complete the sections in order and wait for readiness between stages.
 
 ### 1. Prepare the cluster
 
 Label one worker for the control plane and a different worker for Agent
-workloads. The bootstrap Pod, OCC, and Agent runtime all select these labels.
+workloads; the bootstrap Pod, OCC, and Agent runtime all select these labels.
 
 ```bash
 export CONTROL_NODE='<ready amd64 control node>'
@@ -132,13 +128,31 @@ oc apply -f "$OCC_INPUT_DIRECTORY/agent-sandbox-v0.5.2.yaml"
 oc -n agent-sandbox-system rollout status \
   deployment/agent-sandbox-controller --timeout=5m
 
-helm pull oci://ghcr.io/nvidia/openshell/helm-chart \
-  --version 0.1.6 --destination "$OCC_INPUT_DIRECTORY/openshell-charts"
+# The gateway chart is packaged from the same midstream release as the
+# images: the rhaiv line carries chart changes that are not in the upstream
+# chart, so pulling the upstream chart would mix lines. The chart is named
+# "openshell" from 0.1.9 on (it was "helm-chart" before). Fetch the source
+# archive by its immutable commit, not the movable tag, and verify the
+# recorded checksum like every other downloaded artifact.
+export OPENSHELL_CHART_COMMIT=c2775b8df05619cdd57cb354ea8cd829ec79ee40
+rm -f "$OCC_INPUT_DIRECTORY/openshell-charts/openshell-0.1.10.tgz"
+curl -fL "https://github.com/opendatahub-io/openshell/archive/${OPENSHELL_CHART_COMMIT}.tar.gz" \
+  -o "$OCC_INPUT_DIRECTORY/openshell-${OPENSHELL_CHART_COMMIT}.tar.gz" &&
+  printf '%s  %s\n' \
+    2dfc1521437c0b16175b35056cf385ffdce96203c2416932f0225406c4d96906 \
+    "$OCC_INPUT_DIRECTORY/openshell-${OPENSHELL_CHART_COMMIT}.tar.gz" |
+    sha256sum -c &&
+  tar -xzf "$OCC_INPUT_DIRECTORY/openshell-${OPENSHELL_CHART_COMMIT}.tar.gz" \
+    -C "$OCC_INPUT_DIRECTORY" "openshell-${OPENSHELL_CHART_COMMIT}/deploy/helm/openshell" &&
+  sed -i 's/^version: 0.0.0/version: 0.1.10/; s/^appVersion: "0.0.0"/appVersion: "0.1.10"/' \
+    "$OCC_INPUT_DIRECTORY/openshell-${OPENSHELL_CHART_COMMIT}/deploy/helm/openshell/Chart.yaml" &&
+  yq -e '.version == "0.1.10" and .appVersion == "0.1.10"' \
+    "$OCC_INPUT_DIRECTORY/openshell-${OPENSHELL_CHART_COMMIT}/deploy/helm/openshell/Chart.yaml" &&
+  helm package "$OCC_INPUT_DIRECTORY/openshell-${OPENSHELL_CHART_COMMIT}/deploy/helm/openshell" \
+    --destination "$OCC_INPUT_DIRECTORY/openshell-charts"
 helm pull oci://ghcr.io/nvidia/openshell/openshell-workspace \
   --version 0.1.6 --destination "$OCC_INPUT_DIRECTORY/openshell-charts"
 printf '%s  %s\n' \
-  0533ecf84f777954aaf6113a0813fbc9781ed2a5e6574fb807cebe9a818a1bd4 \
-  "$OCC_INPUT_DIRECTORY/openshell-charts/helm-chart-0.1.6.tgz" \
   10452d43dcf24ff795239dc5daa0fffd509a16ff57739019f0ec084bb7ca37c5 \
   "$OCC_INPUT_DIRECTORY/openshell-charts/openshell-workspace-0.1.6.tgz" \
   | sha256sum -c
@@ -147,7 +161,7 @@ oc create namespace openshell-system --dry-run=client -o yaml | oc apply -f -
 oc apply -f deploy/rhoai/manifests/openshift/base/openshell/openshell-gateway-network-policy.yaml
 oc apply -f deploy/rhoai/manifests/openshift/base/openshell/control-plane-openshell-egress.yaml
 helm upgrade --install openshell-gateway \
-  "$OCC_INPUT_DIRECTORY/openshell-charts/helm-chart-0.1.6.tgz" \
+  "$OCC_INPUT_DIRECTORY/openshell-charts/openshell-0.1.10.tgz" \
   --namespace openshell-system \
   -f deploy/rhoai/manifests/openshift/openshell-gateway-values.yaml \
   --wait --timeout 7m
@@ -190,13 +204,11 @@ git -C "$OCE_CHECKOUT" diff --stat "$OCC_REV"..HEAD -- \
 ```
 
 A non-empty diff means the chart or CLI differs from the image build. Deploy
-from a clean checkout at `OCC_REV`, and carry these deployment assets into that
-checkout.
+from a clean checkout at `OCC_REV` and carry these deployment assets into it.
 
 ### 4. Install PostgreSQL and prepare inputs
 
-Install the PostgreSQL Operator and cluster, then wait for the primary Pod and
-its data claim:
+Install the PostgreSQL Operator and cluster, then wait for the primary Pod:
 
 ```bash
 oc apply -f deploy/rhoai/manifests/openshift/base/operators/postgres-operator.yaml
@@ -219,7 +231,7 @@ oc -n openclaw-postgres wait --for=condition=Ready pod \
 
 Run the bootstrap SQL once for a fresh database, then write the private
 connection files with full TLS verification. Never put these passwords in Helm
-values or the Installation YAML.
+values or the Installation.
 
 ```bash
 openssl rand -hex 24 > "$OCC_INPUT_DIRECTORY/occ-migrator-password"
@@ -253,7 +265,7 @@ for role, password_file, output_file in (
 PY
 ```
 
-Prepare the OpenShift inputs and apply the control-plane egress policies:
+Prepare the OpenShift inputs and apply control-plane egress policies:
 
 ```bash
 source "$OCC_INPUT_DIRECTORY/images.env"
@@ -263,23 +275,21 @@ oc apply -f "$OCC_INPUT_DIRECTORY/control-plane-postgres-egress.yaml"
 oc apply -f "$OCC_INPUT_DIRECTORY/control-plane-kube-api-egress.yaml"
 ```
 
-Review the generated `values.yaml` and `installation.yaml` before continuing.
-They assume `gp3-csi`, the `oce-role` labels, and the default OpenShift DNS and
-ingress selectors. Adjust them for another profile.
+Review the generated `values.yaml` and `installation.yaml`; they assume
+`gp3-csi`, the `oce-role` labels, and the default OpenShift DNS and ingress
+selectors.
 
 `agentNativeAdmin.domain` is `agents.` plus the Console host's parent domain,
-for example `agents.$CLUSTER_APPS_DOMAIN`. The chart requires this Agent DNS
-suffix even while the admin launcher is disabled, because the Console session
-cookie is scoped to the suffix it shares with the Console host. A domain already
-set in a retained `values.yaml` is kept.
+for example `agents.$CLUSTER_APPS_DOMAIN`. The chart requires this suffix even
+with the launcher disabled, because the Console session cookie is scoped to the
+shared parent domain. A retained `values.yaml` keeps an existing value.
 
 Generate the bootstrap administrator credentials once, then create the
 bootstrap Secret before Helm. The chart reads `admin-password` and
-`admin-service-key` from the Secret named by
-`bootstrap.credentials.secretName`, which `prepare-inputs` sets to
-`occ-bootstrap-credentials`. The service key is `occ_` plus 32 random bytes in
-unpadded base64url; the JSON file is the same key in the envelope the `occ` CLI
-reads.
+`admin-service-key` from the Secret named by `bootstrap.credentials.secretName`
+(`occ-bootstrap-credentials` from `prepare-inputs`). The service key is `occ_`
+plus 32 random bytes in unpadded base64url; the JSON file wraps that key for
+the `occ` CLI.
 
 ```bash
 python3 - "$OCC_INPUT_DIRECTORY" <<'PY'
@@ -338,19 +348,14 @@ oc apply -f deploy/rhoai/manifests/openshift/base/openshell/openshell-runtimecla
 oc apply -f deploy/rhoai/manifests/openshift/base/openshell/openshell-workspace-writer-clusterrole.yaml
 ```
 
-The fragment lists the Sandbox executables that may carry tool sources:
-
-```yaml
-drivers:
-  credential_gateway:
-    configuration:
-      toolBinaries:
-        - /usr/local/bin/gh
-        - /usr/libexec/git-core/git-remote-http
-```
-
-Without `toolBinaries`, OpenShell omits the `bearer-token` and OAuth2 tool-source
-types from its catalog. Add a path only when the runtime image contains it.
+OCC is the Installation's TokenService
+(`drivers.token_service: {id: occ, configuration: {}}`) and pushes provider
+profiles through the gateway. The `source-control` rule's `gh` and git helper
+binaries are plain network-policy entries and receive no credential. Remove
+the whole rule if you select OpenShell Git transport (`repository.openShell`):
+that selection refuses any `networkPolicies` endpoint on `github.com` or its
+subdomains at startup
+([protected OpenShell Git](../../docs/reference/repository-credentials/protected-openshell-git.md)).
 
 Create the four system Secrets once, then install OCC:
 
@@ -380,7 +385,7 @@ Do not scope the dry run with `-n openclaw-system`: the chart renders its own
 `oce-installation-secrets-*` Namespace, and a fixed namespace makes `oc apply`
 reject those objects.
 
-After the API Service and Pod are ready, apply the Console Route and verify it:
+After the API Service and Pod are ready, apply and verify the Console Route:
 
 ```bash
 oc apply -f "$OCC_INPUT_DIRECTORY/console-route.yaml"
@@ -391,8 +396,8 @@ curl --fail --silent --show-error "https://$OCC_CONSOLE_HOST/console/login" >/de
 ### 5. Grant tenant access
 
 Bootstrap queues Namespace provisioning immediately. Find the assigned
-Namespace and apply the exact worker and API grants without waiting, because a
-Namespace that has not converged within 15 minutes is marked `failed`.
+Namespace and apply the exact worker and API grants without waiting; a Namespace
+that has not converged within 15 minutes is marked `failed`.
 
 ```bash
 export OCC_NAMESPACE="$(oc get namespaces -l openclaw.dev/namespace -o json |
@@ -425,9 +430,9 @@ Enable private Envoy routing before creating an Agent. Follow
 
 Deploy one dedicated Codex Agent as described in
 [manifests/agents/README.md](manifests/agents/README.md). It selects the tenant,
-attaches it to the private Gateway, registers the model credential, creates the
-Configuration and Agent, grants the exact credential source and Gateway SCC, and
-verifies the deployment.
+attaches it to the Gateway, enrolls the model Source, creates the Configuration
+and Agent, saves its model network policy, admits the Gateway SCC, and verifies
+the deployment.
 
 After the Agent reports `succeeded`, add its authenticated Control UI Route:
 [Control UI Route](manifests/openshift/README.md#control-ui-route). Apply the
@@ -437,17 +442,16 @@ to the Configuration, redeploy the Agent, and complete a real model turn.
 ## Optional: OpenShell dashboard and Keycloak
 
 The dashboard adds a separate Keycloak login for inspecting the OpenShell
-gateway. OCC and Agent sign-in stay unchanged. Follow
+gateway; OCC and Agent sign-in stay unchanged. Follow
 [manifests/dashboard/README.md](manifests/dashboard/README.md) after OCC,
-OpenShell, and PostgreSQL are working.
+OpenShell, and PostgreSQL work.
 
 ## Optional: team-claw Keycloak login
 
 Run one Codex Agent with individual human profiles and a shared workspace. The
-helpers create local Keycloak accounts, an exact OIDC client, a membership
-group, and an OAuth2 Proxy Deployment in the Agent's gateway Namespace. They
-require an OCE release with explicit human Gateway identities; verify the
-release before you start.
+helpers create local Keycloak accounts, an OIDC client, a membership group, and
+an OAuth2 Proxy Deployment in the Agent's gateway Namespace. They require an
+OCE release with explicit human Gateway identities; verify the release first.
 
 Set the Agent identifiers and private paths:
 
@@ -472,13 +476,12 @@ export TEAM_ADMIN_USERS_FILE="$TEAM_LOGIN_DIRECTORY/administrators.json"
 ```
 
 Create a new realm with `deploy/rhoai/scripts/create-team-login-realm`. To reuse
-an existing application realm, run `deploy/rhoai/scripts/prepare-team-login-users`,
-then point `TEAM_USERS_FILE` at the generated `normalized-users.json` and use those
-normalized names in `TEAM_ADMIN_USERS_FILE`, then run
-`deploy/rhoai/scripts/add-agent-keycloak-client`. This order normalizes usernames
-before the client validates administrator membership. Each new account gets its
-own temporary password in `initial-passwords.json`; distribute each value to its
-owner and delete the file afterwards.
+an existing realm, run `deploy/rhoai/scripts/prepare-team-login-users`, point
+`TEAM_USERS_FILE` at the generated `normalized-users.json`, use those names in
+`TEAM_ADMIN_USERS_FILE`, then run `deploy/rhoai/scripts/add-agent-keycloak-client`;
+this normalizes usernames before the client validates administrator membership.
+Each new account gets a temporary password in `initial-passwords.json`; give it
+to its owner and delete the file.
 
 Then prepare and deploy the proxy:
 
@@ -499,10 +502,9 @@ the per-person identity grants.
 
 ## Other profiles
 
-- **OCC admin launcher**: keep `agentNativeAdmin` disabled during bootstrap.
-  After private routing is ready, enable it in the private values and
-  Installation and apply `manifests/native-admin/` for the HTTPS admin
-  endpoint.
+- **OCC admin launcher**: keep `agentNativeAdmin` disabled during bootstrap; after
+  private routing is ready, enable it in the private values and Installation and
+  apply `manifests/native-admin/`.
 - **OpenShell mTLS**: follow
   [openshell-mtls](manifests/openshift/openshell-mtls/README.md) to require
   client certificates, mount OCE's certificate, and keep the post-renderer on
@@ -517,23 +519,12 @@ the per-person identity grants.
 
 ## Upgrade
 
-Use the selected OCE release's upgrade workflow; do not reapply bootstrap.
-
-```bash
-deploy/rhoai/scripts/upgrade --help
-```
-
-The wrapper delegates to `$OCE_CHECKOUT/scripts/upgrade-production-images`.
-Follow [upgrading OCE on Kubernetes](../../docs/guides/deploy/production-upgrade.md)
-and keep the saved `images.env`, Installation Secret, database Secrets, and
-signing key across releases. When you use the dashboard or mTLS profile, pass
-their values and post-renderer to every gateway upgrade.
-
-**Known issue:** With Helm 4, `scripts/upgrade-production-images` can refuse with `the Helm release changed before submission` after it
-stops the API and worker, because Helm 4's `helm status` includes live resources. Affected versions can leave the
-Installation Secret switched with the old controller, so the console stays down until restoration. Use a Helm 3 binary first on
-`PATH` until openclaw/openclaw-enterprise#6593 lands and is synced here. To recover, first confirm with `helm history` that the release revision is unchanged (no other upgrade ran); then restore the Installation Secret from the run's
-evidence directory, then scale the API and worker back up.
+Use `occ installation upgrade` from the reviewed release checkout; do not
+reapply bootstrap. Follow [Upgrade the RHOAI deployment](UPGRADE.md) to
+resolve the published images, check out their source revision, render the
+owner-only profile with `deploy/rhoai/scripts/prepare-upgrade-profile`, then
+run `plan`, `migration check`, and `apply`. The CLI ships in current
+published releases (openclaw/openclaw-enterprise#6504).
 
 ## Verification
 
@@ -546,35 +537,32 @@ oc kustomize deploy/rhoai/manifests/openshift/openshell-mtls
 oc kustomize deploy/rhoai/manifests/widgets
 ```
 
-The advisory `Check RHOAI deployment assets` workflow runs the script tests,
-shell-check, manifest parsing, and Kustomize renders when this directory
-changes.
+The advisory `Check RHOAI deployment assets` workflow runs these checks when
+this directory changes.
 
 ## Limits
 
 - Example hostnames, IP addresses, and `${VARIABLE}` placeholders need private
-  deployment overrides. Keep credentials, kubeconfigs, and rendered overlays
-  outside this repository.
-- The PostgreSQL example runs one instance without backups or replicas. The
+  overrides; keep credentials, kubeconfigs, and rendered overlays outside the
+  repository.
+- The PostgreSQL example runs one instance without backups or replicas; the
   dashboard's Keycloak database inherits those limits.
 - The `occ-bootstrap-credentials` Secret and its source files grant both
   bootstrap administrator identities. The chart reads the Secret only on
-  installation, and editing it does not rotate credentials.
-- The plaintext OpenShell gateway is single-tenant. Labels are not an
-  authentication boundary; use the mTLS profile otherwise.
+  installation; editing it does not rotate credentials.
 - The storage class, node labels, DNS selectors, and router selectors assume
-  the profile described above. Adjust the private inputs for another cluster.
+  the profile above; adjust the private inputs for another cluster.
 - `prepare-inputs` records the router Pod addresses and the PostgreSQL primary
   address as snapshots. Run it once during bootstrap. After a node change,
   router restart, or database failover, run `prepare-inputs refresh` to update
   the discovered addresses and egress inputs without resetting routing,
-  approved API clients, the trusted-proxy preset, or admin-launcher settings.
-  It also removes the retired `agentNativeAdmin.sharedCookieDomain` and fills
-  an empty `agentNativeAdmin.domain`. Then apply the updated values, egress
-  inputs, and Installation Secret.
-- The widget preview certificate is a wildcard for the whole apps domain, so
-  the private CA can vouch for every host under it. Trust that CA only on the
-  clients that use previews.
+  approved API clients, the trusted-proxy preset, or admin-launcher settings;
+  it also fills an empty `agentNativeAdmin.domain`. Then apply the updated values,
+  `$OCC_INPUT_DIRECTORY/control-plane-kube-api-egress.yaml`, and the
+  Installation Secret.
+- The widget preview certificate is a wildcard for the whole apps domain; trust
+  its private CA only on clients that use previews.
 - The cert-manager and PostgreSQL operator subscriptions approve channel
-  upgrades automatically; approve and pin them as the Keycloak operator does if
-  unattended operator changes are not acceptable.
+  upgrades automatically; pin them with `installPlanApproval: Manual` and
+  approve only the selected CSV, as the Keycloak procedure does, if unattended
+  changes are not acceptable.

@@ -26,8 +26,10 @@ if [[ "$mode" == bootstrap ]]; then
   : "${OCC_ADMIN_EMAIL:?Set the bootstrap administrator email}"
   : "${CONTROLLER_IMAGE:?Set the controller image digest}"
   : "${RUNTIME_IMAGE:?Set the runtime image digest}"
-  [[ "$CONTROLLER_IMAGE" =~ @sha256:[a-f0-9]{64}$ ]]
-  [[ "$RUNTIME_IMAGE" =~ @sha256:[a-f0-9]{64}$ ]]
+  [[ "$CONTROLLER_IMAGE" =~ @sha256:[a-f0-9]{64}$ ]] ||
+    { echo "CONTROLLER_IMAGE must be an immutable @sha256 digest: $CONTROLLER_IMAGE" >&2; exit 1; }
+  [[ "$RUNTIME_IMAGE" =~ @sha256:[a-f0-9]{64}$ ]] ||
+    { echo "RUNTIME_IMAGE must be an immutable @sha256 digest: $RUNTIME_IMAGE" >&2; exit 1; }
 fi
 
 export OCC_CLUSTER_NAME
@@ -89,6 +91,9 @@ if [[ "$mode" == bootstrap ]]; then
       "clientAddressHeader":"x-forwarded-for"} |
     .cluster.cidrs = [strenv(API_SERVICE_CIDR)] + load(strenv(OCC_INPUT_DIRECTORY) + "/api-cidrs.json") |
     .controlPlane.nodeSelector = {"oce-role":"control"} |
+    # The null k8s-app is the Helm delete-default idiom: it removes the
+    # inherited k8s-app: kube-dns chart label so DNS peer selectors match
+    # OpenShift DNS pods. Do not "fix" it; see tests/test_prepare_inputs.py.
     .dns = {"namespace":"openshift-dns","podLabels":{
       "dns.operator.openshift.io/daemonset-dns":"default","k8s-app":null}}' \
     "$OCC_INPUT_DIRECTORY/values.yaml"

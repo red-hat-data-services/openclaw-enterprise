@@ -6,7 +6,6 @@ backend:
       insecureTransport: network-policy
     drivers:
       sandbox: openshell-sandbox
-      credential_gateway: openshell-credentials
 drivers:
   compute:
     configuration:
@@ -69,15 +68,31 @@ drivers:
                 ports: [443]
                 protocol: tcp
                 tls: skip
+              # gh resolves API operations (gh api, pr, repo clone) against this host.
+              - host: api.github.com
+                ports: [443]
+                protocol: tcp
+                tls: skip
+            # git HTTP helpers live under /usr/lib/git-core on Debian-based images
+            # and /usr/libexec/git-core on RPM-based runtimes; list both, as the
+            # controller's own git credential policy does.
             binaries:
               - path: /usr/bin/git
+              - path: /usr/local/bin/gh
+              - path: /usr/lib/git-core/git-remote-http
+              - path: /usr/lib/git-core/git-remote-https
+              - path: /usr/libexec/git-core/git-remote-http
+              - path: /usr/libexec/git-core/git-remote-https
       sandboxNamePrefix: os
-  credential_gateway:
-    id: openshell-credentials
-    configuration:
-      binaries:
-        - /app/node_modules/openclaw/node_modules/.pnpm/@openai+codex@0.164.0-linux-x64/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/bin/codex
-      # Executables that may carry tool sources, such as a GitHub token for gh.
-      toolBinaries:
-        - /usr/local/bin/gh
-        - /usr/libexec/git-core/git-remote-http
+  token_service:
+    id: occ
+    configuration: {}
+# Delegates the Agent-side model-egress addition the agents flow saves per Agent.
+# The bundled Codex executable is architecture-specific; add the aarch64 path on arm64.
+sandboxNetworkPolicyCeiling:
+  - id: codex-model-egress
+    binary: /app/node_modules/openclaw/node_modules/.pnpm/@openai+codex@0.164.0-linux-x64/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/bin/codex
+    host: api.openai.com
+    ports:
+      - from: 443
+        to: 443

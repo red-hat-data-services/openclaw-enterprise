@@ -1,0 +1,20 @@
+# Image pin overlay for saved gateway values snapshots: re-apply the
+# reviewed OpenShell image digests over a snapshot so one taken before an
+# image bump cannot pin an older line against a newer chart. Overlay only;
+# never install this file alone. The offline tests cross-check these digests
+# against openshell-gateway-values.yaml.
+gateway:
+  image:
+    registry: quay.io
+    repository: opendatahub/odh-openshell-gateway
+    digest: sha256:e4b89770ef55238cc45d9880614eda64b8ab9a76be5e6c81c63a350889eb0717
+sandboxRuntime:
+  image:
+    registry: quay.io
+    repository: opendatahub/odh-openshell-sandbox
+    digest: sha256:365d321345ea142a10d442f91bebeaf6d67dac4384b6dc29b4e72ada01a9b959
+supervisor:
+  image:
+    registry: quay.io
+    repository: opendatahub/odh-openshell-supervisor
+    digest: sha256:c2c8e9d3d19a1612074df0f637078064cff45b92d35c74b116a72fb503b3c1bc

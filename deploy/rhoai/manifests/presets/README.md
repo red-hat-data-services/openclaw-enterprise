@@ -14,11 +14,58 @@ instructions live in each template's initial `AGENTS.md`. These presets do not
 provision integrations, credentials, additional team agents, or workloads.
 
 These Presets authenticate with a model API key (`harnessAuth.method: api_key`).
-Kubernetes Compute delivers that key as a Secret environment variable, which the
-OpenShell Sandbox Driver rejects, so the Presets deploy only on an Installation
-whose Sandbox Driver supplies Secret environment variables. On the profile in
-this directory, create Agents with the credential-source procedure in
-[the Agent guide](../agents/README.md#register-the-model-credential) instead.
+On the profile in this directory, which selects the OCC TokenService, entering
+a new key when launching a Preset enrolls it as a static TokenService Source
+and saves the Agent as a draft; the Console does not deploy it. A Console-saved
+draft has no Configuration step, so take the tenant setup from
+[Select the tenant](../agents/README.md#select-the-tenant) (including the
+routing-label attachment), but set `OCC_NAMESPACE` to the Namespace you
+selected in the Console; that snippet's `default` selection is only an
+example. Then derive the identifiers the remaining steps use:
+
+```bash
+export OCC_NAMESPACE='<Namespace ID selected in the Console>'
+export TENANT_NAMESPACE="$(oc get namespaces \
+  -l "openclaw.dev/namespace=$OCC_NAMESPACE" -o json |
+  jq -er '.items | if length == 1 then .[0].metadata.name
+    else error("expected one tenant namespace") end')"
+export GATEWAY_NAMESPACE="$TENANT_NAMESPACE"
+export AGENT_NAME='<Agent display name used in the Console>'
+export AGENT_ID="$(deploy/rhoai/bin/occ agent list -o json |
+  jq -er --arg name "$AGENT_NAME" '[.[] | select(.name == $name)] |
+    if length == 1 then .[0].id else error("expected one matching Agent") end')"
+export CONFIGURATION_ID="$(deploy/rhoai/bin/occ agent get "$AGENT_ID" -o json |
+  jq -r .configurationId)"
+export AGENT_SA="agent-$(printf '%s' "$AGENT_ID" | sha256sum |
+  awk '{print substr($1, 1, 12)}')"
+export GATEWAY_SA="gateway-${AGENT_SA#agent-}"
+```
+
+Complete
+[Allow the model endpoint](../agents/README.md#allow-the-model-endpoint-for-the-agent),
+[Admit the Agent Gateway](../agents/README.md#admit-the-agent-gateway), and
+[Deploy and verify](../agents/README.md#deploy-and-verify) before use; the
+Control UI Route procedure needs the `CONFIGURATION_ID` derived above. The
+new-key path needs `secret:create` and `credential_source:create` on the
+Namespace, and the preset chooser disables new-key entry for a caller denied
+`operate` on any readable Secret. The preset flow offers no Source picker, so
+such a caller cannot use these Presets: follow the manual flow from
+[Register the model credential](../agents/README.md#register-the-model-credential)
+through
+[Create the Configuration and Agent](../agents/README.md#create-the-configuration-and-agent),
+which binds the enrolled Source directly. The Control UI Route procedure the
+deploy steps lead into supports one Route per tenant Namespace.
+Secret-backed bindings are refused before the Agent is saved
+("Enroll this model credential as a TokenService Source and select it for
+Harness authentication"): the Console's provisioning request, and direct API
+Agent creation, both reject a Secret binding at submission. A preset file also
+cannot declare a `credential_source` binding directly: preset admission
+accepts only `runtime`, `api_key`, and `codex_pat` harness authentication, and
+seeding such a template stops controller startup before the API is created.
+Remove an invalid preset file, its `presets.files` entry, and its projected
+key from the api, worker, and initialization mount patches in the same update:
+a `presets.files` entry without its file, or a projected key without its file,
+each stops startup.
 
 ## Install across Namespaces
 

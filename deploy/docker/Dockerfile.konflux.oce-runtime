@@ -563,6 +563,8 @@ COPY deploy/runtime/managed-mcp-policy/ /usr/local/lib/oce/platform-plugins/oce-
 
 COPY --from=openclaw-runtime-assets /out/ /opt/oce/runtime/
 COPY --chmod=0444 deploy/runtime/openshell-bootstrap.cjs /opt/oce/runtime/openshell-bootstrap.cjs
+COPY --chmod=0444 deploy/runtime/openshell-worker.gitconfig /usr/local/lib/oce/openshell-worker.gitconfig
+COPY --chmod=0555 deploy/runtime/openshell-git-credential.cjs /usr/local/lib/oce/openshell-git-credential.cjs
 RUN install -d -m 1777 -o root -g root /opt/oce/managed
 COPY --from=openclaw-runtime-assets /source/ /app/node_modules/openclaw/
 # Both gateway plugins and the Dedicated Harness resolve the same pinned Codex.
@@ -615,7 +617,12 @@ RUN --mount=type=bind,source=deploy/runtime/repository-credentials/github-reposi
 RUN node -e 'const fs = require("node:fs"); const provenance = JSON.parse(fs.readFileSync("/opt/oce/runtime/provenance.json", "utf8")); if (!/^[a-f0-9]{40}$/.test(process.argv[1]) || provenance.commit !== process.argv[1]) throw new Error("OpenClaw label must match packaged provenance");' "${OPENCLAW_COMMIT}" \
     && node -e 'const fs = require("node:fs"); const revision = process.argv[1]; if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error("Invalid OCE build revision"); fs.writeFileSync("/opt/oce/runtime/build.json", JSON.stringify({commit: revision}));' "${OCE_COMMIT}"
 
+USER node
+# The runtime user can read the worker Git configuration and run the credential
+# helper, but cannot change either.
+RUN cd /usr/local/lib/oce && test ! -w . \
+    && test -r openshell-worker.gitconfig && test ! -w openshell-worker.gitconfig \
+    && test -x openshell-git-credential.cjs && test ! -w openshell-git-credential.cjs
+
 # Keep this last: a client change then rebuilds only this layer.
 COPY --from=repository-client-build /oce/.build/runtime-client/ /
-
-USER node
