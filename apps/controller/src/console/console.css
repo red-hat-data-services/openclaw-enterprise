@@ -305,6 +305,9 @@ button[aria-busy="true"] {
   outline: var(--focus-ring);
   outline-offset: var(--focus-offset);
 }
+:where(button:focus-visible) {
+  scroll-margin-block: var(--space-1);
+}
 .focus-inset:focus-visible,
 .focus-inset:has(input:focus-visible),
 .agent-tabs button:focus-visible,
@@ -3577,6 +3580,9 @@ input.control-unavailable:not([type="checkbox"], [type="radio"]) {
 .credential-source-catalog .oauth-catalog-table thead th:last-child {
   width: 8rem;
 }
+.credential-source-catalog .oauth-catalog-table:has(.resource-row-actions) thead th:last-child {
+  width: 20rem;
+}
 .connection-template-catalog .oauth-catalog-table thead th:nth-last-child(2) {
   width: 6rem;
 }
@@ -3587,6 +3593,11 @@ input.control-unavailable:not([type="checkbox"], [type="radio"]) {
   width: max-content;
   margin-inline-start: auto;
   align-items: center;
+}
+.credential-source-catalog .oauth-catalog-table .resource-row-actions {
+  width: auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 @container oauth-catalog (max-width: 46rem) {
