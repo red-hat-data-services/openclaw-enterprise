@@ -350,6 +350,28 @@ class PrepareInputsTests(unittest.TestCase):
             )
             self.assertNotIn("k8s-app", selector)
 
+    def test_image_pins_overlay_matches_gateway_values(self):
+        # The dashboard and mTLS procedures pass openshell-image-pins.yaml over
+        # a saved gateway values snapshot; the overlay must carry exactly the
+        # three reviewed image references and nothing else, or it would pin an
+        # image from the wrong repository or an unreviewed component. yq parses
+        # the YAML: the documented workstation tools include no Python YAML
+        # module.
+        def images(path):
+            rendered = subprocess.run(
+                ["yq", "-o=json", ".", str(path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return json.loads(rendered.stdout)
+
+        values = images(RHOAI / "manifests/openshift/openshell-gateway-values.yaml")
+        pins = images(RHOAI / "manifests/openshift/openshell-image-pins.yaml")
+        self.assertEqual(sorted(pins), ["gateway", "sandboxRuntime", "supervisor"])
+        for component in ("gateway", "sandboxRuntime", "supervisor"):
+            self.assertEqual(values[component]["image"], pins[component]["image"])
+
 
 if __name__ == "__main__":
     unittest.main()

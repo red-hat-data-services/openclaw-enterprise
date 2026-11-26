@@ -29,9 +29,10 @@ gateway keeps its current transport until the cutover.
 
 ```bash
 helm template openshell-gateway \
-  "$OCC_INPUT_DIRECTORY/openshell-charts/helm-chart-0.1.6.tgz" \
+  "$OCC_INPUT_DIRECTORY/openshell-charts/openshell-0.1.10.tgz" \
   -n openshell-system --is-upgrade --set agentSandbox.preflight.enabled=false \
   -f "$DASHBOARD_INPUT_DIRECTORY/gateway-values-before.yaml" \
+  -f deploy/rhoai/manifests/openshift/openshell-image-pins.yaml \
   -f deploy/rhoai/manifests/openshift/openshell-mtls/gateway-values.yaml \
   --post-renderer deploy/rhoai/scripts/openshell-mtls-post-render \
   > "$DASHBOARD_INPUT_DIRECTORY/gateway-mtls-rendered.yaml"
@@ -124,10 +125,11 @@ users, then upgrade OCE and the dashboard in the same window.
 
 ```bash
 helm upgrade openshell-gateway \
-  "$OCC_INPUT_DIRECTORY/openshell-charts/helm-chart-0.1.6.tgz" \
+  "$OCC_INPUT_DIRECTORY/openshell-charts/openshell-0.1.10.tgz" \
   --namespace openshell-system \
   -f "$DASHBOARD_INPUT_DIRECTORY/gateway-values-before.yaml" \
   -f "$DASHBOARD_INPUT_DIRECTORY/gateway-oidc-values.yaml" \
+  -f deploy/rhoai/manifests/openshift/openshell-image-pins.yaml \
   -f deploy/rhoai/manifests/openshift/openshell-mtls/gateway-values.yaml \
   --post-renderer deploy/rhoai/scripts/openshell-mtls-post-render \
   --wait --timeout 7m

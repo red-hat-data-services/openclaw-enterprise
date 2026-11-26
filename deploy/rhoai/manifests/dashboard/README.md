@@ -127,14 +127,21 @@ gateway remains private behind its ingress policy. The rolling restart briefly
 interrupts gateway connections.
 
 ```bash
+# A failed or empty snapshot must stop the upgrade: chart defaults would
+# replace the reviewed profile. The image pin overlay re-applies the
+# reviewed image digests after the snapshot, so a snapshot taken before an
+# image bump cannot pin an older line.
 helm get values openshell-gateway -n openshell-system -o yaml \
-  > "$DASHBOARD_INPUT_DIRECTORY/gateway-values-before.yaml"
-helm upgrade openshell-gateway \
-  "$OCC_INPUT_DIRECTORY/openshell-charts/helm-chart-0.1.6.tgz" \
-  --namespace openshell-system \
-  -f "$DASHBOARD_INPUT_DIRECTORY/gateway-values-before.yaml" \
-  -f "$DASHBOARD_INPUT_DIRECTORY/gateway-oidc-values.yaml" \
-  --wait --timeout 7m
+  > "$DASHBOARD_INPUT_DIRECTORY/gateway-values-before.yaml" &&
+  test -s "$DASHBOARD_INPUT_DIRECTORY/gateway-values-before.yaml" &&
+  yq -e '.' "$DASHBOARD_INPUT_DIRECTORY/gateway-values-before.yaml" >/dev/null &&
+  helm upgrade openshell-gateway \
+    "$OCC_INPUT_DIRECTORY/openshell-charts/openshell-0.1.10.tgz" \
+    --namespace openshell-system \
+    -f "$DASHBOARD_INPUT_DIRECTORY/gateway-values-before.yaml" \
+    -f "$DASHBOARD_INPUT_DIRECTORY/gateway-oidc-values.yaml" \
+    -f deploy/rhoai/manifests/openshift/openshell-image-pins.yaml \
+    --wait --timeout 7m
 ```
 
 Include `gateway-oidc-values.yaml` in later gateway upgrades so an OCE-only

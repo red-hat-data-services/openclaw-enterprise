@@ -128,13 +128,31 @@ oc apply -f "$OCC_INPUT_DIRECTORY/agent-sandbox-v0.5.2.yaml"
 oc -n agent-sandbox-system rollout status \
   deployment/agent-sandbox-controller --timeout=5m
 
-helm pull oci://ghcr.io/nvidia/openshell/helm-chart \
-  --version 0.1.6 --destination "$OCC_INPUT_DIRECTORY/openshell-charts"
+# The gateway chart is packaged from the same midstream release as the
+# images: the rhaiv line carries chart changes that are not in the upstream
+# chart, so pulling the upstream chart would mix lines. The chart is named
+# "openshell" from 0.1.9 on (it was "helm-chart" before). Fetch the source
+# archive by its immutable commit, not the movable tag, and verify the
+# recorded checksum like every other downloaded artifact.
+export OPENSHELL_CHART_COMMIT=c2775b8df05619cdd57cb354ea8cd829ec79ee40
+rm -f "$OCC_INPUT_DIRECTORY/openshell-charts/openshell-0.1.10.tgz"
+curl -fL "https://github.com/opendatahub-io/openshell/archive/${OPENSHELL_CHART_COMMIT}.tar.gz" \
+  -o "$OCC_INPUT_DIRECTORY/openshell-${OPENSHELL_CHART_COMMIT}.tar.gz" &&
+  printf '%s  %s\n' \
+    2dfc1521437c0b16175b35056cf385ffdce96203c2416932f0225406c4d96906 \
+    "$OCC_INPUT_DIRECTORY/openshell-${OPENSHELL_CHART_COMMIT}.tar.gz" |
+    sha256sum -c &&
+  tar -xzf "$OCC_INPUT_DIRECTORY/openshell-${OPENSHELL_CHART_COMMIT}.tar.gz" \
+    -C "$OCC_INPUT_DIRECTORY" "openshell-${OPENSHELL_CHART_COMMIT}/deploy/helm/openshell" &&
+  sed -i 's/^version: 0.0.0/version: 0.1.10/; s/^appVersion: "0.0.0"/appVersion: "0.1.10"/' \
+    "$OCC_INPUT_DIRECTORY/openshell-${OPENSHELL_CHART_COMMIT}/deploy/helm/openshell/Chart.yaml" &&
+  yq -e '.version == "0.1.10" and .appVersion == "0.1.10"' \
+    "$OCC_INPUT_DIRECTORY/openshell-${OPENSHELL_CHART_COMMIT}/deploy/helm/openshell/Chart.yaml" &&
+  helm package "$OCC_INPUT_DIRECTORY/openshell-${OPENSHELL_CHART_COMMIT}/deploy/helm/openshell" \
+    --destination "$OCC_INPUT_DIRECTORY/openshell-charts"
 helm pull oci://ghcr.io/nvidia/openshell/openshell-workspace \
   --version 0.1.6 --destination "$OCC_INPUT_DIRECTORY/openshell-charts"
 printf '%s  %s\n' \
-  0533ecf84f777954aaf6113a0813fbc9781ed2a5e6574fb807cebe9a818a1bd4 \
-  "$OCC_INPUT_DIRECTORY/openshell-charts/helm-chart-0.1.6.tgz" \
   10452d43dcf24ff795239dc5daa0fffd509a16ff57739019f0ec084bb7ca37c5 \
   "$OCC_INPUT_DIRECTORY/openshell-charts/openshell-workspace-0.1.6.tgz" \
   | sha256sum -c
@@ -143,7 +161,7 @@ oc create namespace openshell-system --dry-run=client -o yaml | oc apply -f -
 oc apply -f deploy/rhoai/manifests/openshift/base/openshell/openshell-gateway-network-policy.yaml
 oc apply -f deploy/rhoai/manifests/openshift/base/openshell/control-plane-openshell-egress.yaml
 helm upgrade --install openshell-gateway \
-  "$OCC_INPUT_DIRECTORY/openshell-charts/helm-chart-0.1.6.tgz" \
+  "$OCC_INPUT_DIRECTORY/openshell-charts/openshell-0.1.10.tgz" \
   --namespace openshell-system \
   -f deploy/rhoai/manifests/openshift/openshell-gateway-values.yaml \
   --wait --timeout 7m
