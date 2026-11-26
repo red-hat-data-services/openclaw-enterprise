@@ -50,7 +50,7 @@ oc whoami --show-server
 | `manifests/widgets/`      | Dashboard widget preview Route and certificate.                                                                |
 | `manifests/agents/`       | Agent deployment procedure.                                                                                    |
 | `manifests/presets/`      | Installation-wide team Agent Presets and their API, worker, and Job mount patches.                             |
-| `scripts/`                | Build, prepare, resolve, upgrade, validate, and team-login helpers; see [SCRIPTS.md](SCRIPTS.md).              |
+| `scripts/`                | Build, prepare, resolve, validate, and team-login helpers; see [SCRIPTS.md](SCRIPTS.md).                       |
 | `tests/`                  | Offline tests for the scripts.                                                                                 |
 
 The Kustomize stages are documented in
@@ -303,11 +303,6 @@ credentials only on a fresh install and never returns them, so keep the files.
 instead; see
 [production installation](../../docs/guides/deploy/production-installation.md#choose-bootstrap-credential-preparation).
 
-These steps assume the fresh `installation.yaml` a `prepare-inputs` bootstrap
-writes; a retained file keeps retired driver keys through the deep merge, so
-remove them per
-[upgrading credentials](../../docs/guides/deploy/production-upgrade-credentials.md) first.
-
 Render the pinned workspace chart and merge its four resources, the provider
 harness address, and the runtime class into the Installation:
 
@@ -506,27 +501,12 @@ the per-person identity grants.
 
 ## Upgrade
 
-Use the selected OCE release's upgrade workflow; do not reapply bootstrap.
-
-```bash
-deploy/rhoai/scripts/upgrade --help
-```
-
-The wrapper delegates to `$OCE_CHECKOUT/scripts/upgrade-production-images`.
-Follow [upgrading OCE on Kubernetes](../../docs/guides/deploy/production-upgrade.md)
-and keep `images.env`, the Installation Secret, database Secrets, and the
-signing key across releases. For the dashboard or mTLS profile, pass their
-values and post-renderer to every gateway upgrade.
-
-**Known issue:** With Helm 4, `scripts/upgrade-production-images` can refuse with
-`the Helm release changed before submission` after it stops the API and worker,
-because Helm 4's `helm status` includes live resources. Affected versions can
-leave the Installation Secret switched with the old controller and the console
-down. Use a Helm 3 binary first on `PATH` until
-openclaw/openclaw-enterprise#6593 lands and is synced here. To recover, confirm
-with `helm history` that the release revision is unchanged (no other upgrade
-ran), restore the Installation Secret from the run's evidence directory, then
-scale the API and worker back up.
+Use `occ installation upgrade` from the reviewed release checkout; do not
+reapply bootstrap. Follow [Upgrade the RHOAI deployment](UPGRADE.md) to
+resolve the published images, check out their source revision, render the
+owner-only profile with `deploy/rhoai/scripts/prepare-upgrade-profile`, then
+run `plan`, `migration check`, and `apply`. The CLI ships in current
+published releases (openclaw/openclaw-enterprise#6504).
 
 ## Verification
 
@@ -559,8 +539,7 @@ this directory changes.
   router restart, or database failover, run `prepare-inputs refresh` to update
   the discovered addresses and egress inputs without resetting routing,
   approved API clients, the trusted-proxy preset, or admin-launcher settings;
-  it also removes the retired `agentNativeAdmin.sharedCookieDomain` and fills an
-  empty `agentNativeAdmin.domain`. Then apply the updated values,
+  it also fills an empty `agentNativeAdmin.domain`. Then apply the updated values,
   `$OCC_INPUT_DIRECTORY/control-plane-kube-api-egress.yaml`, and the
   Installation Secret.
 - The widget preview certificate is a wildcard for the whole apps domain; trust

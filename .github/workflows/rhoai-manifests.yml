@@ -19,6 +19,7 @@ on:
       - deploy/helm/openclaw-enterprise/**
       - deploy/runtime/Dockerfile
       - deploy/runtime/openclaw-source.json
+      - scripts/upgrade-production
       - scripts/upgrade-production-images
   push:
     branches: [main]
@@ -32,6 +33,7 @@ on:
       - deploy/helm/openclaw-enterprise/**
       - deploy/runtime/Dockerfile
       - deploy/runtime/openclaw-source.json
+      - scripts/upgrade-production
       - scripts/upgrade-production-images
 
 concurrency:
@@ -91,9 +93,13 @@ jobs:
         run: |
           for path in \
             apps/controller/src/composition/installation-config.ts \
+            apps/controller/src/drivers/sandbox/openshell-codex-artifacts.ts \
             cmd/occ \
             deploy/examples/production \
+            deploy/helm/openclaw-enterprise \
+            deploy/runtime/Dockerfile \
             deploy/runtime/openclaw-source.json \
+            scripts/upgrade-production \
             scripts/upgrade-production-images; do
             test -e "$path" || { echo "missing OCE path: $path" >&2; exit 1; }
           done

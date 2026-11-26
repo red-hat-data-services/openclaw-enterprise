@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# Render the owner-only profile for occ installation upgrade; nothing reaches the cluster.
+set -euo pipefail
+umask 077
+: "${OCC_INPUT_DIRECTORY:?Set an existing private input directory}"
+: "${OCE_CHECKOUT:?Set the OCE source checkout}"
+[[ -d "$OCE_CHECKOUT" ]] ||
+  { echo "OCE_CHECKOUT is not a directory: $OCE_CHECKOUT; set it to the reviewed release checkout." >&2; exit 1; }
+[[ -d "$OCC_INPUT_DIRECTORY" ]] ||
+  { echo "OCC_INPUT_DIRECTORY is not a directory: $OCC_INPUT_DIRECTORY; create it and run deploy/rhoai/scripts/prepare-inputs." >&2; exit 1; }
+repository=$(cd "$(dirname "$0")/.." && pwd -P)
+# Evidence and profiles default to a private directory beside the profile, so
+# inputs must stay outside the whole tooling checkout, not just deploy/rhoai.
+# Unset Git environment overrides first: an inherited GIT_WORK_TREE would
+# redirect the toplevel lookup away from this checkout.
+tooling_root=$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+  git -C "$repository" rev-parse --show-toplevel 2>/dev/null) ||
+  tooling_root=$(cd "$repository/../.." && pwd -P)
+source_checkout=$(cd "$OCE_CHECKOUT" && pwd -P)
+inputs=$(cd "$OCC_INPUT_DIRECTORY" && pwd -P)
+case "$inputs/" in
+  "$tooling_root/"*|"$repository/"*|"$source_checkout/"*) echo 'Keep cluster inputs outside both repositories.' >&2; exit 1 ;;
+esac
+# The rendered profile and each run's evidence stay beside the inputs, and
+# images.env feeds the profile: no other local user may write what this
+# script reads. The documented flow keeps the directory 700 and operator-owned;
+# find -perm stays portable where GNU stat is unavailable.
+if find "$inputs" -maxdepth 0 \( -perm -g+w -o -perm -o+w \) | grep -q . || ! [[ -O "$inputs" ]]; then
+  echo "OCC_INPUT_DIRECTORY must be owner-only and owned by the operator: $OCC_INPUT_DIRECTORY; use chmod 700." >&2
+  exit 1
+fi
+
+# The upgrade CLI refuses a checkout without its translator, so fail here with the reason.
+if [[ ! -f "$source_checkout/scripts/upgrade-production" ]]; then
+  echo 'The reviewed release checkout has no upgrade CLI translator (scripts/upgrade-production).' >&2
+  echo 'Use a current published release, whose checkout provides the upgrade CLI (openclaw/openclaw-enterprise#6504).' >&2
+  exit 1
+fi
+occ=${OCC_BIN:-$repository/bin/occ}
+[[ -f "$occ" && -x "$occ" ]] ||
+  { echo "Missing executable $occ; run deploy/rhoai/scripts/build-occ first." >&2; exit 1; }
+occ=$(cd "$(dirname "$occ")" && pwd -P)/$(basename "$occ")
+
+for name in kubeconfig values.yaml installation.yaml; do
+  [[ -f "$inputs/$name" ]] ||
+    { echo "Missing $name in OCC_INPUT_DIRECTORY; point it at the directory prepare-inputs wrote." >&2; exit 1; }
+done
+for name in images.env published-images.json; do
+  [[ -f "$inputs/$name" ]] ||
+    { echo "Missing $name in OCC_INPUT_DIRECTORY; run deploy/rhoai/scripts/resolve-images first." >&2; exit 1; }
+done
+
+context=$(yq -er '.current-context' "$inputs/kubeconfig" 2>/dev/null) ||
+  { echo 'The saved kubeconfig has no current-context; save it with oc config view --raw --minify --flatten.' >&2; exit 1; }
+[[ -n "$context" ]] ||
+  { echo 'The saved kubeconfig has an empty current-context; save it with oc config view --raw --minify --flatten.' >&2; exit 1; }
+CONTEXT=$context yq -e '
+  .contexts | select(type == "!!seq" and length == 1 and .[0].name == strenv(CONTEXT))' \
+  "$inputs/kubeconfig" >/dev/null 2>&1 ||
+  { echo "The saved kubeconfig must contain exactly one context, named by current-context $context; save it with oc config view --raw --minify --flatten." >&2; exit 1; }
+
+# Read the receipt once: resolve-images publishes the receipt and images.env
+# together, so one snapshot keeps oceCommit and the component digests from the
+# same run even if a concurrent run replaces them during this render.
+published=$(<"$inputs/published-images.json") ||
+  { echo 'Cannot read published-images.json; run deploy/rhoai/scripts/resolve-images first.' >&2; exit 1; }
+revision=$(jq -er '.oceCommit' <<<"$published") ||
+  { echo 'published-images.json has no oceCommit; run deploy/rhoai/scripts/resolve-images first.' >&2; exit 1; }
+[[ "$revision" =~ ^[a-f0-9]{40}$ ]] ||
+  { echo "published-images.json has no full OCE commit: $revision" >&2; exit 1; }
+head_revision=$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+  git -C "$source_checkout" rev-parse HEAD 2>/dev/null) ||
+  { echo "Cannot read the revision of $source_checkout; set OCE_CHECKOUT to the reviewed release checkout." >&2; exit 1; }
+[[ "$head_revision" == "$revision" ]] || {
+  echo "OCE_CHECKOUT is at $head_revision, but the selected images were built from $revision." >&2
+  echo 'Check out the published revision in OCE_CHECKOUT before rendering the profile.' >&2
+  exit 1
+}
+
+enabled_type=$(yq -r '.repositoryCredentials.enabled | tag' "$inputs/values.yaml" 2>/dev/null) ||
+  { echo "Cannot parse $inputs/values.yaml; regenerate it with deploy/rhoai/scripts/prepare-inputs." >&2; exit 1; }
+case "$enabled_type" in
+  '!!null') ;;
+  '!!bool')
+    enabled=$(yq -r '.repositoryCredentials.enabled' "$inputs/values.yaml") ||
+      { echo "Cannot parse $inputs/values.yaml; regenerate it with deploy/rhoai/scripts/prepare-inputs." >&2; exit 1; }
+    # The glob form keeps Bash 3 compatibility; ${enabled,,} needs Bash 4.
+    if [[ "$enabled" == [Tt][Rr][Uu][Ee] ]]; then
+      echo 'values.yaml enables repositoryCredentials, which requires an images.broker digest this profile cannot supply;' >&2
+      echo 'RHOAI publishes no broker image. Keep repositoryCredentials.enabled false for this flow.' >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "values.yaml repositoryCredentials.enabled must be a YAML boolean, but reads as $enabled_type;" >&2
+    echo 'Helm treats any non-empty value as true, which enables the broker this profile cannot supply. Use unquoted false.' >&2
+    exit 1
+    ;;
+esac
+
+# Read images.env as data, never as shell: the digests are cross-checked
+# against the receipt below, and parsing the assignment lines cannot execute
+# anything the file contains. A missing assignment stays empty, so a partial
+# file must not inherit a stale export from the operator's shell.
+read_image_assignment() {
+  local name=$1 value
+  # Only the resolve-images assignment lines are accepted; any other
+  # content makes the whole file unusable rather than a partial read.
+  if grep -qvE '^export (CONTROLLER_IMAGE|RUNTIME_IMAGE)=' "$inputs/images.env" 2>/dev/null; then
+    return 1
+  fi
+  value=$(sed -n "s/^export ${name}=//p" "$inputs/images.env" 2>/dev/null) || return 1
+  value=$(tail -n 1 <<<"$value")
+  # A quoted value must be balanced; a stray quote means the file is not the
+  # resolve-images output, not a value to strip characters from.
+  case $value in
+    "'"*"'") value=${value#\'}; value=${value%\'} ;;
+    "'"*|*"'" ) return 1 ;;
+    *) ;;
+  esac
+  printf '%s\n' "$value"
+}
+controller_image=$(read_image_assignment CONTROLLER_IMAGE) ||
+  { echo 'Cannot read images.env; run deploy/rhoai/scripts/resolve-images first.' >&2; exit 1; }
+runtime_image=$(read_image_assignment RUNTIME_IMAGE) ||
+  { echo 'Cannot read images.env; run deploy/rhoai/scripts/resolve-images first.' >&2; exit 1; }
+[[ "$controller_image" =~ @sha256:[a-f0-9]{64}$ ]] ||
+  { echo 'images.env has no immutable CONTROLLER_IMAGE digest; run deploy/rhoai/scripts/resolve-images first.' >&2; exit 1; }
+[[ "$runtime_image" =~ @sha256:[a-f0-9]{64}$ ]] ||
+  { echo 'images.env has no immutable RUNTIME_IMAGE digest; run deploy/rhoai/scripts/resolve-images first.' >&2; exit 1; }
+
+# resolve-images writes both files together for a both-components run, so a
+# digest from a hand-edited images.env must not contradict the receipt read
+# above, and a receipt missing a component comes from hand assembly.
+for component in controller runtime; do
+  case "$component" in
+    controller) variable=CONTROLLER_IMAGE; image=$controller_image ;;
+    runtime) variable=RUNTIME_IMAGE; image=$runtime_image ;;
+  esac
+  published_image=$(jq -r --arg component "$component" '.[$component].image // empty' <<<"$published")
+  [[ -n "$published_image" ]] ||
+    { echo "published-images.json has no $component.image; run deploy/rhoai/scripts/resolve-images first." >&2; exit 1; }
+  [[ "$published_image" == "$image" ]] ||
+    { echo "images.env $variable ($image) disagrees with published-images.json $component.image ($published_image); rerun deploy/rhoai/scripts/resolve-images." >&2; exit 1; }
+done
+
+# A controller-only upgrade selects a runtime digest the Installation already
+# runs in both slots; upgrade-production-images refuses that pair. Omit the
+# runtime image then so the plan keeps the installed Agent revisions. Unreadable
+# or absent slots keep it, because the pair is not proven unchanged.
+include_runtime=1
+if installation_images=$(yq -o=json '.drivers.compute.configuration.images' "$inputs/installation.yaml" 2>/dev/null); then
+  installation_gateway=$(jq -r '(.gateway? // "")' <<<"$installation_images")
+  installation_agent=$(jq -r '(.agent? // "")' <<<"$installation_images")
+  if [[ "$installation_gateway" == "$runtime_image" && "$installation_agent" == "$runtime_image" ]]; then
+    include_runtime=0
+  fi
+fi
+
+# Render beside the other inputs so the final rename replaces atomically.
+profile=$(mktemp "$inputs/upgrade-profile.json.XXXXXX")
+trap 'rm -f "$profile"' EXIT
+jq -n \
+  --arg context "$context" \
+  --arg installationDirectory "$inputs" \
+  --arg sourceRevision "$revision" \
+  --arg occ "$occ" \
+  --arg controller "$controller_image" \
+  --arg runtime "$runtime_image" \
+  --argjson includeRuntime "$include_runtime" \
+  '{kubeconfig:"kubeconfig", context:$context, namespace:"openclaw-system", release:"oce",
+    installationDirectory:$installationDirectory, sourceRevision:$sourceRevision, occ:$occ,
+    images:({controller:$controller} + (if $includeRuntime == 1 then {runtime:$runtime} else {} end))}' > "$profile"
+chmod 600 "$profile"
+if [[ -e "$inputs/upgrade-profile.json" && ! -f "$inputs/upgrade-profile.json" ]]; then
+  echo "Refusing to replace $inputs/upgrade-profile.json: it is not a regular file." >&2
+  exit 1
+fi
+mv "$profile" "$inputs/upgrade-profile.json"
+
+printf 'Rendered the owner-only profile %s for OCE %s from the checkout at %s.\n' \
+  "$inputs/upgrade-profile.json" "$revision" "$head_revision"
+printf 'No cluster access was needed.\n'
+printf 'Next: (cd %q && %q installation upgrade plan --profile %q)\n' \
+  "$source_checkout" "$occ" "$inputs/upgrade-profile.json"
