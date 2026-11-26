@@ -32,7 +32,7 @@ export TENANT_NAMESPACE="$(oc get namespaces \
 export GATEWAY_NAMESPACE="$TENANT_NAMESPACE"
 export AGENT_NAME='<Agent display name used in the Console>'
 export AGENT_ID="$(deploy/rhoai/bin/occ agent list -o json |
-  jq -er --arg name "$AGENT_NAME" '.[] | select(.name == $name) |
+  jq -er --arg name "$AGENT_NAME" '[.[] | select(.name == $name)] |
     if length == 1 then .[0].id else error("expected one matching Agent") end')"
 export CONFIGURATION_ID="$(deploy/rhoai/bin/occ agent get "$AGENT_ID" -o json |
   jq -r .configurationId)"
