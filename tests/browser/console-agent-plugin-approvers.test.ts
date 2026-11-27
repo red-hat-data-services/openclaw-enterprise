@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
-import type { Locator, Page, Response } from "playwright";
+import type { Locator, Page, Response, Route } from "playwright";
 import { responseTo } from "./console-action-helpers.ts";
 import type { PluginFieldCatalog } from "../../apps/controller/src/console/agents/plugin-fields.mjs";
 import { OpenClawController, type PlatformStateStore } from "../../packages/occ/src/index.ts";
@@ -33,6 +33,7 @@ import {
   newPage,
   nextFrames,
   pathRequests,
+  settlePageRequests,
   settledView,
   statusTone,
   waitForEnabled,
@@ -185,7 +186,7 @@ test("A dedicated OpenClaw Agent can enable and disable Google Workspace without
   catalog.release();
 });
 
-test("A dedicated Agent with empty configuration can browse the default OpenClaw catalog", async (t) => {
+async function defaultCatalogAgent(t: TestContext) {
   const { fixture, namespace: namespaceValue }: { fixture: Fixture; namespace: unknown } =
     await createReadyConsoleNamespace(t, "Default plugin catalog");
   const namespace = entity(namespaceValue);
@@ -207,27 +208,174 @@ test("A dedicated Agent with empty configuration can browse the default OpenClaw
       },
     ),
   );
-  const catalogUrl = new URL(
-    `/namespaces/${namespace.id}/agents/${agent.id}/plugins`,
-    fixture.origin,
-  ).href;
+  const catalogPath = `/namespaces/${namespace.id}/agents/${agent.id}/plugins`;
+  const catalogUrl = new URL(catalogPath, fixture.origin).href;
+  return { fixture, namespace, agent, catalogPath, catalogUrl };
+}
+
+const workspaceQuery = "Workspace";
+
+test("A dedicated Agent with empty configuration can browse the default OpenClaw catalog", async (t) => {
+  const { fixture, namespace, agent, catalogPath, catalogUrl } = await defaultCatalogAgent(t);
   const { page } = await newPage(t, fixture, { browser });
-  await Promise.all([
+  const [, catalog] = await Promise.all([
     responseTo(page, "GET", `${catalogUrl}/capabilities`).then((response) =>
       assert.equal(response.status(), 200, "saved Agent plugin capabilities"),
     ),
-    responseTo(page, "POST", catalogUrl).then((response) =>
-      assert.equal(response.status(), 200, "saved Agent plugin catalog"),
-    ),
+    responseTo(page, "POST", catalogUrl),
     (async () => {
       await login(page, fixture, detailUrl(fixture, namespace.id, agent.id, "draft", "plugins"));
       await page.getByRole("button", { name: "Configure plugins", exact: true }).click();
     })(),
   ]);
-  await page
-    .getByRole("dialog", { name: "Configure plugins", exact: true })
-    .getByRole("button", { name: "Google Workspace", exact: true })
-    .waitFor({ state: "visible" });
+  assert.equal(catalog.status(), 200, "saved Agent plugin catalog");
+  const { plugins } = responseData(await catalog.json());
+  assert.ok(Array.isArray(plugins) && plugins.length > 1);
+  const dialog = page.getByRole("dialog", { name: "Configure plugins", exact: true });
+  await dialog.getByRole("button", { name: "Google Workspace", exact: true }).waitFor();
+
+  // Just above the split layout breakpoint, the longer failure message wraps.
+  await page.setViewportSize({ width: 1101, height: 700 });
+  const search = dialog.getByRole("searchbox", { name: "Search plugins" });
+  const controls = dialog.locator(".plugin-browser-status");
+  const status = controls.getByRole("status");
+  const retry = controls.getByRole("button");
+  assert.equal(await status.innerText(), `Page 1 · ${plugins.length} plugins`);
+  assert.equal((await status.getAttribute("aria-live")) ?? "polite", "polite");
+
+  const requests = apiRequests(page, fixture.origin);
+  const writesOrCatalogReads = () =>
+    requests
+      .filter(({ method }) => /^(POST|PUT|PATCH|DELETE)$/.test(method))
+      .map(({ method, path, body }) => [method, path, record(body).q]);
+  const read = ["POST", catalogPath, workspaceQuery];
+
+  const intercepted = Promise.withResolvers<Route>();
+  await page.route(catalogUrl, intercepted.resolve, { times: 1 });
+  await search.fill(workspaceQuery);
+  const route = await within(intercepted.promise, "the catalog search");
+  assert.equal((await route.fetch({ maxRedirects: 0 })).status(), 200);
+  await status.filter({ hasText: /^Searching plugins…$/u }).waitFor();
+  assert.ok(await retry.evaluate((el) => el instanceof HTMLButtonElement && el.disabled));
+  const busyLabel = await retry.innerText();
+
+  // A center click can still hit a shorter button. Keep the point at its original left edge.
+  await retry.scrollIntoViewIfNeeded();
+  const bounds = await retry.boundingBox();
+  assert.ok(bounds);
+  const point = { x: bounds.x + 5, y: bounds.y + bounds.height / 2 };
+  const hitsRetry = () =>
+    retry.evaluate((el, { x, y }) => el.contains(document.elementFromPoint(x, y)), point);
+  assert.ok(await hitsRetry(), "busy button covers the test point");
+  await page.mouse.click(point.x, point.y);
+  await nextFrames(page);
+  assert.deepEqual(writesOrCatalogReads(), [read], "busy click starts no retry");
+
+  await discoveryResponse(
+    page,
+    catalogUrl,
+    () =>
+      route.fulfill({
+        status: 503,
+        json: { error: { code: "PLUGIN_DISCOVERY_UNAVAILABLE", message: "Transient failure." } },
+      }),
+    503,
+  );
+  await status.filter({ hasText: /plugin service is unavailable/i }).waitFor();
+  assert.equal(await search.inputValue(), workspaceQuery);
+  assert.ok(await retry.isEnabled());
+  assert.deepEqual(writesOrCatalogReads(), [read], "failure waits for explicit retry");
+  assert.ok(await hitsRetry(), "enabled button still covers the same point");
+  assert.equal(busyLabel, "Load plugins");
+
+  await discoveryResponse(page, catalogUrl, async () => {
+    await page.mouse.down();
+    await page.mouse.up();
+  });
+  await expectWorkspaceCatalog(dialog, search);
+  await status.filter({ hasText: /^Page 1 · 1 plugin$/u }).waitFor();
+  await settlePageRequests(page);
+  assert.deepEqual(writesOrCatalogReads(), [read, read], "one retry and no writes");
+});
+
+async function openPendingDefaultCatalog(t: TestContext) {
+  const { fixture, namespace, agent, catalogPath, catalogUrl } = await defaultCatalogAgent(t);
+  const { page } = await newPage(t, fixture, { browser });
+  const requests = apiRequests(page, fixture.origin);
+  await login(page, fixture, detailUrl(fixture, namespace.id, agent.id, "draft", "configuration"));
+  const capabilitiesUrl = `${catalogUrl}/capabilities`;
+  const capabilities = await holdRequests(t, page, capabilitiesUrl, {
+    once: true,
+    method: "GET",
+    afterServer: true,
+  });
+  await page.getByRole("tab", { name: "Plugins", exact: true }).click();
+  assert.equal((await capabilities.requested)?.status(), 200, "saved Agent plugin capabilities");
+
+  const configure = page.getByRole("button", { name: "Configure plugins", exact: true });
+  const dialog = page.getByRole("dialog", { name: "Configure plugins", exact: true });
+  const search = dialog.getByRole("searchbox", { name: "Search plugins" });
+  // Keep observing the status when closing the dialog removes it from the accessibility tree.
+  const checkingCatalog = page
+    .locator("dialog.plugin-dialog .plugin-browser-status [role=status]")
+    .filter({ hasText: "Checking plugin catalog availability…" });
+  await configure.click();
+  await checkingCatalog.waitFor({ state: "visible" });
+
+  async function releaseCapabilities() {
+    await page.clock.install();
+    await page.clock.pauseAt(Date.now() + 1000);
+    const response = responseTo(page, "GET", capabilitiesUrl);
+    capabilities.release();
+    assert.equal((await response).status(), 200, "browser received plugin capabilities");
+    await checkingCatalog.waitFor({ state: "detached" });
+    await page.clock.runFor(400);
+    await page.clock.resume();
+    await settlePageRequests(page);
+  }
+
+  const catalogQueries = () =>
+    pathRequests(requests, "POST", catalogPath).map(({ body }) => record(body).q);
+  return { page, configure, dialog, search, catalogUrl, releaseCapabilities, catalogQueries };
+}
+
+async function expectWorkspaceCatalog(dialog: Locator, search: Locator) {
+  assert.equal(await search.inputValue(), workspaceQuery);
+  await dialog.getByRole("button", { name: "Google Workspace", exact: true }).waitFor();
+  assert.equal(await dialog.getByRole("button", { name: "Slack", exact: true }).count(), 0);
+}
+
+test("A closed plugin picker defers its pending search until reopened", async (t) => {
+  const { page, configure, dialog, search, catalogUrl, releaseCapabilities, catalogQueries } =
+    await openPendingDefaultCatalog(t);
+  await search.fill(workspaceQuery);
+  await dialog.getByRole("button", { name: "Done", exact: true }).press("Enter");
+  await dialog.waitFor({ state: "hidden" });
+  await configure.and(page.locator(":focus")).waitFor();
+  await releaseCapabilities();
+  assert.deepEqual(catalogQueries(), [], "a closed picker does not request the catalog");
+
+  const response = responseTo(page, "POST", catalogUrl);
+  await configure.press("Enter");
+  assert.equal((await response).status(), 200, "reopened picker catalog");
+  await expectWorkspaceCatalog(dialog, search);
+  await settlePageRequests(page);
+  assert.deepEqual(catalogQueries(), [workspaceQuery], "the reopened picker searches once");
+});
+
+test("The plugin picker searches after switching back to Available while capabilities are pending", async (t) => {
+  const { dialog, search, releaseCapabilities, catalogQueries } =
+    await openPendingDefaultCatalog(t);
+  const configured = dialog.getByRole("button", { name: "Configured plugins", exact: true });
+  const available = dialog.getByRole("button", { name: "Available plugins", exact: true });
+  await configured.click();
+  assert.equal(await configured.getAttribute("aria-pressed"), "true");
+  await available.click();
+  assert.equal(await available.getAttribute("aria-pressed"), "true");
+  await search.fill(workspaceQuery);
+  await releaseCapabilities();
+  assert.deepEqual(catalogQueries(), [workspaceQuery], "the Available tab searches automatically");
+  await expectWorkspaceCatalog(dialog, search);
 });
 
 async function savedCodexPluginFixture(
@@ -3246,10 +3394,8 @@ test("plugin prefetch remains usable after leaving during its debounce", async (
   const dialog = page.getByRole("dialog", { name: "Configure plugins" });
   await page.clock.runFor(1000);
   await dialog.getByRole("button", { name: "Google Workspace", exact: true }).waitFor();
-  assert.equal(
-    await dialog.getByRole("button", { name: "Loading plugins…", exact: true }).count(),
-    0,
-  );
+  const loadPlugins = dialog.getByRole("button", { name: "Load plugins", exact: true });
+  assert.equal(await loadPlugins.isEnabled(), true, "the reopened catalog can refresh");
   assert.deepEqual(
     responseData(await fixture.request("GET", agentPath)).plugins,
     initialSelections,
