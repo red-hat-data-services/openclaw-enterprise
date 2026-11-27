@@ -257,10 +257,6 @@ RUN --mount=type=bind,from=matrix-sdk-crypto,source=/out,target=/tmp/matrix-sdk-
         --config.supportedArchitectures.libc=glibc \
     && rm -rf /tmp/pnpm-store
 COPY --from=openclaw-source /source/ ./
-# The runtime needs supervised recovery across private PID namespaces. Native
-# lock reinspection and custody still guard every destructive operation.
-RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce-runtime \
-    git apply /tmp/oce-runtime/openclaw-terminated-gateway-namespace.patch
 # Forward the scoped Google placeholder and the OpenShell TLS root to native worker children.
 RUN --mount=type=bind,from=oce-source,source=/oce/deploy/runtime,target=/tmp/oce-runtime \
     git apply /tmp/oce-runtime/openclaw-google-worker-placeholder.patch
@@ -610,7 +606,7 @@ EOF
 
 RUN --mount=type=bind,source=deploy/runtime/repository-credentials/github-repository-rest/SKILL.md,target=/tmp/github-repository-rest.md \
     /usr/bin/git config --system --add include.path /run/oce/repository-credentials/gitconfig \
-    && skill=/etc/codex/skills/github-repository-rest \
+    && skill=/usr/local/lib/oce/skills/github-repository-rest \
     && install -D -m 0444 /tmp/github-repository-rest.md "$skill/SKILL.md" \
     && touch -d @0 "$skill/SKILL.md" "$skill"
 

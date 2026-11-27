@@ -75,7 +75,7 @@ assert_ok "OpenShell bootstrap is read-only" run_in "$IMAGE" \
 assert_ok "/opt/oce/managed is root-owned and sticky" run_in "$IMAGE" \
     bash -c 'test "$(stat -c %U:%G:%a /opt/oce/managed)" = root:root:1777'
 assert_ok "Codex GitHub REST skill is installed" run_in "$IMAGE" \
-    test -f /etc/codex/skills/github-repository-rest/SKILL.md
+    test -f /usr/local/lib/oce/skills/github-repository-rest/SKILL.md
 assert_ok "provenance matches the OpenClaw label" podman run --rm "$IMAGE" node -e \
     'const p = require("/opt/oce/runtime/provenance.json"); process.exit(p.commit === process.argv[1] ? 0 : 1)' "$OPENCLAW_COMMIT"
 assert_ok "download clients are curl and node, without apt" podman run --rm "$IMAGE" node -e \
