@@ -1,5 +1,5 @@
-ARG BASE_IMAGE=registry.access.redhat.com/hi/nodejs:24@sha256:0b3b95334a00e6724b8e0ed6d4ae1cd6c482ed72a9fd92b402d4c7d7742c29a3
-ARG BUILDER_IMAGE=registry.access.redhat.com/hi/nodejs:24-builder@sha256:c61a52c0d50c2122a3dccf46f8bb0cca9c41a1e1df7ff2776b496433331726b3
+ARG BASE_IMAGE=registry.access.redhat.com/hi/nodejs:24@sha256:0500c13e9632afc522488d940a5e7d12d2871e1b97d00e40035c59a21a7237fd
+ARG BUILDER_IMAGE=registry.access.redhat.com/hi/nodejs:24-builder@sha256:211b0f098c9f28b1b538611aaf63cde41fc187fbc0bb54d2497deb557e0245ce
 
 # OpenClaw Enterprise (OCE) controller image on Hummingbird.
 #
